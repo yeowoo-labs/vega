@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Vega checks: one aup spec, three surfaces.
+
+1. CLI and NUI: examples/todo.aup under random adds, moves, toggles, urgent
+   marks and removals prints exactly what a reference Python model of the app
+   and of Vega's conventions says (lines for pipes, sentences for speech),
+   including failed events on an empty list.
+2. TUI: the same runs drawn at several sizes keep the focused row on screen
+   with the least scrolling, show the rows around it in order, right-align
+   badges by display width (Hangul, CJK and emoji take two cells, combining
+   marks none), and evaluate only the cells on screen: a frame costs the
+   title, the field, the focus and three cells per visible row, however long
+   the list is.
+3. Tables: examples/scores.aup aligns its columns by display width and marks
+   row tones.
+4. Every aup example runs on every surface under random keys without a crash.
+"""
+import argparse
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+
+
+def run(*args, stdin='', env=None):
+    return subprocess.run([str(a) for a in args], input=stdin, capture_output=True, text=True, timeout=120,
+                          env=env)
+
+
+def width(text):
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch) or ch in '‍️':
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in 'WF' else 1
+    return total
+
+
+def pictures(text):
+    """Control characters as Vega shows them."""
+    return ''.join(chr(0x2400 + ord(c)) if ord(c) < 0x20 else '␡' if c == '\x7f' else c for c in text)
+
+
+class Todo:
+    """examples/todo.aup and Vega's reading of it."""
+
+    def __init__(self):
+        self.tasks, self.at = [], 0
+
+    def event(self, name, text=None):
+        """Returns False when the event fails (a missing item)."""
+        if name == 'add':
+            self.tasks.append({'title': text, 'done': 0, 'urgent': 0})
+            self.at = len(self.tasks) - 1
+            return True
+        last = max(len(self.tasks) - 1, 0)
+        if name in ('toggle', 'urgent', 'drop') and not self.tasks:
+            return False
+        if name == 'up': self.at = max(self.at - 1, 0)
+        elif name == 'down': self.at = min(self.at + 1, last)
+        elif name == 'toggle': self.tasks[self.at]['done'] = int(not self.tasks[self.at]['done'])
+        elif name == 'urgent': self.tasks[self.at]['urgent'] = int(not self.tasks[self.at]['urgent'])
+        elif name == 'drop':
+            del self.tasks[self.at]
+            self.at = min(self.at, max(len(self.tasks) - 1, 0))
+        return True
+
+    @staticmethod
+    def badge(task):
+        return 'done' if task['done'] else 'urgent' if task['urgent'] else ''
+
+    @staticmethod
+    def tone(task):
+        return 'muted' if task['done'] else 'danger' if task['urgent'] else 'normal'
+
+    def cli(self):
+        lines = ['To do', f'left: {len(self.tasks)} tasks', f'tasks_list ({len(self.tasks)})']
+        for i, task in enumerate(self.tasks):
+            line = ('> ' if i == self.at else '  ') + pictures(task['title'])
+            if self.badge(task):
+                line += f' [{self.badge(task)}]'
+            if self.tone(task) != 'normal':
+                line += f' ({self.tone(task)})'
+            lines.append(line)
+        return lines
+
+    @staticmethod
+    def spoken(text):
+        text = text.rstrip(''.join(chr(c) for c in range(0x21)))
+        return ''.join(' ' if ord(c) < 0x20 else c for c in text)
+
+    def focus(self):
+        if not self.tasks:
+            return 'tasks_list is empty.'
+        task = self.tasks[self.at]
+        words = [self.spoken(task['title'])] + ([self.badge(task)] if self.badge(task) else [])
+        tone = 'danger, ' if self.tone(task) == 'danger' else ''
+        return f'Item {self.at + 1} of {len(self.tasks)}: {tone}' + ', '.join(words) + '.'
+
+    def say(self):
+        n = len(self.tasks)
+        lines = ['To do.', f'left: {n} tasks.', f'tasks_list, {n} item{"" if n == 1 else "s"}.']
+        return lines + ([self.focus()] if n else [])
+
+
+KEYS = {'up': 'ArrowUp', 'down': 'ArrowDown', 'toggle': 'Space', 'urgent': 'KeyU', 'drop': 'Delete'}
+WORDS = ['milk', '우유 사기', 'call 엄마', '日本語', '😀 party', 'café', 'tab\there', 'x' * 60, '', 'a\nb',
+         'ok']
+
+
+def cli_and_say(vega, module, seeds, steps=300):
+    compared = failures = 0
+    for seed in seeds:
+        rng = random.Random(seed)
+        model, script, expected_cli, expected_say = Todo(), [], [], []
+        for _ in range(steps):
+            if rng.random() < 0.25:
+                word = rng.choice(WORDS)
+                script.append('text ' + (word.encode().hex() or '-'))
+                ok, name = model.event('add', word), 'add'
+            else:
+                name = rng.choice(list(KEYS) + ['drop'])
+                script.append(f'key {KEYS[name]}')
+                ok = model.event(name)
+            expected_say.append(model.focus() if ok else f'Could not {name}.')
+            failures += not ok
+            if rng.random() < 0.2:
+                script.append('show')
+                expected_cli += model.cli()
+                expected_say += model.say()
+        text = '\n'.join(script) + '\n'
+        cli = run(vega, 'cli', module, stdin=text)
+        assert cli.returncode == 0 and cli.stdout.splitlines() == expected_cli, \
+            (seed, [(a, b) for a, b in zip(cli.stdout.splitlines(), expected_cli) if a != b][:3])
+        say = run(vega, 'say', module, stdin=text)
+        assert say.returncode == 0 and say.stdout.splitlines() == expected_say, \
+            (seed, [(a, b) for a, b in zip(say.stdout.splitlines(), expected_say) if a != b][:3])
+        compared += len(expected_cli) + len(expected_say)
+    return compared, failures
+
+
+def frames(output, height):
+    lines = output.splitlines()
+    for start in range(0, len(lines), height + 1):
+        frame, cells = lines[start:start + height], lines[start + height]
+        assert len(frame) == height and cells.startswith('cells '), lines[start:start + height + 1]
+        yield frame, int(cells.split()[1])
+
+
+def tui(vega, module, seeds, sizes, steps=300):
+    """Each frame against the model: which rows show, which one is focused,
+    where badges end, and how many cells were evaluated."""
+    checked = 0
+    for columns, rows in sizes:
+        area = rows - 5  # title, field, list header, key bar, input line
+        for seed in seeds:
+            rng = random.Random(seed * 7 + columns)
+            model, script, states = Todo(), [], []
+            for _ in range(steps):
+                if rng.random() < 0.3:
+                    word = rng.choice(WORDS)
+                    script.append('text ' + (word.encode().hex() or '-'))
+                    model.event('add', word)
+                else:
+                    name = rng.choice(list(KEYS))
+                    script.append(f'key {KEYS[name]}')
+                    model.event(name)
+                script.append('show')
+                states.append(([dict(t) for t in model.tasks], model.at))
+            result = run(vega, 'tui', module, '--dump', f'{columns}x{rows}', stdin='\n'.join(script) + '\n')
+            assert result.returncode == 0, result.stderr
+            first = 0
+            for (frame, cells), (tasks, at) in zip(frames(result.stdout, rows), states):
+                n = len(tasks)
+                assert frame[0] == '|To do' and frame[2].startswith(f'|tasks_list ({n})'), frame[:3]
+                if at < first: first = at
+                if at >= first + area: first = at - area + 1
+                if first + area > n: first = max(n - area, 0)
+                shown = frame[3:3 + area]
+                visible = tasks[first:first + area]
+                for i, line in enumerate(shown):
+                    if i >= len(visible):
+                        assert line == '|', (seed, line)
+                        continue
+                    task, focused = visible[i], first + i == at
+                    body = (line[1:].split('\t')[0] + '  ')[:max(2, len(line[1:].split('\t')[0]))]  # trailing spaces are trimmed
+                    assert line[0] == ('>' if focused else '|') and body.startswith('> ' if focused else '  '), (seed, i, line)
+                    label = pictures(task['title'])
+                    badge = Todo.badge(task)
+                    if badge:  # the badge ends at the last column
+                        assert body.endswith(badge) and width(body) == columns, (seed, body, width(body))
+                    if width(label) + 2 + (len(badge) + 2 if badge else 0) <= columns:
+                        assert body[2:].startswith(label), (seed, body, label)
+                    else:
+                        assert '…' in body, (seed, body)
+                    tone = Todo.tone(task)
+                    assert (line.split('\t')[1] if '\t' in line else 'normal') == tone, (seed, line, tone)
+                assert cells == 2 + (2 + 3 * len(visible) if n else 0), (seed, cells, len(visible))
+                checked += 1
+    # A long list costs what its screen shows: 2,000 tasks, 7 visible rows.
+    script = ['text ' + f'task {i}'.encode().hex() for i in range(2000)] + ['key ArrowUp'] * 3 + ['show']
+    frame, cells = next(frames(run(vega, 'tui', module, '--dump', '40x12', stdin='\n'.join(script) + '\n').stdout, 12))
+    assert cells == 2 + 2 + 3 * 7 and frame[9] == '>> task 1996' and frame[3] == '|  task 1990', (cells, frame)
+    return checked
+
+
+def scores(vega, module):
+    joins = ['ann', '범수', 'Zoë']
+    script = [f'text {name.encode().hex()}' for name in joins]
+    script += ['key ArrowUp', 'key KeyW', 'key KeyW', 'key KeyW', 'key ArrowUp', 'key KeyL', 'show']
+    out = run(vega, 'cli', module, stdin='\n'.join(script) + '\n').stdout.splitlines()
+    assert out == ['Scores', 'board (3)',
+                   '  name  score  rank',
+                   '> ann   -1     - (danger)',
+                   '  범수  3      gold (good)',
+                   '  Zoë   0      -'], out
+    tui = run(vega, 'tui', module, '--dump', '30x8', stdin='\n'.join(script) + '\n').stdout.splitlines()
+    assert tui[1:5] == ['|board (3)', '|  name  score  rank\tmuted', '>> ann   -1     -\tdanger',
+                        '|  범수  3      gold\tgood'], tui
+    say = run(vega, 'say', module, stdin='show\n' + '\n'.join(script) + '\n').stdout.splitlines()
+    assert 'Item 1 of 3: danger, name ann, score -1, rank -.' in say, say
+    return len(out)
+
+
+def interactive(vega, module):
+    """The terminal surface on a real pseudo-terminal: typed text commits
+    with Enter, arrow keys and letters reach the app after Tab, Ctrl-C leaves
+    and restores the terminal."""
+    import fcntl, pty, select, struct, termios, time
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(str(vega), [str(vega), 'tui', str(module)])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))
+    os.kill(pid, 28)  # SIGWINCH: take the size
+
+    def read_for(seconds):
+        data, end = b'', time.time() + seconds
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if ready:
+                try:
+                    data += os.read(fd, 65536)
+                except OSError:
+                    break
+        return data
+
+    screen = read_for(0.3)
+    for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u'):
+        os.write(fd, keys)
+        screen += read_for(0.2)
+    os.write(fd, b'\x03')
+    screen += read_for(0.3)
+    _, status = os.waitpid(pid, 0)
+    os.close(fd)
+    text = screen.decode(errors='replace')
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    assert '\x1b[?1049h' in text and text.rstrip().endswith('\x1b[?1049l'), text[-80:]
+    assert 'milk' in text and 'béton' in text and '(2)' in text and 'done' in text, text[-400:]
+    return 1
+
+
+def robustness(vega, aup, work, rounds):
+    """Every aup example, every surface, random keys and text: never a crash."""
+    examples = sorted((ROOT.parent / 'aup' / 'examples').glob('*.aup')) + sorted((ROOT / 'examples').glob('*.aup'))
+    keys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Enter', 'Delete', 'Backspace', 'Home',
+            'End', 'KeyD', 'KeyS', 'KeyU', 'KeyW', 'KeyL', 'KeyM']
+    env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
+    runs = 0
+    for path in examples:
+        module = work / (path.stem + '.pmod')
+        built = run(aup, 'build', path, '-o', module, env=env)
+        assert built.returncode == 0, (path, built.stderr)
+        rng = random.Random(path.stem)
+        for _ in range(rounds):
+            script = []
+            for _ in range(60):
+                roll = rng.random()
+                if roll < 0.2: script.append('text ' + rng.choice(WORDS).encode().hex())
+                elif roll < 0.3: script.append('show')
+                elif roll < 0.35: script.append('frame 3')
+                elif roll < 0.4: script.append(rng.choice(['type 61', 'enter', 'tab']))
+                else: script.append('key ' + rng.choice(keys))
+            text = '\n'.join(script) + '\nshow\n'
+            for surface in (['cli'], ['say'], ['tui', '--dump', rng.choice(['80x24', '12x5', '1x1', '200x3'])]):
+                result = run(vega, surface[0], module, *surface[1:], stdin=text)
+                assert result.returncode == 0, (path, surface, result.stderr[-400:])
+                runs += 1
+    return len(examples), runs
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--vega', type=Path, required=True)
+    parser.add_argument('--aup', type=Path, required=True)
+    parser.add_argument('--seeds', type=int, default=8)
+    parser.add_argument('--rounds', type=int, default=3)
+    args = parser.parse_args()
+    vega, aup = args.vega.resolve(), args.aup.resolve()
+    report = {}
+    with tempfile.TemporaryDirectory(prefix='vega-check-') as directory:
+        work = Path(directory)
+        env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
+        modules = {}
+        for name in ('todo', 'scores'):
+            modules[name] = work / f'{name}.pmod'
+            built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
+            assert built.returncode == 0, built.stderr
+        report['cli_and_say_lines'], report['failed_events_spoken'] = \
+            cli_and_say(vega, modules['todo'], range(args.seeds))
+        report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
+        report['table_lines'] = scores(vega, modules['scores'])
+        report['interactive_sessions'] = interactive(vega, modules['todo'])
+        report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
+    print(json.dumps(report))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

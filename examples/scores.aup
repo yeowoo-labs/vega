@@ -1,0 +1,35 @@
+# A table: a table view without a label column. Every column shows; a tone
+# column colors a row.
+use vega
+
+record Player {
+  name: text
+  score = 0
+}
+
+state players: list of Player
+state at: index of players
+
+input join = text
+input up = key ArrowUp
+input down = key ArrowDown
+input win = key KeyW
+input lose = key KeyL
+
+on join {
+  players.append(Player { name: join })
+  at = players.last
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on win.down { at.score = at.score + 1 }
+on lose.down { at.score = at.score - 1 }
+
+view title = "Scores"
+view board = each p in players {
+  name = p.name
+  score = p.score
+  rank = if p.score > 2 { "gold" } else if p.score > 0 { "silver" } else { "-" }
+  tone = if p.score < 0 { vega.danger } else { vega.when(p.score > 2, vega.good) }
+}
+view board_focus = at.position

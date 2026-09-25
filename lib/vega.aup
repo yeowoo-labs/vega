@@ -1,0 +1,15 @@
+# Vega for aup apps: `use vega` (AUP_PATH=.../vega/lib).
+#
+# A tone says what a value means, not how it looks. Each surface decides:
+# a terminal may dim muted rows and color danger red, a screen reader may
+# say "danger" before an item. Use them in a `tone` column of a list or
+# table view (docs/design/001-first-component.md).
+fn normal = 0
+fn muted = 1
+fn accent = 2
+fn good = 3
+fn warning = 4
+fn danger = 5
+
+# A tone only when a condition holds: vega.when(task.done, vega.muted).
+fn when(condition, tone) = if condition { tone } else { normal }

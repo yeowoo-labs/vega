@@ -3,7 +3,17 @@
 Vega는 **인터페이스 구현자**이며 하나의 **aup 라이브러리**다(`use vega`). 사용자가 보는 인터페이스의
 규격과 고도화된 명세를 기반으로 TUI, CLI, GUI, NUI를 쉽게 만들 수 있게 한다.
 
-상태: 저장소와 헌장만 있다. 구현은 아직 없다.
+상태: 첫 컴포넌트(목록·표·포커스·톤)와 표면 셋(TUI·CLI·NUI 문장)이 동작한다.
+[설계 001](docs/design/001-first-component.md).
+
+```sh
+make                                          # build/vega (옆의 ../pure 체크아웃을 링크)
+AUP_PATH=lib ../aup/build/aup build examples/todo.aup -o todo.pmod
+build/vega tui todo.pmod                      # 터미널. 글자 입력 후 Enter, Tab으로 키 모드, Ctrl-C로 끝
+printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega cli todo.pmod
+printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
+make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
+```
 
 ## 위치
 
@@ -34,5 +44,6 @@ aup는 일반적인 투영과 모듈만 제공하고, 목록·표·커서·톤 �
 
 ## 열린 질문
 
-- NUI의 첫 범위(음성인지, 대화형 텍스트인지, 제스처인지).
-- 표면별 고도화(예: GUI의 가상 스크롤, TUI의 셀 단위 갱신)를 명세의 어디에 둘지.
+- NUI의 다음 범위. 지금은 화면 낭독 같은 문장이다. 음성 합성·대화형 입력·제스처 중 무엇이 먼저인지.
+- 표면별 고도화(예: TUI의 셀 단위 갱신, GUI의 부드러운 스크롤)를 명세의 어디에 둘지. 가상 스크롤은 이미
+  런타임의 성질이다(보이는 칸만 계산).

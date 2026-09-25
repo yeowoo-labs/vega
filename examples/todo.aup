@@ -1,0 +1,40 @@
+# A to-do list as Vega reads it: one spec, shown by the terminal (vega tui),
+# printed for pipes (vega cli) and spoken as sentences (vega say).
+use vega
+
+record Task {
+  title: text
+  done = 0
+  urgent = 0
+}
+
+state tasks: list of Task
+state at: index of tasks
+
+input add = text
+input up = key ArrowUp
+input down = key ArrowDown
+input toggle = key Space
+input urgent = key KeyU
+input drop = key Delete
+
+on add {
+  tasks.append(Task { title: add })
+  at = tasks.last
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on toggle.down { at.done = !at.done }
+on urgent.down { at.urgent = !at.urgent }
+on drop.down { tasks.remove(at) }
+
+view title = "To do"
+view left = "{tasks.count} tasks"
+
+# A list: label, and optionally tone, badge and detail per row.
+view tasks_list = each task in tasks {
+  label = task.title
+  badge = if task.done { "done" } else if task.urgent { "urgent" } else { "" }
+  tone = if task.done { vega.muted } else { vega.when(task.urgent, vega.danger) }
+}
+view tasks_list_focus = at.position
