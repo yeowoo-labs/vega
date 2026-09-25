@@ -6,7 +6,8 @@ BUILD ?= build
 PURE ?= ../pure/prototypes/connections
 AUP ?= ../aup
 
-PURE_SOURCES = $(PURE)/module.c $(PURE)/module-list.c $(PURE)/module-text.c $(PURE)/store-tree.c
+PURE_SOURCES = $(PURE)/module.c $(PURE)/module-list.c $(PURE)/module-save.c $(PURE)/module-store.c \
+               $(PURE)/module-text.c $(PURE)/store-tree.c
 SOURCES = src/screen.c src/draw.c src/width.c src/main.c
 
 .PHONY: all check

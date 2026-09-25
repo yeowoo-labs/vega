@@ -1,5 +1,7 @@
 #define _DEFAULT_SOURCE
 #include "vega.h"
+#include "module-store.h"
+#include "store.h"
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -8,11 +10,13 @@
 #include <termios.h>
 #include <unistd.h>
 
-/* vega SURFACE MODULE: one module, one screen, several surfaces.
+/* vega SURFACE MODULE [--store PATH]: one module, one screen, several surfaces.
  *   tui              interactive terminal
  *   tui --dump WxH   the terminal's frames as text, driven by a script
  *   cli              plain lines for pipes, driven by a script
  *   say              sentences (the first natural-language surface), driven by a script
+ * With --store the app's states live in that tree store: the app continues
+ * where it was, whichever surface runs it.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
  * tab | frame [N] | show. key presses and releases the input bound to that key;
  * text commits text to the screen's text input; type, enter and tab act on the
@@ -25,7 +29,7 @@ static char entry[VEGA_TEXT];
 static size_t entry_length;
 static bool typing;
 
-static bool load(const char *path) {
+static bool load(const char *path, const char *store) {
     static unsigned char bytes[1 << 17];
     FILE *file = fopen(path, "rb");
     size_t size = file ? fread(bytes, 1, sizeof(bytes), file) : 0;
@@ -37,7 +41,9 @@ static bool load(const char *path) {
         fprintf(stderr, "vega: %s: %s\n", path, error);
         return false;
     }
-    if (pure_app_start(&app, &module, (PureData){0}) != PURE_OK) { fprintf(stderr, "vega: cannot start\n"); return false; }
+    if (store && pure_store_init(store) != PURE_OK) { fprintf(stderr, "vega: cannot open store %s\n", store); return false; }
+    PureResult started = pure_app_start(&app, &module, store ? pure_tree_data(store) : (PureData){0});
+    if (started != PURE_OK) { fprintf(stderr, "vega: cannot start (%d)\n", (int)started); return false; }
     vega_screen(&screen, &module);
     typing = screen.prompt >= 0;
     return true;
@@ -362,17 +368,26 @@ static int script(Surface surface, unsigned width, unsigned height) {
 
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0;
-    bool dumped = argc == 5 && !strcmp(argv[3], "--dump") && sscanf(argv[4], "%ux%u", &width, &height) == 2 &&
-                  width && height && width <= 1000 && height <= 1000;
-    if ((argc != 3 && !dumped) || (dumped && strcmp(argv[1], "tui"))) {
-        fputs("vega tui|cli|say MODULE.pmod\nvega tui MODULE.pmod --dump WIDTHxHEIGHT < script\n", stderr);
+    bool dumped = false, usage = argc < 3 || argc % 2 == 0;
+    const char *store = NULL;
+    for (int i = 3; !usage && i + 1 < argc; i += 2) {
+        if (!strcmp(argv[i], "--store")) store = argv[i + 1];
+        else if (!strcmp(argv[i], "--dump") && sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height &&
+                 width <= 1000 && height <= 1000) dumped = true;
+        else usage = true;
+    }
+    if (usage || (dumped && strcmp(argv[1], "tui"))) {
+        fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
+              "vega tui MODULE.pmod [--store PATH] --dump WIDTHxHEIGHT < script\n", stderr);
         return 2;
     }
     Surface surface = !strcmp(argv[1], "cli") ? SURFACE_CLI : !strcmp(argv[1], "say") ? SURFACE_SAY :
                       !strcmp(argv[1], "tui") ? SURFACE_TUI : (Surface)-1;
     if ((int)surface < 0) { fprintf(stderr, "vega: unknown surface %s\n", argv[1]); return 2; }
-    if (!load(argv[2])) return 2;
+    if (!load(argv[2], store)) return 2;
     int status = surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height);
+    /* Frame changes are stored with events; keep the last ones too. */
+    if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }
     pure_app_stop(&app);
     return status;
 }

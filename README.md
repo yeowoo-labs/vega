@@ -9,7 +9,8 @@ Vega는 **인터페이스 구현자**이며 하나의 **aup 라이브러리**다
 ```sh
 make                                          # build/vega (옆의 ../pure 체크아웃을 링크)
 AUP_PATH=lib ../aup/build/aup build examples/todo.aup -o todo.pmod
-build/vega tui todo.pmod                      # 터미널. 글자 입력 후 Enter, Tab으로 키 모드, Ctrl-C로 끝
+build/vega tui todo.pmod --store ~/.todo      # 터미널. 글자 입력 후 Enter, Tab으로 키 모드, Ctrl-C로 끝.
+                                              # --store가 있으면 목록이 다음 실행에도 남는다(어느 표면이든)
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega cli todo.pmod
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
 make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성

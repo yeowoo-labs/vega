@@ -14,6 +14,8 @@
 3. Tables: examples/scores.aup aligns its columns by display width and marks
    row tones.
 4. Every aup example runs on every surface under random keys without a crash.
+5. Stored: surfaces take turns on one store and each continues the list; an
+   interactive session's entries are there in the next one.
 """
 import argparse
 import json
@@ -146,6 +148,39 @@ def cli_and_say(vega, module, seeds, steps=300):
     return compared, failures
 
 
+def stored_surfaces(vega, module, work, seeds, steps=240):
+    """One store, several surfaces in turn: each run continues the list where
+    the last one left it, and prints or says what the model says."""
+    compared = 0
+    for seed in seeds:
+        rng = random.Random(seed + 500)
+        model, store = Todo(), work / f'store-{seed}'
+        cuts = sorted(rng.sample(range(1, steps), 6))
+        for number, (start, end) in enumerate(zip([0] + cuts, cuts + [steps])):
+            surface = ['cli', 'say'][number % 2]
+            script, expected = [], []
+            for _ in range(start, end):
+                if rng.random() < 0.3:
+                    word = rng.choice(WORDS)
+                    script.append('text ' + (word.encode().hex() or '-'))
+                    ok, name = model.event('add', word), 'add'
+                else:
+                    name = rng.choice(list(KEYS) + ['drop'])
+                    script.append(f'key {KEYS[name]}')
+                    ok = model.event(name)
+                if surface == 'say':
+                    expected.append(model.focus() if ok else f'Could not {name}.')
+            script.append('show')
+            expected += model.cli() if surface == 'cli' else model.say()
+            out = run(vega, surface, module, '--store', store, stdin='\n'.join(script) + '\n')
+            assert out.returncode == 0 and out.stdout.splitlines() == expected, \
+                (seed, number, [(a, b) for a, b in zip(out.stdout.splitlines(), expected) if a != b][:3])
+            compared += len(expected)
+        frame = run(vega, 'tui', module, '--store', store, '--dump', '40x12', stdin='show\n').stdout.splitlines()
+        assert frame[2].startswith(f'|tasks_list ({len(model.tasks)})'), frame
+    return compared
+
+
 def frames(output, height):
     lines = output.splitlines()
     for start in range(0, len(lines), height + 1):
@@ -229,14 +264,14 @@ def scores(vega, module):
     return len(out)
 
 
-def interactive(vega, module):
+def interactive(vega, module, store=None):
     """The terminal surface on a real pseudo-terminal: typed text commits
     with Enter, arrow keys and letters reach the app after Tab, Ctrl-C leaves
     and restores the terminal."""
     import fcntl, pty, select, struct, termios, time
     pid, fd = pty.fork()
     if pid == 0:
-        os.execv(str(vega), [str(vega), 'tui', str(module)])
+        os.execv(str(vega), [str(vega), 'tui', str(module)] + (['--store', str(store)] if store else []))
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))
     os.kill(pid, 28)  # SIGWINCH: take the size
 
@@ -263,6 +298,9 @@ def interactive(vega, module):
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
     assert '\x1b[?1049h' in text and text.rstrip().endswith('\x1b[?1049l'), text[-80:]
     assert 'milk' in text and 'béton' in text and '(2)' in text and 'done' in text, text[-400:]
+    if store:  # what was typed is still there in the next session
+        again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
+        assert again == ['To do', 'left: 2 tasks', 'tasks_list (2)', '> milk [done] (muted)', '  béton'], again
     return 1
 
 
@@ -316,7 +354,9 @@ def main():
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
-        report['interactive_sessions'] = interactive(vega, modules['todo'])
+        report['interactive_sessions'] = interactive(vega, modules['todo']) + \
+            interactive(vega, modules['todo'], work / 'interactive-store')
+        report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
         report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
     print(json.dumps(report))
 
