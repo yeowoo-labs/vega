@@ -1,0 +1,38 @@
+# Words typed, tallied. A list keyed by the word keeps each word once and in
+# order: the screen is sorted without a sort anywhere, and typing a word
+# again counts it and moves the focus to it.
+use vega
+
+record Tally {
+  word: text
+  times = 0
+}
+
+state tallies: list of Tally by word
+state at: index of tallies
+
+input add = text
+input up = key ArrowUp
+input down = key ArrowDown
+input drop = key Delete
+
+on add {
+  if !tallies.has(add) {
+    tallies.add(Tally { word: add })
+  }
+  tallies[add].times = tallies[add].times + 1
+  at = tallies[add]
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on drop.down { tallies.remove(at) }
+
+view title = "Tally"
+view typed = "{sum(t.times for t in tallies)} typed, {tallies.count} different"
+
+view tallies_list = each t in tallies {
+  label = t.word
+  badge = "{t.times}"
+  tone = vega.when(t.times > 1, vega.accent)
+}
+view tallies_list_focus = at.position
