@@ -43,15 +43,27 @@ static size_t entry_length;
 static bool typing;
 
 /* The module file last read, and a digest of its bytes. A loaded module
- * keeps nothing of them, so one buffer serves every load. */
-static unsigned char module_bytes[1 << 17];
+ * keeps nothing of them, so one buffer, grown to the largest, serves every load. */
+static unsigned char *module_bytes;
+static size_t module_capacity;
 static uint64_t module_digest;
 
 /* Read a module file whole into module_bytes: its size, or -1. */
 static long read_module(const char *path) {
     FILE *file = fopen(path, "rb");
-    size_t size = file ? fread(module_bytes, 1, sizeof(module_bytes), file) : 0;
-    bool ok = file && !ferror(file) && size < sizeof(module_bytes);
+    size_t size = 0;
+    bool ok = file != NULL;
+    while (ok && !feof(file)) {
+        if (size == module_capacity) {
+            size_t capacity = module_capacity ? module_capacity * 2 : 1 << 16;
+            unsigned char *grown = capacity <= (8u << 20) ? realloc(module_bytes, capacity) : NULL;
+            if (!grown) { ok = false; break; }
+            module_bytes = grown;
+            module_capacity = capacity;
+        }
+        size += fread(module_bytes + size, 1, module_capacity - size, file);
+        ok = !ferror(file);
+    }
     if (file) fclose(file);
     if (!ok) return -1;
     uint64_t h = UINT64_C(0xcbf29ce484222325) ^ size;
