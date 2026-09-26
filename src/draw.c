@@ -193,11 +193,15 @@ void vega_say(FILE *out, PureApp *app, const VegaScreen *screen, bool all) {
 bool vega_grid(VegaGrid *grid, unsigned width, unsigned height) {
     size_t count = (size_t)width * height;
     VegaCell *cells = calloc(count ? count : 1, sizeof(*cells)), *shown = calloc(count ? count : 1, sizeof(*shown));
-    if (!cells || !shown) { free(cells); free(shown); return false; }
+    struct VegaRow *rows = calloc(height ? height : 1, sizeof(*rows));
+    if (!cells || !shown || !rows) { free(cells); free(shown); free(rows); return false; }
+    for (unsigned r = 0; r < height; ++r) rows[r].part = -1;
     free(grid->cells);
     free(grid->shown);
+    free(grid->rows);
     grid->cells = cells;
     grid->shown = shown;
+    grid->rows = rows;
     grid->painted = false;
     grid->width = width;
     grid->height = height;
@@ -207,6 +211,7 @@ bool vega_grid(VegaGrid *grid, unsigned width, unsigned height) {
 void vega_grid_free(VegaGrid *grid) {
     free(grid->cells);
     free(grid->shown);
+    free(grid->rows);
     *grid = (VegaGrid){0};
 }
 
@@ -272,11 +277,13 @@ static const char *key_symbol(const char *key) {
     return key;
 }
 
-static void draw_list(VegaGrid *grid, PureApp *app, const VegaPart *part, size_t first, unsigned top, unsigned height) {
+static void draw_list(VegaGrid *grid, PureApp *app, const VegaPart *part, int index, size_t first, unsigned top,
+                      unsigned height) {
     char text[VEGA_TEXT];
     size_t length, rows = vega_rows(app, part), focus = vega_focus(app, part);
     for (unsigned r = 0; r < height && first + r < rows; ++r) {
         size_t row = first + r;
+        grid->rows[top + r] = (struct VegaRow){index, row};
         bool focused = row == focus;
         VegaTone tone = vega_tone(app, part, row);
         Pen pen = {grid, top + r, 0, grid->width, (uint8_t)tone, focused, false};
@@ -307,7 +314,8 @@ static void draw_list(VegaGrid *grid, PureApp *app, const VegaPart *part, size_t
     }
 }
 
-static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, size_t first, unsigned top, unsigned height) {
+static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, int index, size_t first, unsigned top,
+                       unsigned height) {
     const PureModule *m = app->module;
     char text[VEGA_TEXT];
     size_t length, rows = vega_rows(app, part), focus = vega_focus(app, part);
@@ -338,6 +346,7 @@ static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, size_
     for (unsigned r = 0; r < visible && first + r < rows; ++r) {
         size_t row = first + r;
         bool focused = row == focus;
+        grid->rows[top + 1 + r] = (struct VegaRow){index, row};
         Pen pen = {grid, top + 1 + r, 0, grid->width, (uint8_t)vega_tone(app, part, row), focused, false};
         write_cstr(&pen, focused ? "> " : "  ");
         for (unsigned c = 0; c < part->column_count; ++c) {
@@ -351,10 +360,18 @@ static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, size_
     }
 }
 
+bool vega_hit(const VegaGrid *grid, unsigned line, unsigned *part, size_t *item) {
+    if (line >= grid->height || grid->rows[line].part < 0) return false;
+    *part = (unsigned)grid->rows[line].part;
+    *item = grid->rows[line].item;
+    return true;
+}
+
 void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const char *prompt, size_t prompt_length,
                bool typing) {
     const PureModule *m = app->module;
     for (size_t i = 0; i < (size_t)grid->width * grid->height; ++i) grid->cells[i] = (VegaCell){' ', 0, 0, false, false};
+    for (unsigned r = 0; r < grid->height; ++r) grid->rows[r].part = -1;
     grid->cursor_row = grid->cursor_column = -1;
     if (!grid->width || !grid->height) return;
     char text[VEGA_TEXT];
@@ -398,8 +415,8 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         if (focus < *first) *first = focus;
         if (visible && focus >= *first + visible) *first = focus - visible + 1;
         if (*first + visible > rows) *first = rows > visible ? rows - visible : 0;
-        if (part->kind == VEGA_LIST) draw_list(grid, app, part, *first, row + 1, area);
-        else draw_table(grid, app, part, *first, row + 1, area);
+        if (part->kind == VEGA_LIST) draw_list(grid, app, part, (int)i, *first, row + 1, area);
+        else draw_table(grid, app, part, (int)i, *first, row + 1, area);
         row += share;
     }
     /* Keys the app answers to, then the text being typed. */

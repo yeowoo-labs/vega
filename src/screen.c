@@ -32,12 +32,14 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
     for (uint32_t i = 0; i < m->views && screen->count < VEGA_PARTS; ++i) {
         if (m->view_table[i] || (int)i == screen->title || focus_view[i]) continue;
         VegaPart *part = &screen->parts[screen->count++];
-        *part = (VegaPart){.kind = VEGA_FIELD, .view = i, .focus = -1, .label = -1, .tone = -1, .detail = -1, .badge = -1};
+        *part = (VegaPart){.kind = VEGA_FIELD, .view = i, .focus = -1, .pointer = -1, .label = -1, .tone = -1, .detail = -1,
+                           .badge = -1};
         if (m->view_type[i] != PURE_VIEW_TABLE) continue;
         char name[PURE_MODULE_NAME + 8];
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         part->focus = pure_module_view(m, name);
         if (part->focus >= 0 && !focus_view[part->focus]) part->focus = -1;
+        part->pointer = part->focus >= 0 ? pure_module_position(m, (uint32_t)part->focus) : -1;
         part->label = column(m, i, "label", PURE_VIEW_TEXT);
         part->tone = column(m, i, "tone", PURE_VIEW_NUM);
         part->kind = part->label >= 0 ? VEGA_LIST : VEGA_TABLE;
@@ -153,6 +155,10 @@ size_t vega_focus(PureApp *app, const VegaPart *part) {
     double focus;
     if (part->focus < 0 || !rows || !vega_number(app, (uint32_t)part->focus, 0, &focus) || !(focus >= 0)) return 0;
     return focus >= (double)(rows - 1) ? rows - 1 : (size_t)focus;
+}
+
+bool vega_point(PureApp *app, const VegaPart *part, size_t row) {
+    return part->pointer >= 0 && pure_app_point(app, (uint32_t)part->pointer, row) == PURE_OK;
 }
 
 VegaTone vega_tone(PureApp *app, const VegaPart *part, size_t row) {

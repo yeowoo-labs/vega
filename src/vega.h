@@ -20,6 +20,7 @@ typedef struct {
     VegaKind kind;
     uint32_t view;
     int focus;                      /* number view with the focused row, or -1 */
+    int pointer;                    /* the index state that view shows, or -1: a surface may move it */
     int label, tone, detail, badge; /* columns, or -1 */
     uint32_t columns[PURE_MODULE_VIEWS]; /* a table's shown columns, in order */
     unsigned column_count;
@@ -47,6 +48,9 @@ bool vega_number(PureApp *, uint32_t view, size_t row, double *out);
 size_t vega_rows(const PureApp *, const VegaPart *);
 /* The focused row, clamped to the rows; 0 without a focus view. */
 size_t vega_focus(PureApp *, const VegaPart *);
+/* Focus a row, as a user pointing at it (a click); false when the part's
+ * focus is not a plain index position or the row is not there. */
+bool vega_point(PureApp *, const VegaPart *, size_t row);
 VegaTone vega_tone(PureApp *, const VegaPart *, size_t row);
 /* Values evaluated so far, for checking that surfaces stay lazy. */
 unsigned long vega_evaluations(void);
@@ -77,6 +81,7 @@ typedef struct {
 typedef struct {
     unsigned width, height;
     VegaCell *cells, *shown;
+    struct VegaRow { int part; size_t item; } *rows; /* the item each line shows, or part -1 */
     bool painted; /* shown holds what the terminal shows */
     size_t first[VEGA_PARTS];
     int cursor_row, cursor_column; /* where the terminal cursor goes, or -1 */
@@ -86,4 +91,6 @@ void vega_grid_free(VegaGrid *);
 /* prompt is the text being typed for the screen's text input; typing says
  * whether keys go to it. */
 void vega_draw(VegaGrid *, PureApp *, const VegaScreen *, const char *prompt, size_t prompt_length, bool typing);
+/* The part and item a line of the last drawn grid shows. */
+bool vega_hit(const VegaGrid *, unsigned line, unsigned *part, size_t *item);
 #endif

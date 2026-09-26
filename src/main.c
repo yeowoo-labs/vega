@@ -20,13 +20,16 @@
  * With --store the app's states live in that tree store: the app continues
  * where it was, whichever surface runs it.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
- * tab | frame [N] | show. key presses and releases the input bound to that key;
- * text commits text to the screen's text input; type, enter and tab act on the
- * TUI's input line. */
+ * tab | frame [N] | point VIEW ROW | click LINE COLUMN | show. key presses and
+ * releases the input bound to that key; text commits text to the screen's text
+ * input; type, enter and tab act on the TUI's input line; point focuses a row
+ * (0 first) of a list or table; click is a mouse click on the last shown TUI
+ * frame (1 first, as terminals report it). */
 
 static PureModule module;
 static PureApp app;
 static VegaScreen screen;
+static VegaGrid *drawn; /* the TUI's last frame, which a click lands on */
 static char entry[VEGA_TEXT];
 static size_t entry_length;
 static bool typing;
@@ -83,6 +86,27 @@ static bool press(const char *key, int *input) {
 static bool commit(const char *text, size_t length) {
     if (screen.prompt < 0) return false;
     return pure_app_text(&app, (uint32_t)screen.prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
+}
+
+static const VegaPart *part_named(const char *name) {
+    for (unsigned i = 0; i < screen.count; ++i)
+        if (screen.parts[i].kind != VEGA_FIELD && !strcmp(module.view_names[screen.parts[i].view], name)) return &screen.parts[i];
+    return NULL;
+}
+
+/* A mouse button on a line of the last frame: a click focuses the row there;
+ * the wheel moves the focus of the list or table under it. */
+static bool mouse(unsigned button, unsigned line) {
+    unsigned index;
+    size_t item;
+    if (!drawn || !vega_hit(drawn, line, &index, &item)) return false;
+    const VegaPart *part = &screen.parts[index];
+    if (button == 64 || button == 65) {
+        size_t focus = vega_focus(&app, part), rows = vega_rows(&app, part);
+        if (button == 64 ? !focus : focus + 1 >= rows) return false;
+        item = button == 64 ? focus - 1 : focus + 1;
+    } else if (button) return false;
+    return vega_point(&app, part, item);
 }
 
 static int hex(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; }
@@ -221,7 +245,7 @@ static void on_resize(int signal_number) { (void)signal_number; resized = 1; }
 static void restore_terminal(void) {
     if (!raw_terminal) return;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_terminal);
-    const char *leave = "\033[0m\033[?25h\033[?1049l";
+    const char *leave = "\033[?1006l\033[?1000l\033[0m\033[?25h\033[?1049l";
     if (write(STDOUT_FILENO, leave, strlen(leave)) < 0) { /* nothing left to tell */ }
     raw_terminal = false;
 }
@@ -238,7 +262,7 @@ static bool raw_mode(void) {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)) return false;
     raw_terminal = true;
     atexit(restore_terminal);
-    const char *enter = "\033[?1049h\033[?25l";
+    const char *enter = "\033[?1049h\033[?25l\033[?1000h\033[?1006h"; /* mouse buttons, reported as SGR */
     return write(STDOUT_FILENO, enter, strlen(enter)) >= 0;
 }
 
@@ -286,6 +310,19 @@ static bool handle_input(const unsigned char *in, size_t length) {
     for (size_t at = 0; at < length;) {
         unsigned char c = in[at];
         if (c == 0x03 || c == 0x11) return false; /* Ctrl-C, Ctrl-Q */
+        if (c == 0x1B && at + 2 < length && in[at + 1] == '[' && in[at + 2] == '<') {
+            /* A mouse report: ESC [ < button ; column ; line, M on press, m on release. */
+            unsigned fields[3] = {0, 0, 0}, field = 0;
+            size_t end = at + 3;
+            for (; end < length && field < 3; ++end) {
+                if (in[end] >= '0' && in[end] <= '9') fields[field] = fields[field] * 10 + (unsigned)(in[end] - '0');
+                else if (in[end] == ';') ++field;
+                else break;
+            }
+            if (end < length && in[end] == 'M' && field == 2 && fields[2]) mouse(fields[0], fields[2] - 1);
+            at = end + 1;
+            continue;
+        }
         if (c == 0x1B) {
             size_t matched = 0;
             for (size_t i = 0; i < sizeof(sequences) / sizeof(*sequences) && !matched; ++i) {
@@ -318,6 +355,7 @@ static int interactive(void) {
     if (!raw_mode()) { fputs("vega: the tui needs a terminal (or use --dump WxH)\n", stderr); return 2; }
     signal(SIGWINCH, on_resize);
     VegaGrid grid = {0};
+    drawn = &grid;
     bool ticking = frames();
     for (;;) {
         if (resized) {
@@ -338,6 +376,7 @@ static int interactive(void) {
         if (got <= 0 || !handle_input(in, (size_t)got)) break;
     }
     restore_terminal();
+    drawn = NULL;
     vega_grid_free(&grid);
     return 0;
 }
@@ -351,6 +390,8 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
     static char line[1 << 16];
     VegaGrid grid = {0};
     if (surface == SURFACE_TUI && !vega_grid(&grid, width, height)) return 2;
+    bool shown = false;
+    drawn = surface == SURFACE_TUI ? &grid : NULL;
     bool color = surface == SURFACE_CLI && isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
     unsigned long counted = vega_evaluations();
     while (fgets(line, sizeof(line), stdin)) {
@@ -359,6 +400,7 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
         if (sscanf(line, "%15s %65535s", command, argument) < 1) continue;
         bool acted = true, ok = true;
         int input = -1;
+        const char *verb = "do that";
         if (!strcmp(command, "key")) {
             ok = press(argument, &input);
             if (input < 0) fprintf(stderr, "vega: no input answers %s\n", argument);
@@ -373,6 +415,19 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
         } else if (!strcmp(command, "tab")) {
             handle_key("Tab");
             acted = false;
+        } else if (!strcmp(command, "point")) {
+            char name[PURE_MODULE_NAME];
+            long row = -1;
+            const VegaPart *part = sscanf(line, "%*s %31s %ld", name, &row) == 2 ? part_named(name) : NULL;
+            verb = "point";
+            if (!part) fprintf(stderr, "vega: no list or table %s\n", name);
+            ok = part && row >= 0 && vega_point(&app, part, (size_t)row);
+        } else if (!strcmp(command, "click")) {
+            unsigned at_line = 0, at_column = 0;
+            verb = "point";
+            if (surface != SURFACE_TUI) { fputs("vega: click needs the tui\n", stderr); continue; }
+            acted = sscanf(line, "%*s %u %u", &at_line, &at_column) == 2 && at_line && shown;
+            ok = acted && mouse(0, at_line - 1);
         } else if (!strcmp(command, "frame")) {
             long count = *argument ? strtol(argument, NULL, 10) : 1;
             for (long i = 0; i < count && i < 600; ++i) ok = pure_app_frame(&app) == PURE_OK && ok;
@@ -380,7 +435,7 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
             acted = false;
             if (surface == SURFACE_CLI) vega_print(stdout, &app, &screen, color);
             else if (surface == SURFACE_SAY) vega_say(stdout, &app, &screen, true);
-            else if (painting) {
+            else if ((shown = true) && painting) {
                 Out out = {0};
                 vega_draw(&grid, &app, &screen, entry, entry_length, typing);
                 paint(&grid, &out);
@@ -400,11 +455,12 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
         }
         if (!ok && input >= 0) fprintf(stderr, "vega: %s failed\n", module.input_names[input]);
         if (surface == SURFACE_SAY && acted) {
-            if (!ok) printf("Could not %s.\n", input >= 0 ? module.input_names[input] : "do that");
+            if (!ok) printf("Could not %s.\n", input >= 0 ? module.input_names[input] : verb);
             else vega_say(stdout, &app, &screen, false);
         }
         fflush(stdout);
     }
+    drawn = NULL;
     vega_grid_free(&grid);
     return 0;
 }

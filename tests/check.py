@@ -61,7 +61,13 @@ class Todo:
         self.tasks, self.at = [], 0
 
     def event(self, name, text=None):
-        """Returns False when the event fails (a missing item)."""
+        """Returns False when the event fails (a missing item). point takes
+        the row as text: a surface focusing it, as a click would."""
+        if name == 'point':
+            if not 0 <= text < len(self.tasks):
+                return False
+            self.at = text
+            return True
         if name == 'add':
             self.tasks.append({'title': text, 'done': 0, 'urgent': 0})
             self.at = len(self.tasks) - 1
@@ -127,7 +133,12 @@ def cli_and_say(vega, module, seeds, steps=300):
         rng = random.Random(seed)
         model, script, expected_cli, expected_say = Todo(), [], [], []
         for _ in range(steps):
-            if rng.random() < 0.25:
+            roll = rng.random()
+            if roll < 0.1:
+                row = rng.randrange(len(model.tasks) + 2)
+                script.append(f'point tasks_list {row}')
+                ok, name = model.event('point', row), 'point'
+            elif roll < 0.35:
                 word = rng.choice(WORDS)
                 script.append('text ' + (word.encode().hex() or '-'))
                 ok, name = model.event('add', word), 'add'
@@ -164,7 +175,12 @@ def stored_surfaces(vega, module, work, seeds, steps=240):
             surface = ['cli', 'say'][number % 2]
             script, expected = [], []
             for _ in range(start, end):
-                if rng.random() < 0.3:
+                roll = rng.random()
+                if roll < 0.1:
+                    row = rng.randrange(len(model.tasks) + 1)
+                    script.append(f'point tasks_list {row}')
+                    ok, name = model.event('point', row), 'point'
+                elif roll < 0.4:
                     word = rng.choice(WORDS)
                     script.append('text ' + (word.encode().hex() or '-'))
                     ok, name = model.event('add', word), 'add'
@@ -201,9 +217,16 @@ def tui(vega, module, seeds, sizes, steps=300):
         area = rows - 5  # title, field, list header, key bar, input line
         for seed in seeds:
             rng = random.Random(seed * 7 + columns)
-            model, script, states = Todo(), [], []
-            for _ in range(steps):
-                if rng.random() < 0.3:
+            model, script, states, scroll = Todo(), [], [], 0
+            for step in range(steps):
+                roll = rng.random()
+                if roll < 0.12 and step:
+                    # A click on a line of the last frame: an item line focuses that item.
+                    line = rng.randrange(rows)
+                    script.append(f'click {line + 1} 3')
+                    if 3 <= line < 3 + area and scroll + line - 3 < len(model.tasks):
+                        model.event('point', scroll + line - 3)
+                elif roll < 0.4:
                     word = rng.choice(WORDS)
                     script.append('text ' + (word.encode().hex() or '-'))
                     model.event('add', word)
@@ -212,6 +235,10 @@ def tui(vega, module, seeds, sizes, steps=300):
                     script.append(f'key {KEYS[name]}')
                     model.event(name)
                 script.append('show')
+                n = len(model.tasks)
+                if model.at < scroll: scroll = model.at
+                if model.at >= scroll + area: scroll = model.at - area + 1
+                if scroll + area > n: scroll = max(n - area, 0)
                 states.append(([dict(t) for t in model.tasks], model.at))
             result = run(vega, 'tui', module, '--dump', f'{columns}x{rows}', stdin='\n'.join(script) + '\n')
             assert result.returncode == 0, result.stderr
@@ -382,7 +409,8 @@ def interactive(vega, module, store=None):
         return data
 
     screen = read_for(0.3)
-    for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u'):
+    # Then a click on line 5 (béton's row): a mouse report, press and release.
+    for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u', b'\x1b[<0;3;5M\x1b[<0;3;5m'):
         os.write(fd, keys)
         screen += read_for(0.2)
     os.write(fd, b'\x03')
@@ -395,11 +423,13 @@ def interactive(vega, module, store=None):
     # What the terminal ended up showing, from the bytes it was sent.
     grid = [[[' ', 0, False] for _ in range(40)] for _ in range(10)]
     replay(screen, grid)
-    final = '\n'.join(shown(grid))
-    assert 'milk' in final and 'béton' in final and '(2)' in final and 'done' in final, final
+    final = shown(grid)
+    assert 'milk' in '\n'.join(final) and '(2)' in final[2] and 'done' in final[3], final
+    assert final[4].startswith('>> béton') and final[3].startswith('|  milk'), final  # the click moved the focus
+    assert '\x1b[?1000h' in text and '\x1b[?1000l' in text, 'mouse reports on, then off'
     if store:  # what was typed is still there in the next session
         again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
-        assert again == ['To do', 'left: 2 tasks', 'tasks_list (2)', '> milk [done] (muted)', '  béton'], again
+        assert again == ['To do', 'left: 2 tasks', 'tasks_list (2)', '  milk [done] (muted)', '> béton'], again
     return 1
 
 
@@ -479,6 +509,7 @@ def robustness(vega, aup, work, rounds):
                 elif roll < 0.3: script.append('show')
                 elif roll < 0.35: script.append('frame 3')
                 elif roll < 0.4: script.append(rng.choice(['type 61', 'enter', 'tab']))
+                elif roll < 0.45: script.append(f'click {rng.randrange(1, 30)} {rng.randrange(1, 90)}')
                 else: script.append('key ' + rng.choice(keys))
             text = '\n'.join(script) + '\nshow\n'
             size = rng.choice(['80x24', '12x5', '1x1', '200x3'])
