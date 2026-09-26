@@ -382,7 +382,12 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
     signal(SIGPIPE, SIG_IGN);
     static Client clients[CLIENTS];
     for (unsigned i = 0; i < CLIENTS; ++i) clients[i].fd = -1;
+    VegaTimers timers;
+    vega_timers_start(&timers, app->module, vega_now());
     while (!stopping) {
+        /* Tick what is due; every page hears of it this round, without waiting. */
+        bool ticked = false;
+        long due = vega_timers_run(&timers, app, vega_now(), &ticked);
         struct pollfd fds[CLIENTS + 1];
         unsigned slot[CLIENTS + 1], count = 1;
         fds[0] = (struct pollfd){listener, POLLIN, 0};
@@ -392,11 +397,17 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
             fds[count] = (struct pollfd){c->fd, (short)(POLLIN | (c->out_at < c->out.used ? POLLOUT : 0)), 0};
             slot[count++] = i;
         }
-        int ready = poll(fds, count, screen->ticks ? 33 : reload ? 200 : 1000);
+        int timeout = ticked ? 0 : screen->ticks ? 33 : reload ? 200 : 1000;
+        if (due >= 0 && due < timeout) timeout = (int)due;
+        int ready = poll(fds, count, timeout);
         if (ready < 0 && errno != EINTR) break;
-        bool changed = false;
+        bool changed = ticked;
+        app->now = vega_now(); /* what the events of this round see */
         if (ready == 0 && screen->ticks) changed = pure_app_frame(app) == PURE_OK;
-        if (reload && reload()) changed = true; /* a new module: every page draws it */
+        if (reload && reload()) { /* a new module: every page draws it */
+            changed = true;
+            vega_timers_start(&timers, app->module, app->now);
+        }
         if (fds[0].revents & POLLIN)
             for (int fd; (fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)) >= 0;) {
                 unsigned free_slot = CLIENTS;

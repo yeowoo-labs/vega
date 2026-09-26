@@ -609,6 +609,71 @@ def hot_swap(vega, aup, work):
     return len(out)
 
 
+def timing(vega, module):
+    """examples/stopwatch.aup: time is an input. A script sets the time events
+    see and ticks the timer; the terminal and the web page tick it on the
+    clock, and every page hears of each tick."""
+    import fcntl, pty, select, struct, termios, time
+    script = ('time 1000\nkey Space\ntime 2500\ntick tick\nshow\ntime 63400\ntick tick\nkey KeyL\n'
+              'time 70000\nkey Space\ntick tick\nshow\ntime 71000\nkey KeyR\nshow\n')
+    out = run(vega, 'cli', module, stdin=script).stdout.splitlines()
+    assert out == ['Stopwatch', 'time: 0:01.5', 'status: running', 'laps_list (0)',
+                   'Stopwatch', 'time: 1:09.0', 'status: stopped', 'laps_list (1)', '> 1:02.4 (accent)',
+                   'Stopwatch', 'time: 0:00.0', 'status: stopped', 'laps_list (1)', '> 1:02.4 (accent)'], out
+    # The terminal, on the clock: start it, and a second and more later it shows that.
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(str(vega), [str(vega), 'tui', str(module)])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 8, 30, 0, 0))
+    os.kill(pid, 28)
+    screen = b''
+
+    def read_for(seconds):
+        nonlocal screen
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    screen += os.read(fd, 65536)
+                except OSError:
+                    break
+
+    read_for(0.3)
+    os.write(fd, b' ')
+    read_for(1.4)
+    os.write(fd, b'\x03')
+    read_for(0.3)
+    _, status = os.waitpid(pid, 0)
+    os.close(fd)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    grid = [[[' ', 0, False] for _ in range(30)] for _ in range(8)]
+    replay(screen, grid)
+    final = '\n'.join(shown(grid))
+    import re
+    seconds = float(re.search(r'time\s+0:(\d\d\.\d)', final).group(1))
+    assert 1.2 <= seconds <= 2.5 and 'running' in final, final
+    # The web page: every tick is news to every open page.
+    surface = WebSurface(vega, module)
+    try:
+        import http.client
+        stream = http.client.HTTPConnection('127.0.0.1', surface.port, timeout=10)
+        stream.request('GET', '/events')
+        events = stream.getresponse()
+        events.readline(), events.readline()
+        surface.call('POST', '/key', 'Space')
+        heard = 0
+        began = time.time()
+        while time.time() - began < 1.0:
+            if events.readline().startswith(b'data:'): heard += 1
+        page = json.loads(surface.call('GET', '/screen')[1])
+        field = next(f['text'] for f in page['fields'] if f['name'] == 'time')
+        assert heard >= 6 and float(field.split(':')[1]) >= 0.8, (heard, field)
+        stream.close()
+    finally:
+        surface.stop()
+    return len(out), heard
+
+
 def scores(vega, module):
     joins = ['ann', '범수', 'Zoë']
     script = [f'text {name.encode().hex()}' for name in joins]
@@ -810,7 +875,7 @@ def main():
         work = Path(directory)
         env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
         modules = {}
-        for name in ('todo', 'scores', 'today'):
+        for name in ('todo', 'scores', 'today', 'stopwatch'):
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
@@ -818,6 +883,7 @@ def main():
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
+        report['timed_lines'], report['ticks_heard'] = timing(vega, modules['stopwatch'])
         report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \

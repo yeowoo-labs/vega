@@ -36,6 +36,16 @@ typedef struct {
 } VegaScreen;
 
 void vega_screen(VegaScreen *, const PureModule *);
+
+/* The wall-clock time events see on a live surface: milliseconds since 1970
+ * (UTC). Scripts set their own (time MS). */
+double vega_now(void);
+/* When each timer input ticks next. run ticks every one due at now (a tick
+ * sees now) and gives the milliseconds until the next, or -1 without timers;
+ * ticked says whether any did. Missed ticks are not made up. */
+typedef struct { double next[PURE_MODULE_INPUTS]; } VegaTimers;
+void vega_timers_start(VegaTimers *, const PureModule *, double now);
+long vega_timers_run(VegaTimers *, PureApp *, double now, bool *ticked);
 /* What a module seems to mean but does not meet: a list label that is not
  * text, a _focus view without its table, a column a list never shows, a
  * second text input. Each finding names the view or input it is about;

@@ -25,12 +25,13 @@
  * written again replaces the running one and states keep their values by
  * name: aup watch app.aup -o app.pmod beside it makes a saved edit show at once.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
- * tab | frame [N] | point VIEW ROW | click LINE COLUMN | swap MODULE | show. key presses and
+ * tab | frame [N] | point VIEW ROW | click LINE COLUMN | time MS | tick TIMER | swap MODULE | show. key presses and
  * releases the input bound to that key; text commits text to the screen's text
  * input; type, enter and tab act on the TUI's input line; point focuses a row
  * (0 first) of a list or table; click is a mouse click on the last shown TUI
- * frame (1 first, as terminals report it); swap replaces the module as --watch
- * does. */
+ * frame (1 first, as terminals report it); time sets the time the next
+ * events see (live surfaces use the clock) and tick ticks a timer (live
+ * surfaces tick them on time); swap replaces the module as --watch does. */
 
 static PureModule modules[2]; /* the running one (app.module) and the next */
 static unsigned current;
@@ -405,6 +406,8 @@ static int interactive(void) {
     signal(SIGWINCH, on_resize);
     VegaGrid grid = {0};
     drawn = &grid;
+    VegaTimers timers;
+    vega_timers_start(&timers, app.module, vega_now());
     for (;;) {
         if (resized) {
             struct winsize size;
@@ -413,13 +416,19 @@ static int interactive(void) {
                 vega_grid(&grid, size.ws_col, size.ws_row);
             else vega_grid(&grid, 80, 24);
         }
+        /* Tick what is due, draw, then wait for input, a frame or the next tick. */
+        bool ticked = false;
+        long due = vega_timers_run(&timers, &app, vega_now(), &ticked);
         vega_draw(&grid, &app, &screen, entry, entry_length, typing);
         paint_terminal(&grid);
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
-        int ready = poll(&wait, 1, screen.ticks ? 16 : watched ? 200 : -1);
+        int timeout = screen.ticks ? 16 : watched ? 200 : -1;
+        if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
+        int ready = poll(&wait, 1, timeout);
+        app.now = vega_now();
         if (ready == 0) {
             if (screen.ticks) pure_app_frame(&app);
-            module_changed();
+            if (module_changed()) vega_timers_start(&timers, app.module, app.now);
             continue;
         }
         if (ready < 0) continue; /* a signal, such as a resize */
@@ -480,6 +489,21 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
             if (surface != SURFACE_TUI) { fputs("vega: click needs the tui\n", stderr); continue; }
             acted = sscanf(line, "%*s %u %u", &at_line, &at_column) == 2 && at_line && shown;
             ok = acted && mouse(0, at_line - 1);
+        } else if (!strcmp(command, "time")) {
+            /* The time the next events see: scripts replay any. */
+            char *end;
+            double now = strtod(argument, &end);
+            acted = false;
+            if (!*argument || *end || !(now >= 0 && now < 1e15)) fprintf(stderr, "vega: time takes milliseconds\n");
+            else app.now = now;
+        } else if (!strcmp(command, "tick")) {
+            input = pure_module_input(app.module, argument);
+            verb = "tick";
+            if (input < 0 || app.module->input[input].kind != PURE_KIND_TIMER) {
+                fprintf(stderr, "vega: no timer %s\n", argument);
+                input = -1;
+                ok = false;
+            } else ok = pure_app_tick(&app, (uint32_t)input) == PURE_OK;
         } else if (!strcmp(command, "swap")) {
             acted = false;
             if (!swap(argument, read_module(argument))) fprintf(stderr, "vega: kept the running module\n");
