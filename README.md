@@ -18,6 +18,20 @@ build/vega web todo.pmod --watch              # 브라우저(GUI). --watch: 모�
 make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
 ```
 
+사람과 프로그램이 같은 앱을 쓴다. `examples/board.aup`는 칸반 보드다. 사람은 Vega 표면으로, 프로그램은 같은 모듈과
+저장소를 서빙하는 Pure의 `pure-serve`로 쓴다(라우트 코드가 없다. 보기가 GET, 입력이 POST다).
+
+```sh
+AUP_PATH=lib ../aup/build/aup build examples/board.aup -o board.pmod
+build/vega tui board.pmod --store ~/.board           # 사람: 제목을 쓰고 Enter, Tab 뒤 ←→로 칸을 옮긴다
+../pure/prototypes/connections/build/pure-serve --module board.pmod --store ~/.board --threads 2 &
+curl -s localhost:8767/views/counts                  # 1 to do, 1 doing, 0 done
+curl -s -X POST -H 'Content-Type: application/json' -d '{"title": "ship it", "lane": 2}' localhost:8767/inputs/post
+curl -s 'localhost:8767/views/cards_list?from=0&count=20'
+```
+
+한 저장소는 한 번에 한 호스트가 연다(상태의 소유자는 하나다).
+
 ## 위치
 
 | 층 | 역할 | 비유 |

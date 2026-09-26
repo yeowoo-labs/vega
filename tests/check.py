@@ -674,6 +674,46 @@ def timing(vega, module):
     return len(out), heard
 
 
+def hosts(vega, serve, module, work):
+    """examples/board.aup, one app and one store for people and programs: the
+    CLI adds and moves cards, pure-serve serves the same store as a JSON API
+    (a program moves one and adds another), and the CLI then shows what the
+    program did, its focus still on the card it was on."""
+    import http.client
+    store = work / 'board-store'
+    script = 'time 1000\ntext ' + 'write docs'.encode().hex() + '\ntext ' + 'ship it'.encode().hex() + '\nkey ArrowRight\nshow\n'
+    before = run(vega, 'cli', module, '--store', store, stdin=script).stdout.splitlines()
+    assert before[-3:] == ['cards_list (2)', '> ship it [doing] (accent)', '  write docs [to do]'], before
+    server = subprocess.Popen([str(serve), '--module', str(module), '--store', str(store), '--port', '0'],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        port = json.loads(server.stdout.readline())['port']
+
+        def call(method, path, body=None):
+            connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+            headers = {'Content-Type': 'application/json'} if body else {}
+            connection.request(method, path, body, headers)
+            response = connection.getresponse()
+            answer = response.status, response.read()
+            connection.close()
+            return answer
+
+        assert call('GET', '/views/counts') == (200, b'1 to do, 1 doing, 0 done')
+        assert call('POST', '/inputs/post', '{"title": "write docs", "lane": 2}') == (200, b'write docs')
+        assert call('POST', '/inputs/post', '{"title": "from api", "lane": 1}') == (200, b'from api')
+        rows = json.loads(call('GET', '/views/cards_list')[1])['items']
+        assert [(r['label'], r['badge']) for r in rows] == [('from api', 'doing'), ('ship it', 'doing'),
+                                                            ('write docs', 'done')], rows
+    finally:
+        import signal
+        server.send_signal(signal.SIGTERM)
+        assert server.wait(timeout=10) == 0, server.stderr.read()
+    after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
+    assert after == ['Board', 'counts: 0 to do, 2 doing, 1 done', 'cards_list (3)', '  from api [doing] (accent)',
+                     '> ship it [doing] (accent)', '  write docs [done] (muted)'], after
+    return len(rows)
+
+
 def scores(vega, module):
     joins = ['ann', '범수', 'Zoë']
     script = [f'text {name.encode().hex()}' for name in joins]
@@ -866,6 +906,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
     parser.add_argument('--aup', type=Path, required=True)
+    parser.add_argument('--serve', type=Path, required=True)
     parser.add_argument('--seeds', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=3)
     args = parser.parse_args()
@@ -875,7 +916,7 @@ def main():
         work = Path(directory)
         env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
         modules = {}
-        for name in ('todo', 'scores', 'today', 'stopwatch'):
+        for name in ('todo', 'scores', 'today', 'stopwatch', 'board'):
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
@@ -884,6 +925,7 @@ def main():
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
         report['timed_lines'], report['ticks_heard'] = timing(vega, modules['stopwatch'])
+        report['board_rows_across_hosts'] = hosts(vega, args.serve.resolve(), modules['board'], work)
         report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \

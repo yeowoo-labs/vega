@@ -1,0 +1,58 @@
+# A board of cards in lanes, for people and programs alike: vega tui, web,
+# cli and say show it, and pure-serve serves the same module and store as a
+# JSON API (GET /views/NAME, POST /inputs/NAME) with no routes written.
+use vega
+
+record Card {
+  title: text
+  lane = 0   # 0 to do, 1 doing, 2 done
+  since = 0  # when it came into its lane: milliseconds since 1970
+}
+
+state cards: list of Card by title
+state at: index of cards
+
+input add = text            # a person types a title
+input post = message {      # a program posts {"title": ..., "lane": ...}
+  title: text
+  lane: u32
+}
+input forward = key ArrowRight
+input back = key ArrowLeft
+input up = key ArrowUp
+input down = key ArrowDown
+input drop = key Delete
+
+fn lane_name(lane) = if lane == 0 { "to do" } else if lane == 1 { "doing" } else { "done" }
+
+on add {
+  cards.add(Card { title: add, since: now })
+  at = cards[add]
+}
+on post {
+  if !cards.has(post.title) { cards.add(Card { title: post.title }) }
+  cards[post.title].lane = min(post.lane, 2)
+  cards[post.title].since = now
+  reply post.title
+}
+on forward.down {
+  at.lane = min(at.lane + 1, 2)
+  at.since = now
+}
+on back.down {
+  at.lane = max(at.lane - 1, 0)
+  at.since = now
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on drop.down { cards.remove(at) }
+
+view title = "Board"
+view counts = "{count(c in cards where c.lane == 0)} to do, {count(c in cards where c.lane == 1)} doing, {count(c in cards where c.lane == 2)} done"
+
+view cards_list = each c in cards {
+  label = c.title
+  badge = lane_name(c.lane)
+  tone = if c.lane == 2 { vega.muted } else { vega.when(c.lane == 1, vega.accent) }
+}
+view cards_list_focus = at.position

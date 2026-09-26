@@ -21,4 +21,5 @@ $(BUILD)/vega: $(SOURCES) src/vega.h $(PURE_SOURCES) | $(BUILD)
 
 check: $(BUILD)/vega
 	$(MAKE) -C $(AUP) build/aup
-	python3 tests/check.py --vega $(BUILD)/vega --aup $(AUP)/build/aup
+	$(MAKE) -C $(PURE) build/pure-serve
+	python3 tests/check.py --vega $(BUILD)/vega --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve
