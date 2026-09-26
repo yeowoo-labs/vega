@@ -17,6 +17,8 @@
  *   tui --paint WxH  the bytes each frame sends to the terminal, driven by a script
  *   cli              plain lines for pipes, driven by a script
  *   say              sentences (the first natural-language surface), driven by a script
+ *   web [--listen ADDRESS] [--port N]
+ *                    a web page (a GUI), on 127.0.0.1 unless another address is given
  * With --store the app's states live in that tree store: the app continues
  * where it was, whichever surface runs it.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
@@ -63,11 +65,7 @@ static bool load(const char *path, const char *store) {
     return true;
 }
 
-static int key_input(const char *key) {
-    for (uint32_t i = 0; i < module.inputs; ++i)
-        if (module.input[i].kind == PURE_KIND_KEY && !strcmp(module.input_keys[i], key)) return (int)i;
-    return -1;
-}
+static int key_input(const char *key) { return vega_key_input(&module, key); }
 
 static bool frames(void) {
     for (uint32_t h = 0; h < module.handlers; ++h) if (module.handler[h].event == 0) return true;
@@ -77,16 +75,10 @@ static bool frames(void) {
 /* A key press and release; false when the app has no such key or the press failed. */
 static bool press(const char *key, int *input) {
     *input = key_input(key);
-    if (*input < 0) return false;
-    bool ok = pure_app_input(&app, (uint32_t)*input, PURE_EDGE_DOWN) == PURE_OK;
-    pure_app_input(&app, (uint32_t)*input, PURE_EDGE_UP);
-    return ok;
+    return *input >= 0 && vega_press(&app, key);
 }
 
-static bool commit(const char *text, size_t length) {
-    if (screen.prompt < 0) return false;
-    return pure_app_text(&app, (uint32_t)screen.prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
-}
+static bool commit(const char *text, size_t length) { return vega_commit(&app, &screen, text, length); }
 
 static const VegaPart *part_named(const char *name) {
     for (unsigned i = 0; i < screen.count; ++i)
@@ -383,7 +375,7 @@ static int interactive(void) {
 
 /* ---- scripts -------------------------------------------------------- */
 
-typedef enum { SURFACE_CLI, SURFACE_SAY, SURFACE_TUI } Surface;
+typedef enum { SURFACE_CLI, SURFACE_SAY, SURFACE_TUI, SURFACE_WEB } Surface;
 
 /* painting: show writes the terminal bytes of the frame, not the grid. */
 static int script(Surface surface, unsigned width, unsigned height, bool painting) {
@@ -466,11 +458,14 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
 }
 
 int main(int argc, char **argv) {
-    unsigned width = 0, height = 0;
+    unsigned width = 0, height = 0, port = 8080;
     bool dumped = false, painting = false, usage = argc < 3 || argc % 2 == 0;
-    const char *store = NULL;
+    const char *store = NULL, *listen_on = "127.0.0.1";
     for (int i = 3; !usage && i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--store")) store = argv[i + 1];
+        else if (!strcmp(argv[i], "--listen") && !strcmp(argv[1], "web")) listen_on = argv[i + 1];
+        else if (!strcmp(argv[i], "--port") && !strcmp(argv[1], "web") && sscanf(argv[i + 1], "%u", &port) == 1 &&
+                 port < 65536) {}
         else if ((!strcmp(argv[i], "--dump") || !strcmp(argv[i], "--paint")) &&
                  sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height && width <= 1000 && height <= 1000)
             dumped = true, painting = !strcmp(argv[i], "--paint");
@@ -479,6 +474,7 @@ int main(int argc, char **argv) {
     if (usage || (dumped && strcmp(argv[1], "tui")) || (!strcmp(argv[1], "check") && argc != 3)) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
               "vega tui MODULE.pmod [--store PATH] --dump|--paint WIDTHxHEIGHT < script\n"
+              "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N]\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
@@ -487,10 +483,11 @@ int main(int argc, char **argv) {
         return vega_check(&module, print_finding, argv[2]) ? 1 : 0;
     }
     Surface surface = !strcmp(argv[1], "cli") ? SURFACE_CLI : !strcmp(argv[1], "say") ? SURFACE_SAY :
-                      !strcmp(argv[1], "tui") ? SURFACE_TUI : (Surface)-1;
+                      !strcmp(argv[1], "tui") ? SURFACE_TUI : !strcmp(argv[1], "web") ? SURFACE_WEB : (Surface)-1;
     if ((int)surface < 0) { fprintf(stderr, "vega: unknown surface %s\n", argv[1]); return 2; }
     if (!load(argv[2], store)) return 2;
-    int status = surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height, painting);
+    int status = surface == SURFACE_WEB ? vega_web(&app, &screen, listen_on, port) :
+                 surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height, painting);
     /* Frame changes are stored with events; keep the last ones too. */
     if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }
     pure_app_stop(&app);

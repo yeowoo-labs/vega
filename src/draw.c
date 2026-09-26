@@ -412,9 +412,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         write_cstr(&head, count);
         unsigned area = share - 1, visible = part->kind == VEGA_TABLE && area ? area - 1 : area;
         size_t *first = &grid->first[i];
-        if (focus < *first) *first = focus;
-        if (visible && focus >= *first + visible) *first = focus - visible + 1;
-        if (*first + visible > rows) *first = rows > visible ? rows - visible : 0;
+        *first = vega_scroll(*first, focus, visible, rows);
         if (part->kind == VEGA_LIST) draw_list(grid, app, part, (int)i, *first, row + 1, area);
         else draw_table(grid, app, part, (int)i, *first, row + 1, area);
         row += share;

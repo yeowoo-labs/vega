@@ -51,6 +51,15 @@ size_t vega_focus(PureApp *, const VegaPart *);
 /* Focus a row, as a user pointing at it (a click); false when the part's
  * focus is not a plain index position or the row is not there. */
 bool vega_point(PureApp *, const VegaPart *, size_t row);
+/* The first row to show of `rows` when `visible` fit: the least scrolling
+ * from first that keeps the focused row in view. */
+size_t vega_scroll(size_t first, size_t focus, size_t visible, size_t rows);
+/* The key input answering a key name (Pure's names, as KeyboardEvent.code
+ * spells them), or -1; press sends its press and release. */
+int vega_key_input(const PureModule *, const char *key);
+bool vega_press(PureApp *, const char *key);
+/* Commit text to the screen's text input. */
+bool vega_commit(PureApp *, const VegaScreen *, const char *text, size_t length);
 VegaTone vega_tone(PureApp *, const VegaPart *, size_t row);
 /* Values evaluated so far, for checking that surfaces stay lazy. */
 unsigned long vega_evaluations(void);
@@ -68,6 +77,9 @@ unsigned vega_text_width(const char *text, size_t length);
 void vega_print(FILE *, PureApp *, const VegaScreen *, bool color);
 /* NUI: the screen as sentences (all), or only the focused item of the first list. */
 void vega_say(FILE *, PureApp *, const VegaScreen *, bool all);
+/* GUI: the screen as a web page on listen:port (0: any free port, printed as
+ * {"port":N}); runs until SIGINT or SIGTERM. */
+int vega_web(PureApp *, const VegaScreen *, const char *listen, unsigned port);
 
 /* TUI: a grid of cells, redrawn from the app on every change. first keeps each
  * list's scroll between frames; the focused row stays visible. shown is what

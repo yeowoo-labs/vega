@@ -20,6 +20,10 @@
    none in the examples.
 7. Painting: the bytes the TUI sends, replayed by a small terminal emulator,
    give the very frame the dump shows, while sending only what changed.
+8. Web: the GUI surface's screen JSON matches the model after random keys,
+   text and row clicks, holds only the rows asked for around the focus, and
+   every open page hears of each change. In headless Chromium (when node and
+   chromium are there) the page itself takes keys, a click and typed text.
 """
 import argparse
 import json
@@ -368,6 +372,119 @@ def painting(vega, module, seeds, sizes, steps=200):
     return compared, first_mean, later_mean
 
 
+def web(vega, module, work, seeds, steps=150, visible=4):
+    """The web surface against the model: POST keys, text and row clicks, then
+    the screen JSON's title, field, rows, focus and the window of items."""
+    import http.client
+    import signal
+    import threading
+    compared = 0
+    for seed in seeds:
+        store = work / f'web-{seed}'
+        process = subprocess.Popen([str(vega), 'web', str(module), '--port', '0', '--store', str(store)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        port = json.loads(process.stdout.readline())['port']
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+
+        def call(method, path, body=None):
+            connection.request(method, path, body.encode() if isinstance(body, str) else body)
+            response = connection.getresponse()
+            return response.status, response.read()
+
+        heard = []
+        stream = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        stream.request('GET', '/events')
+        events = stream.getresponse()
+        assert events.getheader('Content-Type') == 'text/event-stream'
+        listener = threading.Thread(target=lambda: [heard.append(line) for line in iter(events.readline, b'')
+                                                    if line.startswith(b'data:')], daemon=True)
+        listener.start()
+        status, page = call('GET', '/')
+        assert status == 200 and b'EventSource' in page and b"role:'listbox'" in page, page[:80]
+        assert call('GET', '/nowhere')[0] == 404
+        rng, model, first, part = random.Random(seed + 900), Todo(), 0, None
+        for _ in range(steps):
+            roll = rng.random()
+            if roll < 0.3:
+                word = rng.choice(WORDS)
+                status, answer = call('POST', '/text', word)
+                model.event('add', word)
+            elif roll < 0.45 and part is not None:
+                row = rng.randrange(len(model.tasks) + 1)
+                status, answer = call('POST', '/point', f'{part} {row}')
+                assert json.loads(answer)['ok'] == model.event('point', row), (seed, row)
+            else:
+                name = rng.choice(list(KEYS))
+                status, answer = call('POST', '/key', KEYS[name])
+                assert json.loads(answer)['ok'] == model.event(name), (seed, name)
+            assert status == 200
+            status, body = call('GET', f'/screen?rows={visible}&first={first}')
+            screen = json.loads(body)
+            tasks, n = model.tasks, len(model.tasks)
+            (listed,) = screen['parts']
+            part = listed['part']
+            if model.at < first: first = model.at
+            if model.at >= first + visible: first = model.at - visible + 1
+            if first + visible > n: first = max(n - visible, 0)
+            assert screen['title'] == 'To do' and screen['fields'] == [{'name': 'left', 'text': f'{n} tasks'}], screen
+            assert (listed['rows'], listed['focus'], listed['first']) == (n, model.at, first), (seed, listed, model.at)
+            window = tasks[first:first + visible]
+            assert [(item['row'], item['label'], item['badge'], item['tone']) for item in listed['items']] == \
+                [(first + i, task['title'], Todo.badge(task), Todo.tone(task)) for i, task in enumerate(window)], seed
+            assert screen['prompt'] == 'add' and listed['pointable'] and listed['kind'] == 'list'
+            compared += 1
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, process.stderr.read()
+        listener.join(timeout=5)
+        assert len(heard) > steps // 2, len(heard)  # a change each time, more or less merged
+        again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
+        assert again == model.cli(), (again, model.cli())
+    return compared
+
+
+class WebSurface:
+    """vega web on a free port; stops with SIGTERM."""
+
+    def __init__(self, vega, module, *args):
+        self.process = subprocess.Popen([str(vega), 'web', str(module), '--port', '0', *map(str, args)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.port = json.loads(self.process.stdout.readline())['port']
+
+    def call(self, method, path, body=None):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        try:
+            connection.request(method, path, body.encode() if isinstance(body, str) else body)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def stop(self):
+        import signal
+        self.process.send_signal(signal.SIGTERM)
+        assert self.process.wait(timeout=10) == 0, self.process.stderr.read()
+
+
+def browser(vega, module, work):
+    """The page in headless Chromium: keys, a click on a row, typed text."""
+    import shutil
+    if not shutil.which('node') or not shutil.which('chromium'):
+        return 'skipped'
+    store = work / 'browser-store'
+    assert run(vega, 'cli', module, '--store', store, stdin='text 61\ntext 62\ntext 63\n').returncode == 0
+    surface = WebSurface(vega, module, '--store', store)
+    try:
+        result = run('node', HERE / 'browser.mjs', f'http://127.0.0.1:{surface.port}/')
+    finally:
+        surface.stop()
+    outcome = json.loads(result.stdout)
+    assert result.returncode == 0 and outcome['ok'], outcome
+    after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
+    assert after == ['To do', 'left: 4 tasks', 'tasks_list (4)', '  a [done] (muted)', '  b', '  c', '> 브라우저'], after
+    return len(outcome['steps'])
+
+
 def scores(vega, module):
     joins = ['ann', '범수', 'Zoë']
     script = [f'text {name.encode().hex()}' for name in joins]
@@ -383,6 +500,19 @@ def scores(vega, module):
                         '|  범수  3      gold\tgood'], tui
     say = run(vega, 'say', module, stdin='show\n' + '\n'.join(script) + '\n').stdout.splitlines()
     assert 'Item 1 of 3: danger, name ann, score -1, rank -.' in say, say
+    # The web surface: a table's columns and cells in order, with tones.
+    surface = WebSurface(vega, module)
+    try:
+        for line in script[:-1]:
+            command, argument = line.split()
+            if command == 'text': surface.call('POST', '/text', bytes.fromhex(argument))
+            else: surface.call('POST', '/key', argument)
+        board = json.loads(surface.call('GET', '/screen?rows=10')[1])['parts'][0]
+    finally:
+        surface.stop()
+    assert board['kind'] == 'table' and board['columns'] == ['name', 'score', 'rank'] and board['focus'] == 0, board
+    assert [(item['cells'], item['tone']) for item in board['items']] == [
+        (['ann', '-1', '-'], 'danger'), (['범수', '3', 'gold'], 'good'), (['Zoë', '0', '-'], 'normal')], board
     return len(out)
 
 
@@ -517,6 +647,19 @@ def robustness(vega, aup, work, rounds):
                 result = run(vega, surface[0], module, *surface[1:], stdin=text)
                 assert result.returncode == 0, (path, surface, result.stderr[-400:])
                 runs += 1
+        # The web surface under random posts: every answer well formed, and a clean stop.
+        surface = WebSurface(vega, module)
+        try:
+            for _ in range(40):
+                roll = rng.random()
+                if roll < 0.3: surface.call('POST', '/text', rng.choice(WORDS))
+                elif roll < 0.4: surface.call('POST', '/point', f'{rng.randrange(4)} {rng.randrange(4)}')
+                else: surface.call('POST', '/key', rng.choice(keys))
+                status, body = surface.call('GET', f'/screen?rows={rng.randrange(0, 30)}&first={rng.randrange(9)},1')
+                assert status == 200 and isinstance(json.loads(body)['parts'], list), (path, body[:200])
+        finally:
+            surface.stop()
+        runs += 1
     return len(examples), runs
 
 
@@ -543,6 +686,8 @@ def main():
         report['table_lines'] = scores(vega, modules['scores'])
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
+        report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))
+        report['browser_steps'] = browser(vega, modules['todo'], work)
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
             interactive(vega, modules['todo'], work / 'interactive-store')
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))

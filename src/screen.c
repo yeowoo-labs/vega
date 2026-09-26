@@ -157,6 +157,32 @@ size_t vega_focus(PureApp *app, const VegaPart *part) {
     return focus >= (double)(rows - 1) ? rows - 1 : (size_t)focus;
 }
 
+size_t vega_scroll(size_t first, size_t focus, size_t visible, size_t rows) {
+    if (focus < first) first = focus;
+    if (visible && focus >= first + visible) first = focus - visible + 1;
+    if (first + visible > rows) first = rows > visible ? rows - visible : 0;
+    return first;
+}
+
+int vega_key_input(const PureModule *m, const char *key) {
+    for (uint32_t i = 0; i < m->inputs; ++i)
+        if (m->input[i].kind == PURE_KIND_KEY && !strcmp(m->input_keys[i], key)) return (int)i;
+    return -1;
+}
+
+bool vega_press(PureApp *app, const char *key) {
+    int input = vega_key_input(app->module, key);
+    if (input < 0) return false;
+    bool ok = pure_app_input(app, (uint32_t)input, PURE_EDGE_DOWN) == PURE_OK;
+    pure_app_input(app, (uint32_t)input, PURE_EDGE_UP);
+    return ok;
+}
+
+bool vega_commit(PureApp *app, const VegaScreen *screen, const char *text, size_t length) {
+    return screen->prompt >= 0 &&
+           pure_app_text(app, (uint32_t)screen->prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
+}
+
 bool vega_point(PureApp *app, const VegaPart *part, size_t row) {
     return part->pointer >= 0 && pure_app_point(app, (uint32_t)part->pointer, row) == PURE_OK;
 }

@@ -8,7 +8,7 @@ AUP ?= ../aup
 
 PURE_SOURCES = $(PURE)/module.c $(PURE)/module-list.c $(PURE)/module-save.c $(PURE)/module-store.c \
                $(PURE)/module-text.c $(PURE)/store-tree.c
-SOURCES = src/screen.c src/draw.c src/width.c src/main.c
+SOURCES = src/screen.c src/draw.c src/width.c src/web.c src/main.c
 
 .PHONY: all check
 all: $(BUILD)/vega
