@@ -34,6 +34,11 @@ typedef struct {
 } VegaScreen;
 
 void vega_screen(VegaScreen *, const PureModule *);
+/* What a module seems to mean but does not meet: a list label that is not
+ * text, a _focus view without its table, a column a list never shows, a
+ * second text input. Each finding names the view or input it is about;
+ * returns how many there were. */
+unsigned vega_check(const PureModule *, void (*report)(void *, const char *name, const char *message), void *context);
 
 /* A view (row ignored) or a column at a row as text; numbers in Pure's
  * shortest form. false when it has no value (for example a missing item). */

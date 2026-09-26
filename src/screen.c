@@ -50,6 +50,62 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
     }
 }
 
+static bool is_view(const PureModule *m, int view, uint8_t type) {
+    return view >= 0 && m->view_type[view] == type;
+}
+
+unsigned vega_check(const PureModule *m, void (*report)(void *, const char *name, const char *message), void *context) {
+    unsigned found = 0;
+    char name[2 * PURE_MODULE_NAME + 8], message[256];
+#define FIND(...) do { snprintf(message, sizeof(message), __VA_ARGS__); report(context, name, message); ++found; } while (0)
+    int title = pure_module_view(m, "title");
+    snprintf(name, sizeof(name), "title");
+    if (title >= 0 && m->view_type[title] != PURE_VIEW_TEXT) FIND("a title is text; this one shows as a field");
+    for (uint32_t i = 0; i < m->views; ++i) {
+        if (m->view_table[i]) continue;
+        const char *view = m->view_names[i];
+        size_t length = strlen(view);
+        snprintf(name, sizeof(name), "%s", view);
+        if (length > 6 && !strcmp(view + length - 6, "_focus")) {
+            char table[PURE_MODULE_NAME];
+            snprintf(table, sizeof(table), "%.*s", (int)(length - 6), view);
+            int owner = pure_module_view(m, table);
+            if (!is_view(m, owner, PURE_VIEW_TABLE))
+                FIND("names no list or table %s; it shows as a field", table);
+            else if (m->view_type[i] != PURE_VIEW_NUM) FIND("the focused row is a number; %s shows no focus", table);
+        }
+        if (m->view_type[i] != PURE_VIEW_TABLE) continue;
+        int label = pure_module_column(m, i, "label"), tone = pure_module_column(m, i, "tone");
+        bool list = is_view(m, label, PURE_VIEW_TEXT);
+        unsigned shown = 0;
+        for (uint32_t k = 0; k < m->views; ++k) {
+            if (m->view_table[k] != i + 1) continue;
+            const char *column = m->view_names[k];
+            bool text = m->view_type[k] == PURE_VIEW_TEXT;
+            snprintf(name, sizeof(name), "%s.%s", view, column);
+            if ((int)k == label && !text) FIND("a list's label is text; %s shows as a table", view);
+            else if ((int)k == tone && text) FIND("a tone is a number (vega.normal ... vega.danger); %s", list ?
+                                                  "the list ignores it" : "it shows as a column");
+            else if (list && (!strcmp(column, "badge") || !strcmp(column, "detail")) && !text)
+                FIND("a list's %s is text; this one is not shown", column);
+            else if (list && (int)k != label && (int)k != tone && strcmp(column, "badge") && strcmp(column, "detail"))
+                FIND("a list shows label, badge, detail and tone; this column is not shown");
+            shown += (int)k != tone || text;
+        }
+        snprintf(name, sizeof(name), "%s", view);
+        if (!list && !shown) FIND("a table with no column to show");
+    }
+    int prompt = -1;
+    for (uint32_t i = 0; i < m->inputs; ++i) {
+        if (m->input[i].kind != PURE_KIND_TEXT) continue;
+        snprintf(name, sizeof(name), "%s", m->input_names[i]);
+        if (prompt >= 0) FIND("only the first text input (%s) has a place to type into", m->input_names[prompt]);
+        else prompt = (int)i;
+    }
+#undef FIND
+    return found;
+}
+
 typedef struct { char *out; size_t used; } Collect;
 
 static bool collect(void *context, PureSpan span) {

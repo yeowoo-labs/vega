@@ -16,6 +16,8 @@
 4. Every aup example runs on every surface under random keys without a crash.
 5. Stored: surfaces take turns on one store and each continues the list; an
    interactive session's entries are there in the next one.
+6. vega check names every convention a spec seems to mean but misses, and
+   none in the examples.
 """
 import argparse
 import json
@@ -304,6 +306,61 @@ def interactive(vega, module, store=None):
     return 1
 
 
+BROKEN_SPEC = """use vega
+record Item {
+  name: text
+  size = 0
+}
+state items: list of Item
+state at: index of items
+input add = text
+input note = text
+input up = key ArrowUp
+on add { items.append(Item { name: add }) }
+on note { items.append(Item { name: note }) }
+on up.down { at = at - 1 }
+view title = 3
+view items_list = each item in items {
+  label = item.name
+  tone = "red"
+  badge = item.size
+  size = item.size
+}
+view sizes = each item in items {
+  label = item.size
+}
+view empty = each item in items {
+  tone = vega.muted
+}
+view missing_focus = 1
+view items_list_focus = "0"
+"""
+
+
+def conventions(vega, aup, work, modules):
+    """Every convention the broken spec misses, and none in the examples."""
+    env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
+    (work / 'broken.aup').write_text(BROKEN_SPEC)
+    built = run(aup, 'build', work / 'broken.aup', '-o', work / 'broken.pmod', env=env)
+    assert built.returncode == 0, built.stderr
+    result = run(vega, 'check', work / 'broken.pmod')
+    found = [line.split(': ', 1)[1] for line in result.stdout.splitlines()]
+    assert result.returncode == 1 and found == [
+        'title: a title is text; this one shows as a field',
+        'items_list.tone: a tone is a number (vega.normal ... vega.danger); the list ignores it',
+        "items_list.badge: a list's badge is text; this one is not shown",
+        'items_list.size: a list shows label, badge, detail and tone; this column is not shown',
+        "sizes.label: a list's label is text; sizes shows as a table",
+        'empty: a table with no column to show',
+        'missing_focus: names no list or table missing; it shows as a field',
+        'items_list_focus: the focused row is a number; items_list shows no focus',
+        'note: only the first text input (add) has a place to type into'], result.stdout
+    for module in modules.values():
+        clean = run(vega, 'check', module)
+        assert clean.returncode == 0 and not clean.stdout, clean.stdout
+    return len(found)
+
+
 def robustness(vega, aup, work, rounds):
     """Every aup example, every surface, random keys and text: never a crash."""
     examples = sorted((ROOT.parent / 'aup' / 'examples').glob('*.aup')) + sorted((ROOT / 'examples').glob('*.aup'))
@@ -315,6 +372,7 @@ def robustness(vega, aup, work, rounds):
         module = work / (path.stem + '.pmod')
         built = run(aup, 'build', path, '-o', module, env=env)
         assert built.returncode == 0, (path, built.stderr)
+        assert run(vega, 'check', module).returncode in (0, 1), path
         rng = random.Random(path.stem)
         for _ in range(rounds):
             script = []
@@ -357,6 +415,7 @@ def main():
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
             interactive(vega, modules['todo'], work / 'interactive-store')
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
+        report['convention_findings'] = conventions(vega, aup, work, modules)
         report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
     print(json.dumps(report))
 

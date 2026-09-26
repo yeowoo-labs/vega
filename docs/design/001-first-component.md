@@ -46,6 +46,29 @@ Tab이 키 모드로 바꾸면 글자·숫자·Space가 `KeyA`·`Digit0`·`Space
 표시 폭은 Vega가 맡는다. 한글·CJK·그림 이모지는 두 칸, 결합 문자·변이 선택자·ZWJ는 0칸, 제어 문자는
 제어 그림(U+2400대)으로 보인다. grapheme 단위 자르기는 아직 없어 ZWJ 이모지 묶음은 근사다.
 
+## 규약 검사 (`vega check`)
+
+`vega check app.pmod`는 모듈이 뜻한 듯하지만 규약에 맞지 않는 곳을 알린다. 표면은 이런 보기를 조용히 다른
+부품으로 읽는다. 검사는 그 읽기를 드러내어 오타나 타입 실수가 화면에서 사라지지 않게 한다. 찾으면 종료 코드 1이다.
+규칙은 화면을 읽는 코드와 같은 파일(`src/screen.c`)에 있다.
+
+| 찾는 것 | 표면이 대신 하는 일 |
+|---|---|
+| 수인 `title` | 필드로 보인다 |
+| 수인 `label` 열 | 목록이 아니라 표로 보인다 |
+| text인 `tone` 열 | 목록은 무시, 표는 열로 보인다 |
+| 수인 `badge`·`detail` 열 | 보이지 않는다 |
+| 목록의 그 밖의 열 | 보이지 않는다(목록은 label, badge, detail, tone만 보인다) |
+| 보일 열이 없는 표 | 제목과 행 수만 보인다 |
+| 목록·표가 없는 `X_focus`, text인 `_focus` | 필드로 보이거나 포커스가 없다 |
+| 두 번째 text 입력 | 입력할 곳이 없다(첫 번째만 입력 줄을 얻는다) |
+
+```text
+$ vega check bad.pmod
+bad.pmod: items_list.tone: a tone is a number (vega.normal ... vega.danger); the list ignores it
+bad.pmod: missing_focus: names no list or table missing; it shows as a field
+```
+
 ## 영속
 
 모든 표면은 `--store 경로`를 받는다. 앱의 상태는 Pure가 그 트리 저장소에 두므로, 터미널에서 적은 할 일을 다음 실행의
@@ -64,10 +87,11 @@ CLI나 문장 표면이 그대로 이어받는다. Vega에도 앱에도 저장 �
 - 한 저장소를 CLI와 문장 표면이 번갈아 이어 쓰며(시드마다 7번) 매번 모델과 같은 목록을 보이고, 대화형 세션에서 입력한
   것이 다음 실행에 남는다.
 - aup와 Vega의 예제 11개를 세 표면에 무작위 입력으로 돌려 비정상 종료가 없다. sanitizer 빌드로도 같은 검사를 통과한다.
+- 규약을 여덟 가지로 어긴 명세에서 `vega check`가 아홉 곳을 모두 정확한 문장으로 알리고, 예제에서는 아무것도 알리지
+  않는다.
 
 ## 남은 것
 
-- 규약 오류를 조용히 넘기지 않기: `label`이 수인 목록, 표에 없는 `_focus` 같은 것을 `vega check`로 알린다.
 - 포커스를 표면에서 바꾸기(GUI 클릭, TUI 마우스). 지금은 앱의 키 핸들러만 포커스를 옮긴다. Pure에 표의 인덱스를
   이벤트로 바꾸는 호스트 API가 필요하다.
 - 셀 단위 갱신(TUI는 매 변경마다 전체를 다시 그린다), GUI 표면, 음성 합성으로 가는 NUI.

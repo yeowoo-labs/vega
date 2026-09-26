@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 /* vega SURFACE MODULE [--store PATH]: one module, one screen, several surfaces.
+ *   check            what the module seems to mean but does not meet (exit 1)
  *   tui              interactive terminal
  *   tui --dump WxH   the terminal's frames as text, driven by a script
  *   cli              plain lines for pipes, driven by a script
@@ -29,7 +30,7 @@ static char entry[VEGA_TEXT];
 static size_t entry_length;
 static bool typing;
 
-static bool load(const char *path, const char *store) {
+static bool load_module(const char *path) {
     static unsigned char bytes[1 << 17];
     FILE *file = fopen(path, "rb");
     size_t size = file ? fread(bytes, 1, sizeof(bytes), file) : 0;
@@ -41,6 +42,15 @@ static bool load(const char *path, const char *store) {
         fprintf(stderr, "vega: %s: %s\n", path, error);
         return false;
     }
+    return true;
+}
+
+static void print_finding(void *path, const char *name, const char *message) {
+    printf("%s: %s: %s\n", (const char *)path, name, message);
+}
+
+static bool load(const char *path, const char *store) {
+    if (!load_module(path)) return false;
     if (store && pure_store_init(store) != PURE_OK) { fprintf(stderr, "vega: cannot open store %s\n", store); return false; }
     PureResult started = pure_app_start(&app, &module, store ? pure_tree_data(store) : (PureData){0});
     if (started != PURE_OK) { fprintf(stderr, "vega: cannot start (%d)\n", (int)started); return false; }
@@ -376,10 +386,15 @@ int main(int argc, char **argv) {
                  width <= 1000 && height <= 1000) dumped = true;
         else usage = true;
     }
-    if (usage || (dumped && strcmp(argv[1], "tui"))) {
+    if (usage || (dumped && strcmp(argv[1], "tui")) || (!strcmp(argv[1], "check") && argc != 3)) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
-              "vega tui MODULE.pmod [--store PATH] --dump WIDTHxHEIGHT < script\n", stderr);
+              "vega tui MODULE.pmod [--store PATH] --dump WIDTHxHEIGHT < script\n"
+              "vega check MODULE.pmod\n", stderr);
         return 2;
+    }
+    if (!strcmp(argv[1], "check")) {
+        if (!load_module(argv[2])) return 2;
+        return vega_check(&module, print_finding, argv[2]) ? 1 : 0;
     }
     Surface surface = !strcmp(argv[1], "cli") ? SURFACE_CLI : !strcmp(argv[1], "say") ? SURFACE_SAY :
                       !strcmp(argv[1], "tui") ? SURFACE_TUI : (Surface)-1;
