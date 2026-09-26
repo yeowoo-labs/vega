@@ -192,10 +192,13 @@ void vega_say(FILE *out, PureApp *app, const VegaScreen *screen, bool all) {
 
 bool vega_grid(VegaGrid *grid, unsigned width, unsigned height) {
     size_t count = (size_t)width * height;
-    VegaCell *cells = calloc(count ? count : 1, sizeof(*cells));
-    if (!cells) return false;
+    VegaCell *cells = calloc(count ? count : 1, sizeof(*cells)), *shown = calloc(count ? count : 1, sizeof(*shown));
+    if (!cells || !shown) { free(cells); free(shown); return false; }
     free(grid->cells);
+    free(grid->shown);
     grid->cells = cells;
+    grid->shown = shown;
+    grid->painted = false;
     grid->width = width;
     grid->height = height;
     return true;
@@ -203,6 +206,7 @@ bool vega_grid(VegaGrid *grid, unsigned width, unsigned height) {
 
 void vega_grid_free(VegaGrid *grid) {
     free(grid->cells);
+    free(grid->shown);
     *grid = (VegaGrid){0};
 }
 

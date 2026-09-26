@@ -14,6 +14,7 @@
  *   check            what the module seems to mean but does not meet (exit 1)
  *   tui              interactive terminal
  *   tui --dump WxH   the terminal's frames as text, driven by a script
+ *   tui --paint WxH  the bytes each frame sends to the terminal, driven by a script
  *   cli              plain lines for pipes, driven by a script
  *   say              sentences (the first natural-language surface), driven by a script
  * With --store the app's states live in that tree store: the app continues
@@ -157,33 +158,56 @@ static void dump(const VegaGrid *grid) {
 
 static const char *const sgr_tones[VEGA_TONES] = {"", ";2", ";1;36", ";32", ";33", ";31"};
 
-static void paint(const VegaGrid *grid) {
-    Out out = {0};
-    out_put(&out, "\033[H", 3);
+static bool same_cell(const VegaCell *a, const VegaCell *b) {
+    return a->ch == b->ch && a->mark == b->mark && a->tone == b->tone && a->focus == b->focus && a->strong == b->strong;
+}
+
+/* The terminal bytes that turn what it shows into the grid: each run of
+ * changed cells after a cursor move (a short unchanged gap stays in the run,
+ * being cheaper than another move), everything after a resize. */
+static void paint(VegaGrid *grid, Out *out) {
+    bool all = !grid->painted;
+    int style = -1;
+    char code[48];
+    if (all) out_put(out, "\033[2J", 4);
     for (unsigned r = 0; r < grid->height; ++r) {
-        const VegaCell *line = grid->cells + (size_t)r * grid->width;
-        int style = -1;
-        for (unsigned c = 0; c < grid->width; ++c) {
-            if (!line[c].ch) continue;
-            int next = line[c].tone | line[c].focus << 4 | line[c].strong << 5;
-            if (next != style) {
-                char sgr[32];
-                int n = snprintf(sgr, sizeof(sgr), "\033[0%s%s%sm", line[c].strong ? ";1" : "", line[c].focus ? ";7" : "",
-                                 sgr_tones[line[c].tone < VEGA_TONES ? line[c].tone : 0]);
-                out_put(&out, sgr, (size_t)n);
-                style = next;
+        const VegaCell *line = grid->cells + (size_t)r * grid->width, *old = grid->shown + (size_t)r * grid->width;
+        for (unsigned c = 0; c < grid->width;) {
+            if (!all && same_cell(&line[c], &old[c])) { ++c; continue; }
+            unsigned start = c, end = c + 1;
+            for (unsigned k = c + 1, gap = 0; k < grid->width && gap <= 6; ++k) {
+                if (all || !same_cell(&line[k], &old[k])) { end = k + 1; gap = 0; }
+                else ++gap;
             }
-            out_codepoint(&out, line[c].ch);
-            if (line[c].mark) out_codepoint(&out, line[c].mark);
+            while (start && !line[start].ch) --start; /* the second half of a wide character: from its first */
+            out_put(out, code, (size_t)snprintf(code, sizeof(code), "\033[%u;%uH", r + 1, start + 1));
+            for (unsigned k = start; k < end; ++k) {
+                if (!line[k].ch) continue;
+                int next = line[k].tone | line[k].focus << 4 | line[k].strong << 5;
+                if (next != style) {
+                    out_put(out, code, (size_t)snprintf(code, sizeof(code), "\033[0%s%s%sm", line[k].strong ? ";1" : "",
+                                                         line[k].focus ? ";7" : "",
+                                                         sgr_tones[line[k].tone < VEGA_TONES ? line[k].tone : 0]));
+                    style = next;
+                }
+                out_codepoint(out, line[k].ch);
+                if (line[k].mark) out_codepoint(out, line[k].mark);
+            }
+            c = end;
         }
-        out_put(&out, "\033[0m", 4);
-        if (r + 1 < grid->height) out_put(&out, "\r\n", 2);
     }
-    if (grid->cursor_row >= 0) {
-        char move[32];
-        int n = snprintf(move, sizeof(move), "\033[%d;%dH\033[?25h", grid->cursor_row + 1, grid->cursor_column + 1);
-        out_put(&out, move, (size_t)n);
-    } else out_put(&out, "\033[?25l", 6);
+    if (style > 0) out_put(out, "\033[0m", 4);
+    if (grid->cursor_row >= 0)
+        out_put(out, code, (size_t)snprintf(code, sizeof(code), "\033[%d;%dH\033[?25h", grid->cursor_row + 1,
+                                             grid->cursor_column + 1));
+    else out_put(out, "\033[?25l", 6);
+    memcpy(grid->shown, grid->cells, (size_t)grid->width * grid->height * sizeof(*grid->cells));
+    grid->painted = true;
+}
+
+static void paint_terminal(VegaGrid *grid) {
+    Out out = {0};
+    paint(grid, &out);
     if (write(STDOUT_FILENO, out.bytes, out.used) < 0) { /* the terminal went away; the loop ends on read */ }
     free(out.bytes);
 }
@@ -304,7 +328,7 @@ static int interactive(void) {
             else vega_grid(&grid, 80, 24);
         }
         vega_draw(&grid, &app, &screen, entry, entry_length, typing);
-        paint(&grid);
+        paint_terminal(&grid);
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
         int ready = poll(&wait, 1, ticking ? 16 : -1);
         if (ready == 0) { pure_app_frame(&app); continue; }
@@ -322,7 +346,8 @@ static int interactive(void) {
 
 typedef enum { SURFACE_CLI, SURFACE_SAY, SURFACE_TUI } Surface;
 
-static int script(Surface surface, unsigned width, unsigned height) {
+/* painting: show writes the terminal bytes of the frame, not the grid. */
+static int script(Surface surface, unsigned width, unsigned height, bool painting) {
     static char line[1 << 16];
     VegaGrid grid = {0};
     if (surface == SURFACE_TUI && !vega_grid(&grid, width, height)) return 2;
@@ -355,7 +380,15 @@ static int script(Surface surface, unsigned width, unsigned height) {
             acted = false;
             if (surface == SURFACE_CLI) vega_print(stdout, &app, &screen, color);
             else if (surface == SURFACE_SAY) vega_say(stdout, &app, &screen, true);
-            else {
+            else if (painting) {
+                Out out = {0};
+                vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+                paint(&grid, &out);
+                printf("paint %zu\n", out.used);
+                fwrite(out.bytes, 1, out.used, stdout);
+                putchar('\n');
+                free(out.bytes);
+            } else {
                 vega_draw(&grid, &app, &screen, entry, entry_length, typing);
                 dump(&grid);
                 printf("cells %lu\n", vega_evaluations() - counted);
@@ -378,17 +411,18 @@ static int script(Surface surface, unsigned width, unsigned height) {
 
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0;
-    bool dumped = false, usage = argc < 3 || argc % 2 == 0;
+    bool dumped = false, painting = false, usage = argc < 3 || argc % 2 == 0;
     const char *store = NULL;
     for (int i = 3; !usage && i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--store")) store = argv[i + 1];
-        else if (!strcmp(argv[i], "--dump") && sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height &&
-                 width <= 1000 && height <= 1000) dumped = true;
+        else if ((!strcmp(argv[i], "--dump") || !strcmp(argv[i], "--paint")) &&
+                 sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height && width <= 1000 && height <= 1000)
+            dumped = true, painting = !strcmp(argv[i], "--paint");
         else usage = true;
     }
     if (usage || (dumped && strcmp(argv[1], "tui")) || (!strcmp(argv[1], "check") && argc != 3)) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
-              "vega tui MODULE.pmod [--store PATH] --dump WIDTHxHEIGHT < script\n"
+              "vega tui MODULE.pmod [--store PATH] --dump|--paint WIDTHxHEIGHT < script\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
@@ -400,7 +434,7 @@ int main(int argc, char **argv) {
                       !strcmp(argv[1], "tui") ? SURFACE_TUI : (Surface)-1;
     if ((int)surface < 0) { fprintf(stderr, "vega: unknown surface %s\n", argv[1]); return 2; }
     if (!load(argv[2], store)) return 2;
-    int status = surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height);
+    int status = surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height, painting);
     /* Frame changes are stored with events; keep the last ones too. */
     if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }
     pure_app_stop(&app);

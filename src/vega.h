@@ -66,7 +66,9 @@ void vega_print(FILE *, PureApp *, const VegaScreen *, bool color);
 void vega_say(FILE *, PureApp *, const VegaScreen *, bool all);
 
 /* TUI: a grid of cells, redrawn from the app on every change. first keeps each
- * list's scroll between frames; the focused row stays visible. */
+ * list's scroll between frames; the focused row stays visible. shown is what
+ * the terminal shows, so a paint sends only the cells that changed (all of
+ * them until the first paint after a resize). */
 typedef struct {
     uint32_t ch, mark; /* a character and at most one combining mark; ch 0 continues a wide one */
     uint8_t tone;
@@ -74,7 +76,8 @@ typedef struct {
 } VegaCell;
 typedef struct {
     unsigned width, height;
-    VegaCell *cells;
+    VegaCell *cells, *shown;
+    bool painted; /* shown holds what the terminal shows */
     size_t first[VEGA_PARTS];
     int cursor_row, cursor_column; /* where the terminal cursor goes, or -1 */
 } VegaGrid;

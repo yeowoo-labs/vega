@@ -18,6 +18,8 @@
    interactive session's entries are there in the next one.
 6. vega check names every convention a spec seems to mean but misses, and
    none in the examples.
+7. Painting: the bytes the TUI sends, replayed by a small terminal emulator,
+   give the very frame the dump shows, while sending only what changed.
 """
 import argparse
 import json
@@ -248,6 +250,97 @@ def tui(vega, module, seeds, sizes, steps=300):
     return checked
 
 
+TONE_NAMES = ['normal', 'muted', 'accent', 'good', 'warning', 'danger']
+
+
+def replay(stream, screen):
+    """Apply terminal bytes to screen (rows of [text, tone, focus] cells) as a
+    terminal would: cursor moves, clearing, colors and reverse video, wide
+    characters over two cells, combining marks joining the character before."""
+    text, row, col, tone, focus, i = stream.decode(), 0, 0, 0, False, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\x1b':
+            assert text[i + 1] == '[', repr(text[i:i + 8])
+            j = i + 2
+            while not '@' <= text[j] <= '~':
+                j += 1
+            params, final = text[i + 2:j], text[j]
+            if final == 'H':
+                row, col = (int(n or 1) - 1 for n in (params.split(';') + ['1'])[:2])
+            elif final == 'J':
+                for line in screen:
+                    line[:] = [[' ', 0, False] for _ in line]
+            elif final == 'm':
+                codes = params.split(';')
+                focus = '7' in codes
+                tone = next((t for code, t in (('36', 2), ('32', 3), ('33', 4), ('31', 5), ('2', 1)) if code in codes), 0)
+            i = j + 1
+            continue
+        cells = width(ch)
+        if not cells:
+            back = col - 1
+            while back > 0 and screen[row][back][0] == '':
+                back -= 1
+            screen[row][back][0] += ch
+        else:
+            screen[row][col] = [ch, tone, focus]
+            if cells == 2:
+                screen[row][col + 1] = ['', tone, focus]
+            col += cells
+        i += 1
+
+
+def shown(screen):
+    """A replayed screen in the dump's form."""
+    lines = []
+    for line in screen:
+        focus = any(cell[2] for cell in line)
+        text = ''.join(cell[0] for cell in line).rstrip(' ')
+        first = next((cell for cell in line if cell[0] not in ('', ' ')), None)
+        tone = first[1] if first else 0
+        lines.append(('>' if focus else '|') + text + ('\t' + TONE_NAMES[tone] if tone else ''))
+    return lines
+
+
+def painting(vega, module, seeds, sizes, steps=200):
+    """Every painted frame equals the dumped one; later frames send only what
+    changed. Returns frames compared and the mean bytes of a first and of a
+    later frame."""
+    compared, first_bytes, later_bytes, later = 0, 0, 0, 0
+    for columns, rows in sizes:
+        for seed in seeds:
+            rng = random.Random(seed * 13 + columns)
+            script = []
+            for _ in range(steps):
+                roll = rng.random()
+                if roll < 0.25: script.append('text ' + (rng.choice(WORDS).encode().hex() or '-'))
+                elif roll < 0.3: script.append(rng.choice(['type 61', 'enter', 'tab']))
+                else: script.append('key ' + rng.choice(list(KEYS.values())))
+                script.append('show')
+            text = '\n'.join(script) + '\n'
+            dumped = [frame for frame, _ in frames(run(vega, 'tui', module, '--dump', f'{columns}x{rows}', stdin=text).stdout,
+                                                   rows)]
+            painted = subprocess.run([str(vega), 'tui', str(module), '--paint', f'{columns}x{rows}'], input=text.encode(),
+                                     capture_output=True, timeout=120)
+            assert painted.returncode == 0, painted.stderr
+            out, at, screen, n = painted.stdout, 0, [[[' ', 0, False] for _ in range(columns)] for _ in range(rows)], 0
+            while at < len(out):
+                end = out.index(b'\n', at)
+                size = int(out[at:end].split()[1])
+                replay(out[end + 1:end + 1 + size], screen)
+                assert shown(screen) == dumped[n], (seed, n, shown(screen), dumped[n])
+                if n: later_bytes, later = later_bytes + size, later + 1
+                else: first_bytes += size
+                at, n = end + 2 + size, n + 1
+            assert n == len(dumped), (n, len(dumped))
+            compared += n
+    first_mean = first_bytes // (len(sizes) * len(seeds))
+    later_mean = later_bytes // later
+    assert later_mean * 3 < first_mean, (first_mean, later_mean)
+    return compared, first_mean, later_mean
+
+
 def scores(vega, module):
     joins = ['ann', '범수', 'Zoë']
     script = [f'text {name.encode().hex()}' for name in joins]
@@ -299,7 +392,11 @@ def interactive(vega, module, store=None):
     text = screen.decode(errors='replace')
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
     assert '\x1b[?1049h' in text and text.rstrip().endswith('\x1b[?1049l'), text[-80:]
-    assert 'milk' in text and 'béton' in text and '(2)' in text and 'done' in text, text[-400:]
+    # What the terminal ended up showing, from the bytes it was sent.
+    grid = [[[' ', 0, False] for _ in range(40)] for _ in range(10)]
+    replay(screen, grid)
+    final = '\n'.join(shown(grid))
+    assert 'milk' in final and 'béton' in final and '(2)' in final and 'done' in final, final
     if store:  # what was typed is still there in the next session
         again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
         assert again == ['To do', 'left: 2 tasks', 'tasks_list (2)', '> milk [done] (muted)', '  béton'], again
@@ -384,7 +481,8 @@ def robustness(vega, aup, work, rounds):
                 elif roll < 0.4: script.append(rng.choice(['type 61', 'enter', 'tab']))
                 else: script.append('key ' + rng.choice(keys))
             text = '\n'.join(script) + '\nshow\n'
-            for surface in (['cli'], ['say'], ['tui', '--dump', rng.choice(['80x24', '12x5', '1x1', '200x3'])]):
+            size = rng.choice(['80x24', '12x5', '1x1', '200x3'])
+            for surface in (['cli'], ['say'], ['tui', '--dump', size], ['tui', '--paint', size]):
                 result = run(vega, surface[0], module, *surface[1:], stdin=text)
                 assert result.returncode == 0, (path, surface, result.stderr[-400:])
                 runs += 1
@@ -412,6 +510,8 @@ def main():
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
+        report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
+            painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
             interactive(vega, modules['todo'], work / 'interactive-store')
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
