@@ -20,6 +20,7 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
     screen->prompt = -1;
     for (uint32_t i = 0; i < m->inputs && screen->prompt < 0; ++i)
         if (m->input[i].kind == PURE_KIND_TEXT) screen->prompt = (int)i;
+    for (uint32_t h = 0; h < m->handlers; ++h) screen->ticks = screen->ticks || m->handler[h].event == 0;
     /* A <table>_focus view belongs to its table, not to the fields. */
     bool focus_view[PURE_MODULE_VIEWS] = {false};
     for (uint32_t i = 0; i < m->views; ++i) {

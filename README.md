@@ -13,6 +13,8 @@ build/vega tui todo.pmod --store ~/.todo      # 터미널. 글자 입력 후 Ent
                                               # --store가 있으면 목록이 다음 실행에도 남는다(어느 표면이든)
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega cli todo.pmod
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
+build/vega web todo.pmod --watch              # 브라우저(GUI). --watch: 모듈이 다시 빌드되면 상태를 이어 바꾼다
+                                              # (옆에서 AUP_PATH=lib aup watch examples/todo.aup -o todo.pmod)
 make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
 ```
 

@@ -18,6 +18,11 @@
    interactive session's entries are there in the next one.
 6. vega check names every convention a spec seems to mean but misses, and
    none in the examples.
+9. Hot swap: a new module replaces the running one, states keeping their
+   values by name, whether a script swaps it or --watch (web, and the TUI on
+   a pseudo-terminal) sees its file written again, even at the same size
+   within the same second; a module that does not load leaves the app as it
+   was.
 7. Painting: the bytes the TUI sends, replayed by a small terminal emulator,
    give the very frame the dump shows, while sending only what changed.
 8. Web: the GUI surface's screen JSON matches the model after random keys,
@@ -29,6 +34,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -540,6 +546,69 @@ def split(vega, module, work, seeds, steps=200):
     return compared
 
 
+def hot_swap(vega, aup, work):
+    """Swap a module under a running app: by script, and by --watch in the
+    web surface when the file is written again (atomically, as aup watch
+    writes it). States keep their values by name; a broken module is refused."""
+    import time
+    env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
+    source = (ROOT / 'examples/todo.aup').read_text()
+    changed = source.replace('view title = "To do"', 'view title = "Things"') + \
+        'view done_count = count(t in tasks where t.done)\n'
+    modules = []
+    # again differs from after in one letter: a module of the same size, written within the same second.
+    for name, text in (('before', source), ('after', changed), ('again', changed.replace('"Things"', '"Thingz"'))):
+        (work / f'{name}.aup').write_text(text)
+        assert run(aup, 'build', work / f'{name}.aup', '-o', work / f'{name}.pmod', env=env).returncode == 0
+        modules.append(work / f'{name}.pmod')
+    script = f'text 61\ntext 62\nkey Space\nswap {modules[1]}\nkey ArrowUp\nshow\n'
+    out = run(vega, 'cli', modules[0], stdin=script).stdout.splitlines()
+    assert out == ['Things', 'left: 1 of 2', 'tasks_list (2)', '> a', '  b [done] (muted)', 'done_count: 1'], out
+    # --watch: the web surface takes the new module and tells every page.
+    live = work / 'live.pmod'
+    shutil.copy(modules[0], live)
+    surface = WebSurface(vega, live, '--watch')
+    import http.client
+    import threading
+    heard = []
+    stream = http.client.HTTPConnection('127.0.0.1', surface.port, timeout=10)
+    stream.request('GET', '/events')
+    events = stream.getresponse()
+    threading.Thread(target=lambda: [heard.append(line) for line in iter(events.readline, b'') if line.startswith(b'data:')],
+                     daemon=True).start()
+    def replace(module, title):
+        """Write module over the watched file as aup does, and wait for the page to show title."""
+        shutil.copy(module, work / 'live.tmp')
+        os.replace(work / 'live.tmp', live)
+        for _ in range(50):
+            screen = json.loads(surface.call('GET', '/screen')[1])
+            if screen['title'] == title: return screen
+            time.sleep(0.05)
+        raise AssertionError(f'never shown: {title}: {screen}')
+
+    try:
+        for word in ('a', 'b'): surface.call('POST', '/text', word)
+        surface.call('POST', '/key', 'Space')
+        time.sleep(0.3)
+        before = len(heard)
+        screen = replace(modules[1], 'Things')
+        assert {'name': 'done_count', 'text': '1'} in screen['fields'], screen
+        assert [item['label'] for item in screen['parts'][0]['items']] == ['a', 'b'], screen
+        time.sleep(0.2)
+        assert len(heard) > before, 'the page hears of the new module'
+        assert modules[2].stat().st_size == modules[1].stat().st_size
+        replace(modules[2], 'Thingz')
+        (work / 'live.tmp').write_bytes(b'not a module')
+        os.replace(work / 'live.tmp', live)
+        time.sleep(0.6)
+        assert json.loads(surface.call('GET', '/screen')[1])['title'] == 'Thingz'  # the broken one is refused
+    finally:
+        surface.stop()
+    shutil.copy(modules[0], work / 'tui.pmod')
+    interactive(vega, work / 'tui.pmod', replace=modules[1])
+    return len(out)
+
+
 def scores(vega, module):
     joins = ['ann', '범수', 'Zoë']
     script = [f'text {name.encode().hex()}' for name in joins]
@@ -571,14 +640,16 @@ def scores(vega, module):
     return len(out)
 
 
-def interactive(vega, module, store=None):
+def interactive(vega, module, store=None, replace=None):
     """The terminal surface on a real pseudo-terminal: typed text commits
     with Enter, arrow keys and letters reach the app after Tab, Ctrl-C leaves
-    and restores the terminal."""
+    and restores the terminal. With replace, it runs with --watch and replace
+    is then written over module: the terminal shows it, with the same tasks."""
     import fcntl, pty, select, struct, termios, time
     pid, fd = pty.fork()
     if pid == 0:
-        os.execv(str(vega), [str(vega), 'tui', str(module)] + (['--store', str(store)] if store else []))
+        os.execv(str(vega), [str(vega), 'tui', str(module)] + (['--store', str(store)] if store else []) +
+                 (['--watch'] if replace else []))
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))
     os.kill(pid, 28)  # SIGWINCH: take the size
 
@@ -598,6 +669,10 @@ def interactive(vega, module, store=None):
     for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u', b'\x1b[<0;3;5M\x1b[<0;3;5m'):
         os.write(fd, keys)
         screen += read_for(0.2)
+    if replace:
+        shutil.copy(replace, module.with_suffix('.tmp'))
+        os.replace(module.with_suffix('.tmp'), module)
+        screen += read_for(0.6)
     os.write(fd, b'\x03')
     screen += read_for(0.3)
     _, status = os.waitpid(pid, 0)
@@ -609,8 +684,12 @@ def interactive(vega, module, store=None):
     grid = [[[' ', 0, False] for _ in range(40)] for _ in range(10)]
     replay(screen, grid)
     final = shown(grid)
-    assert 'milk' in '\n'.join(final) and '(2)' in final[2] and 'done' in final[3], final
-    assert final[4].startswith('>> béton') and final[3].startswith('|  milk'), final  # the click moved the focus
+    if replace:  # the new title and field, the same tasks, focus and done mark
+        assert final[:3] == ['|Things', '|left  1 of 2\tmuted', '|done_count  1\tmuted'], final
+        assert final[4].startswith('|  milk') and 'done' in final[4] and final[5].startswith('>> béton'), final
+    else:
+        assert 'milk' in '\n'.join(final) and '(2)' in final[2] and 'done' in final[3], final
+        assert final[4].startswith('>> béton') and final[3].startswith('|  milk'), final  # the click moved the focus
     assert '\x1b[?1000h' in text and '\x1b[?1000l' in text, 'mouse reports on, then off'
     if store:  # what was typed is still there in the next session
         again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
@@ -739,6 +818,7 @@ def main():
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
+        report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])

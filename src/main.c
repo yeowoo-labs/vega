@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /* vega SURFACE MODULE [--store PATH]: one module, one screen, several surfaces.
@@ -20,15 +21,19 @@
  *   web [--listen ADDRESS] [--port N]
  *                    a web page (a GUI), on 127.0.0.1 unless another address is given
  * With --store the app's states live in that tree store: the app continues
- * where it was, whichever surface runs it.
+ * where it was, whichever surface runs it. With --watch (tui, web) a module
+ * written again replaces the running one and states keep their values by
+ * name: aup watch app.aup -o app.pmod beside it makes a saved edit show at once.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
- * tab | frame [N] | point VIEW ROW | click LINE COLUMN | show. key presses and
+ * tab | frame [N] | point VIEW ROW | click LINE COLUMN | swap MODULE | show. key presses and
  * releases the input bound to that key; text commits text to the screen's text
  * input; type, enter and tab act on the TUI's input line; point focuses a row
  * (0 first) of a list or table; click is a mouse click on the last shown TUI
- * frame (1 first, as terminals report it). */
+ * frame (1 first, as terminals report it); swap replaces the module as --watch
+ * does. */
 
-static PureModule module;
+static PureModule modules[2]; /* the running one (app.module) and the next */
+static unsigned current;
 static PureApp app;
 static VegaScreen screen;
 static VegaGrid *drawn; /* the TUI's last frame, which a click lands on */
@@ -36,41 +41,90 @@ static char entry[VEGA_TEXT];
 static size_t entry_length;
 static bool typing;
 
-static bool load_module(const char *path) {
-    static unsigned char bytes[1 << 17];
+/* The module file last read, and a digest of its bytes. A loaded module
+ * keeps nothing of them, so one buffer serves every load. */
+static unsigned char module_bytes[1 << 17];
+static uint64_t module_digest;
+
+/* Read a module file whole into module_bytes: its size, or -1. */
+static long read_module(const char *path) {
     FILE *file = fopen(path, "rb");
-    size_t size = file ? fread(bytes, 1, sizeof(bytes), file) : 0;
-    bool ok = file && !ferror(file) && size < sizeof(bytes);
+    size_t size = file ? fread(module_bytes, 1, sizeof(module_bytes), file) : 0;
+    bool ok = file && !ferror(file) && size < sizeof(module_bytes);
     if (file) fclose(file);
-    if (!ok) { fprintf(stderr, "vega: cannot read %s\n", path); return false; }
+    if (!ok) return -1;
+    uint64_t h = UINT64_C(0xcbf29ce484222325) ^ size;
+    for (size_t i = 0; i < size; ++i) h = (h ^ module_bytes[i]) * UINT64_C(0x100000001b3);
+    module_digest = h;
+    return (long)size;
+}
+
+/* Decode the module that read_module read from path. */
+static bool decode(const char *path, long size, PureModule *module) {
+    if (size < 0) { fprintf(stderr, "vega: cannot read %s\n", path); return false; }
     char error[128];
-    if (pure_module_load(bytes, size, &module, error, sizeof(error)) != PURE_OK) {
+    if (pure_module_load(module_bytes, (size_t)size, module, error, sizeof(error)) != PURE_OK) {
         fprintf(stderr, "vega: %s: %s\n", path, error);
         return false;
     }
     return true;
 }
 
+static bool load_module(const char *path, PureModule *module) { return decode(path, read_module(path), module); }
+
 static void print_finding(void *path, const char *name, const char *message) {
     printf("%s: %s: %s\n", (const char *)path, name, message);
 }
 
 static bool load(const char *path, const char *store) {
-    if (!load_module(path)) return false;
+    if (!load_module(path, &modules[current])) return false;
     if (store && pure_store_init(store) != PURE_OK) { fprintf(stderr, "vega: cannot open store %s\n", store); return false; }
-    PureResult started = pure_app_start(&app, &module, store ? pure_tree_data(store) : (PureData){0});
+    PureResult started = pure_app_start(&app, &modules[current], store ? pure_tree_data(store) : (PureData){0});
     if (started != PURE_OK) { fprintf(stderr, "vega: cannot start (%d)\n", (int)started); return false; }
-    vega_screen(&screen, &module);
+    vega_screen(&screen, &modules[current]);
     typing = screen.prompt >= 0;
     return true;
 }
 
-static int key_input(const char *key) { return vega_key_input(&module, key); }
-
-static bool frames(void) {
-    for (uint32_t h = 0; h < module.handlers; ++h) if (module.handler[h].event == 0) return true;
-    return false;
+/* Replace the running app's module with the one read from path, states
+ * keeping their values by name; a module that does not load or replace
+ * leaves the app as it was. */
+static bool swap(const char *path, long size) {
+    PureModule *next = &modules[!current];
+    if (!decode(path, size, next)) return false;
+    PureResult replaced = pure_app_replace(&app, next);
+    if (replaced != PURE_OK) {
+        fprintf(stderr, "vega: keeping the running module: cannot replace it (%d)\n", (int)replaced);
+        return false;
+    }
+    bool had_prompt = screen.prompt >= 0;
+    current = !current;
+    vega_screen(&screen, next);
+    typing = screen.prompt >= 0 && (typing || !had_prompt);
+    return true;
 }
+
+/* --watch: the module file's bytes when last read (their digest), so a
+ * module written again is seen however soon and whatever its size or file
+ * times. Read at most five times a second, however often asked; bytes that
+ * do not load are not tried again. */
+static const char *watched;
+static uint64_t watched_digest;
+static struct timespec watched_at;
+
+static bool module_changed(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!watched || (now.tv_sec - watched_at.tv_sec) * 1000000000L + now.tv_nsec - watched_at.tv_nsec < 200000000L)
+        return false;
+    watched_at = now;
+    long size = read_module(watched);
+    if (size < 0 || module_digest == watched_digest) return false; /* a missing file is looked for again */
+    watched_digest = module_digest;
+    return swap(watched, size);
+}
+
+static int key_input(const char *key) { return vega_key_input(app.module, key); }
 
 /* A key press and release; false when the app has no such key or the press failed. */
 static bool press(const char *key, int *input) {
@@ -82,7 +136,8 @@ static bool commit(const char *text, size_t length) { return vega_commit(&app, &
 
 static const VegaPart *part_named(const char *name) {
     for (unsigned i = 0; i < screen.count; ++i)
-        if (screen.parts[i].kind != VEGA_FIELD && !strcmp(module.view_names[screen.parts[i].view], name)) return &screen.parts[i];
+        if (screen.parts[i].kind != VEGA_FIELD && !strcmp(app.module->view_names[screen.parts[i].view], name))
+            return &screen.parts[i];
     return NULL;
 }
 
@@ -350,7 +405,6 @@ static int interactive(void) {
     signal(SIGWINCH, on_resize);
     VegaGrid grid = {0};
     drawn = &grid;
-    bool ticking = frames();
     for (;;) {
         if (resized) {
             struct winsize size;
@@ -362,8 +416,12 @@ static int interactive(void) {
         vega_draw(&grid, &app, &screen, entry, entry_length, typing);
         paint_terminal(&grid);
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
-        int ready = poll(&wait, 1, ticking ? 16 : -1);
-        if (ready == 0) { pure_app_frame(&app); continue; }
+        int ready = poll(&wait, 1, screen.ticks ? 16 : watched ? 200 : -1);
+        if (ready == 0) {
+            if (screen.ticks) pure_app_frame(&app);
+            module_changed();
+            continue;
+        }
         if (ready < 0) continue; /* a signal, such as a resize */
         unsigned char in[256];
         ssize_t got = read(STDIN_FILENO, in, sizeof(in));
@@ -422,6 +480,9 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
             if (surface != SURFACE_TUI) { fputs("vega: click needs the tui\n", stderr); continue; }
             acted = sscanf(line, "%*s %u %u", &at_line, &at_column) == 2 && at_line && shown;
             ok = acted && mouse(0, at_line - 1);
+        } else if (!strcmp(command, "swap")) {
+            acted = false;
+            if (!swap(argument, read_module(argument))) fprintf(stderr, "vega: kept the running module\n");
         } else if (!strcmp(command, "frame")) {
             long count = *argument ? strtol(argument, NULL, 10) : 1;
             for (long i = 0; i < count && i < 600; ++i) ok = pure_app_frame(&app) == PURE_OK && ok;
@@ -447,9 +508,9 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
             fprintf(stderr, "vega: unknown command %s\n", command);
             continue;
         }
-        if (!ok && input >= 0) fprintf(stderr, "vega: %s failed\n", module.input_names[input]);
+        if (!ok && input >= 0) fprintf(stderr, "vega: %s failed\n", app.module->input_names[input]);
         if (surface == SURFACE_SAY && acted) {
-            if (!ok) printf("Could not %s.\n", input >= 0 ? module.input_names[input] : verb);
+            if (!ok) printf("Could not %s.\n", input >= 0 ? app.module->input_names[input] : verb);
             else vega_say(stdout, &app, &screen, false);
         }
         fflush(stdout);
@@ -461,10 +522,16 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
 
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0, port = 8080;
-    bool dumped = false, painting = false, usage = argc < 3 || argc % 2 == 0;
+    bool dumped = false, painting = false, watch = false, usage = argc < 3;
     const char *store = NULL, *listen_on = "127.0.0.1";
-    for (int i = 3; !usage && i + 1 < argc; i += 2) {
-        if (!strcmp(argv[i], "--store")) store = argv[i + 1];
+    for (int i = 3; !usage && i < argc; i += 2) {
+        if (!strcmp(argv[i], "--watch") && (!strcmp(argv[1], "tui") || !strcmp(argv[1], "web"))) {
+            watch = true;
+            --i; /* a flag without a value */
+            continue;
+        }
+        if (i + 1 >= argc) usage = true;
+        else if (!strcmp(argv[i], "--store")) store = argv[i + 1];
         else if (!strcmp(argv[i], "--listen") && !strcmp(argv[1], "web")) listen_on = argv[i + 1];
         else if (!strcmp(argv[i], "--port") && !strcmp(argv[1], "web") && sscanf(argv[i + 1], "%u", &port) == 1 &&
                  port < 65536) {}
@@ -475,20 +542,24 @@ int main(int argc, char **argv) {
     }
     if (usage || (dumped && strcmp(argv[1], "tui")) || (!strcmp(argv[1], "check") && argc != 3)) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
-              "vega tui MODULE.pmod [--store PATH] --dump|--paint WIDTHxHEIGHT < script\n"
-              "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N]\n"
+              "vega tui MODULE.pmod [--store PATH] [--watch] | --dump|--paint WIDTHxHEIGHT < script\n"
+              "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
     if (!strcmp(argv[1], "check")) {
-        if (!load_module(argv[2])) return 2;
-        return vega_check(&module, print_finding, argv[2]) ? 1 : 0;
+        if (!load_module(argv[2], &modules[0])) return 2;
+        return vega_check(&modules[0], print_finding, argv[2]) ? 1 : 0;
     }
     Surface surface = !strcmp(argv[1], "cli") ? SURFACE_CLI : !strcmp(argv[1], "say") ? SURFACE_SAY :
                       !strcmp(argv[1], "tui") ? SURFACE_TUI : !strcmp(argv[1], "web") ? SURFACE_WEB : (Surface)-1;
     if ((int)surface < 0) { fprintf(stderr, "vega: unknown surface %s\n", argv[1]); return 2; }
     if (!load(argv[2], store)) return 2;
-    int status = surface == SURFACE_WEB ? vega_web(&app, &screen, listen_on, port) :
+    if (watch && !dumped) {
+        watched = argv[2];
+        watched_digest = module_digest; /* of what load read */
+    }
+    int status = surface == SURFACE_WEB ? vega_web(&app, &screen, listen_on, port, watched ? module_changed : NULL) :
                  surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height, painting);
     /* Frame changes are stored with events; keep the last ones too. */
     if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }

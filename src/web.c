@@ -364,7 +364,7 @@ static void drop(Client *c) {
     c->fd = -1;
 }
 
-int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsigned port) {
+int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsigned port, bool (*reload)(void)) {
     int listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
     socklen_t size = sizeof(address);
@@ -382,8 +382,6 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
     signal(SIGPIPE, SIG_IGN);
     static Client clients[CLIENTS];
     for (unsigned i = 0; i < CLIENTS; ++i) clients[i].fd = -1;
-    bool ticking = false;
-    for (uint32_t h = 0; h < app->module->handlers; ++h) ticking = ticking || app->module->handler[h].event == 0;
     while (!stopping) {
         struct pollfd fds[CLIENTS + 1];
         unsigned slot[CLIENTS + 1], count = 1;
@@ -394,10 +392,11 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
             fds[count] = (struct pollfd){c->fd, (short)(POLLIN | (c->out_at < c->out.used ? POLLOUT : 0)), 0};
             slot[count++] = i;
         }
-        int ready = poll(fds, count, ticking ? 33 : 1000);
+        int ready = poll(fds, count, screen->ticks ? 33 : reload ? 200 : 1000);
         if (ready < 0 && errno != EINTR) break;
         bool changed = false;
-        if (ready == 0 && ticking) changed = pure_app_frame(app) == PURE_OK;
+        if (ready == 0 && screen->ticks) changed = pure_app_frame(app) == PURE_OK;
+        if (reload && reload()) changed = true; /* a new module: every page draws it */
         if (fds[0].revents & POLLIN)
             for (int fd; (fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)) >= 0;) {
                 unsigned free_slot = CLIENTS;

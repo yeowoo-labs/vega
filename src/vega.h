@@ -30,6 +30,7 @@ typedef struct {
     const PureModule *module;
     int title;  /* text view, or -1 */
     int prompt; /* the first text input, or -1 */
+    bool ticks; /* it handles frames: a surface runs them, about 60 a second */
     VegaPart parts[VEGA_PARTS];
     unsigned count;
 } VegaScreen;
@@ -82,8 +83,9 @@ void vega_print(FILE *, PureApp *, const VegaScreen *, bool color);
 /* NUI: the screen as sentences (all), or only the focused item of the first list. */
 void vega_say(FILE *, PureApp *, const VegaScreen *, bool all);
 /* GUI: the screen as a web page on listen:port (0: any free port, printed as
- * {"port":N}); runs until SIGINT or SIGTERM. */
-int vega_web(PureApp *, const VegaScreen *, const char *listen, unsigned port);
+ * {"port":N}); runs until SIGINT or SIGTERM. reload, when given, is asked
+ * a few times a second whether the module was replaced (the screen with it). */
+int vega_web(PureApp *, const VegaScreen *, const char *listen, unsigned port, bool (*reload)(void));
 
 /* TUI: a grid of cells, redrawn from the app on every change. first keeps each
  * list's scroll between frames; the focused row stays visible. shown is what
