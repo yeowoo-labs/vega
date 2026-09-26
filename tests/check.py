@@ -88,6 +88,10 @@ class Todo:
             self.at = min(self.at, max(len(self.tasks) - 1, 0))
         return True
 
+    def left(self):
+        """The left field: open tasks of all, a count over the list."""
+        return f"{sum(1 for t in self.tasks if not t['done'])} of {len(self.tasks)}"
+
     @staticmethod
     def badge(task):
         return 'done' if task['done'] else 'urgent' if task['urgent'] else ''
@@ -97,7 +101,7 @@ class Todo:
         return 'muted' if task['done'] else 'danger' if task['urgent'] else 'normal'
 
     def cli(self):
-        lines = ['To do', f'left: {len(self.tasks)} tasks', f'tasks_list ({len(self.tasks)})']
+        lines = ['To do', f'left: {self.left()}', f'tasks_list ({len(self.tasks)})']
         for i, task in enumerate(self.tasks):
             line = ('> ' if i == self.at else '  ') + pictures(task['title'])
             if self.badge(task):
@@ -122,7 +126,7 @@ class Todo:
 
     def say(self):
         n = len(self.tasks)
-        lines = ['To do.', f'left: {n} tasks.', f'tasks_list, {n} item{"" if n == 1 else "s"}.']
+        lines = ['To do.', f'left: {self.left()}.', f'tasks_list, {n} item{"" if n == 1 else "s"}.']
         return lines + ([self.focus()] if n else [])
 
 
@@ -426,7 +430,7 @@ def web(vega, module, work, seeds, steps=150, visible=4):
             if model.at < first: first = model.at
             if model.at >= first + visible: first = model.at - visible + 1
             if first + visible > n: first = max(n - visible, 0)
-            assert screen['title'] == 'To do' and screen['fields'] == [{'name': 'left', 'text': f'{n} tasks'}], screen
+            assert screen['title'] == 'To do' and screen['fields'] == [{'name': 'left', 'text': model.left()}], screen
             assert (listed['rows'], listed['focus'], listed['first']) == (n, model.at, first), (seed, listed, model.at)
             window = tasks[first:first + visible]
             assert [(item['row'], item['label'], item['badge'], item['tone']) for item in listed['items']] == \
@@ -481,7 +485,7 @@ def browser(vega, module, work):
     outcome = json.loads(result.stdout)
     assert result.returncode == 0 and outcome['ok'], outcome
     after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
-    assert after == ['To do', 'left: 4 tasks', 'tasks_list (4)', '  a [done] (muted)', '  b', '  c', '> 브라우저'], after
+    assert after == ['To do', 'left: 3 of 4', 'tasks_list (4)', '  a [done] (muted)', '  b', '  c', '> 브라우저'], after
     return len(outcome['steps'])
 
 
@@ -559,7 +563,7 @@ def interactive(vega, module, store=None):
     assert '\x1b[?1000h' in text and '\x1b[?1000l' in text, 'mouse reports on, then off'
     if store:  # what was typed is still there in the next session
         again = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
-        assert again == ['To do', 'left: 2 tasks', 'tasks_list (2)', '  milk [done] (muted)', '> béton'], again
+        assert again == ['To do', 'left: 1 of 2', 'tasks_list (2)', '  milk [done] (muted)', '> béton'], again
     return 1
 
 

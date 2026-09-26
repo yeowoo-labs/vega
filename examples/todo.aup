@@ -29,7 +29,7 @@ on urgent.down { at.urgent = !at.urgent }
 on drop.down { tasks.remove(at) }
 
 view title = "To do"
-view left = "{tasks.count} tasks"
+view left = "{count(t in tasks where !t.done)} of {tasks.count}"
 
 # A list: label, and optionally tone, badge and detail per row.
 view tasks_list = each task in tasks {

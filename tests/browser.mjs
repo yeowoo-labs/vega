@@ -71,7 +71,7 @@ try {
   };
 
   await until('three tasks, the last focused', `document.querySelectorAll('li').length === 3 && ${selected} === 2`);
-  await until('title and field', `document.querySelector('h1').textContent === 'To do' && document.querySelector('dd').textContent === '3 tasks'`);
+  await until('title and field', `document.querySelector('h1').textContent === 'To do' && document.querySelector('dd').textContent === '3 of 3'`);
   await key('ArrowUp', 'ArrowUp', 38);
   await until('ArrowUp moves the focus', `${selected} === 1`);
   const box = await evaluate(`(() => { const r = document.querySelectorAll('li')[0].getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()`);
@@ -80,6 +80,7 @@ try {
   await until('a click focuses its row', `${selected} === 0`);
   await key('Space', ' ', 32, ' ');
   await until('Space marks it done, muted', `document.querySelectorAll('li')[0].classList.contains('muted') && document.querySelector('li .badge')?.textContent === 'done'`);
+  await until('the count of open tasks follows', `document.querySelector('dd').textContent === '2 of 3'`);
   await evaluate(`document.getElementById('entry').focus()`);
   await send('Input.insertText', { text: '브라우저' });
   await key('Enter', 'Enter', 13, '\r');
