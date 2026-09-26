@@ -138,6 +138,7 @@ static void say_focus(FILE *out, PureApp *app, const VegaPart *part) {
     size_t length, rows = vega_rows(app, part);
     if (!rows) { fprintf(out, "%s is empty.\n", m->view_names[part->view]); return; }
     size_t focus = vega_focus(app, part);
+    if (focus >= rows) { fprintf(out, "%s: none of %zu focused.\n", m->view_names[part->view], rows); return; }
     fprintf(out, "Item %zu of %zu: ", focus + 1, rows);
     VegaTone tone = vega_tone(app, part, focus);
     if (tone >= VEGA_ACCENT) fprintf(out, "%s, ", tone_names[tone]);
@@ -164,8 +165,15 @@ void vega_say(FILE *out, PureApp *app, const VegaScreen *screen, bool all) {
     char text[VEGA_TEXT];
     size_t length;
     if (!all) {
-        for (unsigned i = 0; i < screen->count; ++i)
-            if (screen->parts[i].kind != VEGA_FIELD) { say_focus(out, app, &screen->parts[i]); return; }
+        /* The focused item where a list shows it, else the first list. */
+        const VegaPart *first = NULL;
+        for (unsigned i = 0; i < screen->count; ++i) {
+            const VegaPart *part = &screen->parts[i];
+            if (part->kind == VEGA_FIELD) continue;
+            if (!first) first = part;
+            if (vega_focus(app, part) < vega_rows(app, part)) { say_focus(out, app, part); return; }
+        }
+        if (first) say_focus(out, app, first);
         return;
     }
     if (screen->title >= 0 && vega_text(app, (uint32_t)screen->title, 0, text, &length)) {

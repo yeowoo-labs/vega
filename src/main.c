@@ -95,8 +95,10 @@ static bool mouse(unsigned button, unsigned line) {
     const VegaPart *part = &screen.parts[index];
     if (button == 64 || button == 65) {
         size_t focus = vega_focus(&app, part), rows = vega_rows(&app, part);
-        if (button == 64 ? !focus : focus + 1 >= rows) return false;
-        item = button == 64 ? focus - 1 : focus + 1;
+        if (focus < rows) { /* else the wheel focuses the row under it */
+            if (button == 64 ? !focus : focus + 1 >= rows) return false;
+            item = button == 64 ? focus - 1 : focus + 1;
+        }
     } else if (button) return false;
     return vega_point(&app, part, item);
 }

@@ -146,20 +146,23 @@ bool vega_number(PureApp *app, uint32_t view, size_t row, double *out) {
     return app->module->view_table[view] ? pure_app_cell(app, view, row, out) : pure_app_view(app, view, out);
 }
 
-size_t vega_rows(const PureApp *app, const VegaPart *part) {
+size_t vega_rows(PureApp *app, const VegaPart *part) {
     return part->kind == VEGA_FIELD ? 0 : pure_app_rows(app, part->view);
 }
 
 size_t vega_focus(PureApp *app, const VegaPart *part) {
-    size_t rows = vega_rows(app, part);
+    size_t rows = vega_rows(app, part), row;
     double focus;
     if (part->focus < 0 || !rows || !vega_number(app, (uint32_t)part->focus, 0, &focus) || !(focus >= 0)) return 0;
-    return focus >= (double)(rows - 1) ? rows - 1 : (size_t)focus;
+    bool filtered = app->module->view_code[part->view].length > 0;
+    size_t item = focus < (double)SIZE_MAX ? (size_t)focus : SIZE_MAX;
+    if (pure_app_item_row(app, part->view, item, &row)) return row;
+    return filtered ? VEGA_NO_ROW : rows - 1;
 }
 
 size_t vega_scroll(size_t first, size_t focus, size_t visible, size_t rows) {
-    if (focus < first) first = focus;
-    if (visible && focus >= first + visible) first = focus - visible + 1;
+    if (focus < rows && focus < first) first = focus;
+    if (focus < rows && visible && focus >= first + visible) first = focus - visible + 1;
     if (first + visible > rows) first = rows > visible ? rows - visible : 0;
     return first;
 }
@@ -184,7 +187,9 @@ bool vega_commit(PureApp *app, const VegaScreen *screen, const char *text, size_
 }
 
 bool vega_point(PureApp *app, const VegaPart *part, size_t row) {
-    return part->pointer >= 0 && pure_app_point(app, (uint32_t)part->pointer, row) == PURE_OK;
+    size_t item; /* a filtered list's row shows some item of the list */
+    return part->pointer >= 0 && pure_app_row_item(app, part->view, row, &item) &&
+           pure_app_point(app, (uint32_t)part->pointer, item) == PURE_OK;
 }
 
 VegaTone vega_tone(PureApp *app, const VegaPart *part, size_t row) {

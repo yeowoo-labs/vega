@@ -123,8 +123,10 @@ static void screen_json(Buffer *b, PureApp *app, const VegaScreen *screen, size_
         puts_(b, comma ? ",{\"part\":" : "{\"part\":");
         putf(b, "%u,\"name\":", i);
         json_name(b, m->view_names[part->view]);
-        putf(b, ",\"kind\":\"%s\",\"rows\":%zu,\"focus\":%zu,\"first\":%zu,\"pointable\":%s,\"columns\":[",
-             part->kind == VEGA_LIST ? "list" : "table", rows, rows ? focus : 0, first, part->pointer >= 0 ? "true" : "false");
+        putf(b, ",\"kind\":\"%s\",\"rows\":%zu,\"focus\":", part->kind == VEGA_LIST ? "list" : "table", rows);
+        if (focus < rows) putf(b, "%zu", focus);
+        else puts_(b, "null");
+        putf(b, ",\"first\":%zu,\"pointable\":%s,\"columns\":[", first, part->pointer >= 0 ? "true" : "false");
         if (part->kind == VEGA_TABLE)
             for (unsigned c = 0; c < part->column_count; ++c) {
                 if (c) puts_(b, ",");
@@ -224,12 +226,12 @@ static const char *const page_parts[] = {
 "el('span',{className:'label',textContent:it.label?\?''}),it.detail?el('span',{className:'detail',textContent:it.detail}):null,"
 "it.badge?el('span',{className:'badge',textContent:it.badge}):null);item.setAttribute('role','option');"
 "item.setAttribute('aria-selected',it.row===p.focus);list.append(item)}"
-"list.onwheel=e=>{e.preventDefault();pick(Math.max(0,Math.min(p.rows-1,p.focus+Math.sign(e.deltaY))))};"
+"list.onwheel=e=>{e.preventDefault();pick(Math.max(0,Math.min(p.rows-1,(p.focus?\?-1)+Math.sign(e.deltaY))))};"
 "return el('section',{},head,list)}"
 "const table=el('table',{},el('thead',{},el('tr',{},...p.columns.map(c=>el('th',{textContent:c})))));"
 "const body=el('tbody');for(const it of p.items){const tr=el('tr',{className:it.tone,onclick:()=>pick(it.row)},"
 "...it.cells.map(c=>el('td',{textContent:c?\?'-'})));tr.setAttribute('aria-selected',it.row===p.focus);body.append(tr)}"
-"table.append(body);table.onwheel=e=>{e.preventDefault();pick(Math.max(0,Math.min(p.rows-1,p.focus+Math.sign(e.deltaY))))};"
+"table.append(body);table.onwheel=e=>{e.preventDefault();pick(Math.max(0,Math.min(p.rows-1,(p.focus?\?-1)+Math.sign(e.deltaY))))};"
 "return el('section',{},head,table)}));"
 "$('prompt').hidden=!s.prompt;if(s.prompt)$('entry').placeholder=s.prompt;"
 "const symbols={ArrowUp:'\u2191',ArrowDown:'\u2193',ArrowLeft:'\u2190',ArrowRight:'\u2192',Backspace:'Bksp',"

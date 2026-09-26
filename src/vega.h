@@ -45,14 +45,18 @@ unsigned vega_check(const PureModule *, void (*report)(void *, const char *name,
  * shortest form. false when it has no value (for example a missing item). */
 bool vega_text(PureApp *, uint32_t view, size_t row, char out[VEGA_TEXT], size_t *length);
 bool vega_number(PureApp *, uint32_t view, size_t row, double *out);
-size_t vega_rows(const PureApp *, const VegaPart *);
-/* The focused row, clamped to the rows; 0 without a focus view. */
+size_t vega_rows(PureApp *, const VegaPart *);
+/* The row of the focused item: the focus view names an item (an index's
+ * position), shown on the row that holds it; VEGA_NO_ROW when a filtered
+ * list leaves that item out. Clamped to the rows without a filter; 0
+ * without a focus view. */
+#define VEGA_NO_ROW SIZE_MAX
 size_t vega_focus(PureApp *, const VegaPart *);
 /* Focus a row, as a user pointing at it (a click); false when the part's
  * focus is not a plain index position or the row is not there. */
 bool vega_point(PureApp *, const VegaPart *, size_t row);
 /* The first row to show of `rows` when `visible` fit: the least scrolling
- * from first that keeps the focused row in view. */
+ * from first that keeps the focused row in view (any, without one). */
 size_t vega_scroll(size_t first, size_t focus, size_t visible, size_t rows);
 /* The key input answering a key name (Pure's names, as KeyboardEvent.code
  * spells them), or -1; press sends its press and release. */

@@ -40,6 +40,12 @@ view tasks_list_focus = at.position
 | NUI | `vega say app.pmod < script` | 문장. 이벤트마다 포커스 항목을 말하고(`Item 2 of 3: danger, milk, urgent.`), 실패하면 `Could not toggle.`, `show`에서 화면 전체 |
 | GUI | `vega web app.pmod [--listen 주소] [--port N]` | 웹 페이지. 제목·필드·목록(`listbox`)·표·키 목록·입력 칸. 키, 행 클릭, 휠, 입력을 받고 열린 페이지마다 변경을 알린다. 보이는 행만 계산한다 |
 
+목록은 걸러질 수 있다(`each t in tasks where !t.done`). 한 리스트에서 걸러진 목록 여럿이 포커스 하나를 나눠 쓴다.
+포커스 보기(`open_focus = at.position`)는 항목을 가리키므로 Vega는 Pure에게 그 항목의 행을 묻고
+(`pure_app_item_row`), 그 항목을 가진 목록에만 포커스를 보인다. 다른 목록에는 포커스가 없다(웹 JSON의 `focus`는
+null, 음성은 포커스를 가진 목록의 항목을 말한다). 행을 클릭하거나 가리키면 그 행의 항목을 가리킨다
+(`pure_app_row_item`). `examples/today.aup`가 열린 일과 끝난 일 두 목록을 이렇게 보인다.
+
 포커스는 표면에서도 옮긴다. TUI에서 목록·표의 행을 클릭하면 그 행이 포커스가 되고, 휠은 포커스를 한 행씩 옮긴다
 (SGR 마우스 보고). 스크립트는 `point 보기 행`(0부터)과 `click 줄 칸`(마지막으로 보인 프레임, 1부터)으로 같은 일을 한다.
 앱에 코드가 필요 없다. `<표>_focus` 보기가 `at.position`처럼 인덱스 상태의 위치 그대로이면 Vega는 Pure에게 그 상태를
@@ -130,6 +136,8 @@ CLI나 문장 표면이 그대로 이어받는다. Vega에도 앱에도 저장 �
 - aup와 Vega의 예제 11개를 세 표면에 무작위 입력으로 돌려 비정상 종료가 없다. sanitizer 빌드로도 같은 검사를 통과한다.
 - 규약을 여덟 가지로 어긴 명세에서 `vega check`가 아홉 곳을 모두 정확한 문장으로 알리고, 예제에서는 아무것도 알리지
   않는다.
+- 걸러진 두 목록(`examples/today.aup`)의 CLI 출력이 무작위 추가·이동·완료·양쪽 목록 가리키기 1,600단계에서 모델과
+  같다(포커스는 그 항목을 가진 목록에만 있다). 웹 JSON은 다른 목록의 포커스를 null로 준다.
 - 무작위 스크립트에 `point`(범위 밖 포함)와 TUI `click`을 섞어도 CLI·문장·프레임이 모델과 같다. 가상 터미널에서
   마우스로 행을 클릭하면 포커스가 옮겨지고, 저장소를 쓰는 다음 실행이 그 포커스에서 시작한다.
 

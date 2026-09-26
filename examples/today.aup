@@ -1,0 +1,39 @@
+# Two lists over one list state: what is open and what is done. Each shows
+# the items its where keeps; the focus (at) is one item, shown in whichever
+# list holds it, and a click in either list points at that item.
+use vega
+
+record Task {
+  title: text
+  done = 0
+}
+
+state tasks: list of Task
+state at: index of tasks
+
+input add = text
+input up = key ArrowUp
+input down = key ArrowDown
+input toggle = key Space
+
+on add {
+  tasks.append(Task { title: add })
+  at = tasks.last
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on toggle.down { at.done = !at.done }
+
+view title = "Today"
+view left = "{count(t in tasks where !t.done)} open"
+
+view open = each t in tasks where !t.done {
+  label = t.title
+}
+view open_focus = at.position
+
+view done = each t in tasks where t.done {
+  label = t.title
+  tone = vega.muted
+}
+view done_focus = at.position

@@ -431,7 +431,7 @@ def web(vega, module, work, seeds, steps=150, visible=4):
             if model.at >= first + visible: first = model.at - visible + 1
             if first + visible > n: first = max(n - visible, 0)
             assert screen['title'] == 'To do' and screen['fields'] == [{'name': 'left', 'text': model.left()}], screen
-            assert (listed['rows'], listed['focus'], listed['first']) == (n, model.at, first), (seed, listed, model.at)
+            assert (listed['rows'], listed['focus'], listed['first']) == (n, model.at if n else None, first), (seed, listed)
             window = tasks[first:first + visible]
             assert [(item['row'], item['label'], item['badge'], item['tone']) for item in listed['items']] == \
                 [(first + i, task['title'], Todo.badge(task), Todo.tone(task)) for i, task in enumerate(window)], seed
@@ -487,6 +487,57 @@ def browser(vega, module, work):
     after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
     assert after == ['To do', 'left: 3 of 4', 'tasks_list (4)', '  a [done] (muted)', '  b', '  c', '> 브라우저'], after
     return len(outcome['steps'])
+
+
+def split(vega, module, work, seeds, steps=200):
+    """examples/today.aup: two lists filtered from one list share one focus.
+    The CLI shows each list's items in order with the focus in whichever
+    list holds it; point takes a row of either list; the web surface gives
+    the other list no focus."""
+    compared = 0
+    for seed in seeds:
+        rng, tasks, at, script, expected = random.Random(seed + 700), [], 0, [], []
+        for _ in range(steps):
+            roll = rng.random()
+            opened = [i for i, t in enumerate(tasks) if not t['done']]
+            closed = [i for i, t in enumerate(tasks) if t['done']]
+            if roll < 0.3:
+                word = rng.choice(WORDS)
+                script.append('text ' + (word.encode().hex() or '-'))
+                tasks.append({'title': word, 'done': 0})
+                at = len(tasks) - 1
+            elif roll < 0.5:
+                name, rows = rng.choice([('open', opened), ('done', closed)])
+                row = rng.randrange(len(rows) + 1)
+                script.append(f'point {name} {row}')
+                if row < len(rows): at = rows[row]
+            else:
+                key = rng.choice(['ArrowUp', 'ArrowDown', 'Space'])
+                script.append(f'key {key}')
+                if key == 'ArrowUp': at = max(at - 1, 0)
+                elif key == 'ArrowDown': at = min(at + 1, max(len(tasks) - 1, 0))
+                elif tasks: tasks[at]['done'] = int(not tasks[at]['done'])
+            if rng.random() < 0.3:
+                script.append('show')
+                opened = [i for i, t in enumerate(tasks) if not t['done']]
+                closed = [i for i, t in enumerate(tasks) if t['done']]
+                expected += ['Today', f'left: {len(opened)} open', f'open ({len(opened)})']
+                expected += [('> ' if i == at else '  ') + pictures(tasks[i]['title']) for i in opened]
+                expected += [f'done ({len(closed)})']
+                expected += [('> ' if i == at else '  ') + pictures(tasks[i]['title']) + ' (muted)' for i in closed]
+        out = run(vega, 'cli', module, stdin='\n'.join(script) + '\n')
+        assert out.returncode == 0 and out.stdout.splitlines() == expected, \
+            (seed, [(a, b) for a, b in zip(out.stdout.splitlines(), expected) if a != b][:3])
+        compared += len(expected)
+    surface = WebSurface(vega, module)
+    try:
+        for word in ('a', 'b', 'c'): surface.call('POST', '/text', word)
+        surface.call('POST', '/key', 'Space')  # c is done: the focus moves to the done list
+        parts = json.loads(surface.call('GET', '/screen?rows=5')[1])['parts']
+    finally:
+        surface.stop()
+    assert [(p['name'], p['rows'], p['focus']) for p in parts] == [('open', 2, None), ('done', 1, 0)], parts
+    return compared
 
 
 def scores(vega, module):
@@ -680,7 +731,7 @@ def main():
         work = Path(directory)
         env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
         modules = {}
-        for name in ('todo', 'scores'):
+        for name in ('todo', 'scores', 'today'):
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
@@ -688,6 +739,7 @@ def main():
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
+        report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))
