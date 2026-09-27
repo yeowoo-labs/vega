@@ -32,6 +32,15 @@ curl -s 'localhost:8767/views/cards_list?from=0&count=20'
 
 한 저장소는 한 번에 한 호스트가 연다(상태의 소유자는 하나다).
 
+글자와 아이콘은 하나의 바이너리 형식(심볼 파일)으로 그린다. 폰트와 SVG는 빌드할 때 한 번만 해석한다
+([설계 002](docs/design/002-symbol-format.md)).
+
+```sh
+build/vega-symbols build --font DejaVuSans.ttf --codes 0x20-0x7e --svg 0xE000=icon.svg -o ui.vsym
+build/vega-symbols compare DejaVuSans.ttf ui.vsym --sizes 12,16,32   # FreeType과 픽셀 차이, 읽는 비용
+build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
+```
+
 ## 위치
 
 | 층 | 역할 | 비유 |

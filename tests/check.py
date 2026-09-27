@@ -29,9 +29,15 @@
    text and row clicks, holds only the rows asked for around the focus, and
    every open page hears of each change. In headless Chromium (when node and
    chromium are there) the page itself takes keys, a click and typed text.
+10. Symbols: SVG icons (arcs, compact flags, holes, no viewBox) become
+   outlines of the right area, an icon asking for what symbols cannot hold is
+   refused by name, damaged files are refused whole, and (when DejaVu Sans is
+   there) glyphs keep their exact area and draw within a few levels of
+   FreeType's own coverage.
 """
 import argparse
 import json
+import math
 import os
 import random
 import shutil
@@ -902,11 +908,95 @@ def robustness(vega, aup, work, rounds):
     return len(examples), runs
 
 
+def symbols(tool, work):
+    """Build, read back and damage symbol files (docs/design/002-symbol-format.md)."""
+    icons = ROOT / 'tests' / 'symbols'
+    out = work / 'icons.vsym'
+    built = run(tool, 'build', '--svg', f'0xE002={icons / "rounded.svg"}', '--svg', f'0xE000={icons / "circle.svg"}',
+                '--svg', f'0xE001={icons / "frame.svg"}', '-o', out)
+    assert built.returncode == 0, built.stderr
+    info = json.loads(run(tool, 'info', out).stdout)
+    units = info['units']
+    square = (units / 16) ** 2  # an icon pixel, in square units
+    expected = {0xE000: math.pi * 49, 0xE001: 196 - 64, 0xE002: 196 - 16 + 4 * math.pi}
+    assert [s['code'] for s in info['symbols']] == sorted(expected), info
+    for symbol in info['symbols']:
+        area = abs(symbol['area']) / square
+        assert abs(area - expected[symbol['code']]) < 2e-3 * expected[symbol['code']], (symbol, expected)
+        assert symbol['bounds'] == [units // 16, units // 16, units * 15 // 16, units * 15 // 16], symbol
+        assert symbol['advance'] == units, symbol
+    refused = run(tool, 'build', '--svg', f'0xE000={icons / "turned.svg"}', '-o', work / 'turned.vsym')
+    assert refused.returncode != 0 and 'turned.svg' in refused.stderr and 'transform' in refused.stderr, refused.stderr
+    twice = run(tool, 'build', '--svg', f'0xE000={icons / "circle.svg"}', '--svg', f'0xE000={icons / "frame.svg"}',
+                '-o', work / 'twice.vsym')
+    assert twice.returncode != 0 and 'twice' in twice.stderr, twice.stderr
+
+    picture = work / 'circle.pgm'
+    assert run(tool, 'render', out, '0xE000', 32, picture).returncode == 0
+    header, pixels = picture.read_bytes().split(b'255\n', 1)
+    w, h = map(int, header.split()[1:3])
+    assert len(pixels) == w * h and abs(sum(pixels) / 255 - math.pi * 49 * 4) < 2, (w, h, sum(pixels) / 255)
+    assert run(tool, 'render', out, '0x41', 32, picture).returncode != 0  # no such symbol
+
+    good = out.read_bytes()
+    count = int.from_bytes(good[12:16], 'little')
+    records = 28
+
+    def damaged(name, data):
+        path = work / f'{name}.vsym'
+        path.write_bytes(bytes(data))
+        refused = run(tool, 'info', path)
+        assert refused.returncode != 0 and refused.stdout == '', (name, refused.stdout)
+        return refused.stderr.strip()
+
+    why = [damaged('short', good[:-1]), damaged('magic', b'VEGASYM2' + good[8:])]
+    swapped = bytearray(good)
+    swapped[records:records + 24], swapped[records + 24:records + 48] = good[records + 24:records + 48], good[records:records + 24]
+    why.append(damaged('order', swapped))
+    beyond = bytearray(good)
+    beyond[records + 8:records + 12] = (1 << 20).to_bytes(4, 'little')
+    why.append(damaged('beyond', beyond))
+    flagged = bytearray(good)
+    flagged[records + 22] = 1
+    why.append(damaged('flags', flagged))
+    counted = bytearray(good)
+    counted[12:16] = (count + 1).to_bytes(4, 'little')
+    why.append(damaged('count', counted))
+    assert len(set(why)) == len(why), why
+
+    report = {'icons': len(info['symbols'])}
+    font = Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
+    if font.exists():
+        glyphs = work / 'ascii.vsym'
+        assert run(tool, 'build', '--font', font, '--codes', '0x20-0x7e', '-o', glyphs).returncode == 0
+        lines = run(tool, 'compare', font, glyphs, '--sizes', '12,16,32').stdout.splitlines()
+        for line in lines[1:]:
+            size = json.loads(line)
+            assert size['glyphs'] == 94 and size['mean_difference'] < 3 and size['within_16'] > 0.99, size
+        report['glyph_sizes'] = len(lines) - 1
+        try:
+            from fontTools.pens.areaPen import AreaPen
+            from fontTools.ttLib import TTFont
+        except ImportError:
+            return report
+        face = TTFont(font)
+        outlines, cmap = face.getGlyphSet(), face.getBestCmap()
+        shown = json.loads(run(tool, 'info', glyphs).stdout)
+        k = shown['units'] / face['head'].unitsPerEm
+        for symbol in shown['symbols']:
+            pen = AreaPen()
+            outlines[cmap[symbol['code']]].draw(pen)
+            assert abs(abs(pen.value) * k * k - abs(symbol['area'])) < 1, (chr(symbol['code']), pen.value, symbol)
+        report['exact_glyphs'] = len(shown['symbols'])
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
     parser.add_argument('--aup', type=Path, required=True)
     parser.add_argument('--serve', type=Path, required=True)
+    parser.add_argument('--symbols', type=Path)
     parser.add_argument('--seeds', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=3)
     args = parser.parse_args()
@@ -937,6 +1027,8 @@ def main():
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
         report['convention_findings'] = conventions(vega, aup, work, modules)
         report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
+        if args.symbols:
+            report['symbols'] = symbols(args.symbols.resolve(), work)
     print(json.dumps(report))
 
 
