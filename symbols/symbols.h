@@ -62,7 +62,8 @@ void vega_symbol_raster(const VegaSymbols *, const VegaSymbol *, double scale, d
 
 /* Symbols drawn once at one scale and kept, for surfaces that compose them
  * on the CPU: each the first time it is asked for. */
-typedef struct { VegaPlace place; const unsigned char *pixels; } VegaBitmap; /* pixels: place.width per row */
+/* pixels: place.width per row; advance: how far the pen moves after it, in whole pixels */
+typedef struct { VegaPlace place; const unsigned char *pixels; int advance; } VegaBitmap;
 typedef struct VegaGlyphs VegaGlyphs;
 VegaGlyphs *vega_glyphs_open(const VegaSymbols *, float scale);
 /* The bitmap of code, or NULL when the file has no such symbol. */

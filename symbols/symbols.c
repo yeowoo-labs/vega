@@ -237,7 +237,7 @@ const VegaBitmap *vega_glyph(VegaGlyphs *glyphs, uint32_t code) {
     if (pixels)
         vega_symbol_raster(glyphs->symbols, &symbol, glyphs->scale, place.left / glyphs->scale, place.top / glyphs->scale,
                            place.width, place.height, pixels, (size_t)place.width);
-    slot->bitmap = (VegaBitmap){place, pixels};
+    slot->bitmap = (VegaBitmap){place, pixels, (int)lroundf(symbol.advance * glyphs->scale)};
     return &slot->bitmap;
 }
 

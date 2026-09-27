@@ -86,8 +86,12 @@ void vega_pixels(const VegaGrid *grid, VegaFace *face, uint32_t *out, size_t str
             int x = (int)c * face->cell_width, y = (int)r * face->cell_height;
             const VegaBitmap *glyph = vega_glyph(face->glyphs, cell->ch);
             unsigned cells = vega_width(cell->ch) == 2 ? 2 : 1;
+            /* A wide character's glyph is centred in its two cells: a CJK font's full width is
+             * less than two cells of a monospace Latin font. */
+            int centred = glyph && cells == 2 && glyph->advance < 2 * face->cell_width
+                              ? (2 * face->cell_width - glyph->advance) / 2 : 0;
             if (!glyph) missing(out, stride, x, y, face->cell_width * (int)cells, face->cell_height, width, color);
-            else draw(out, stride, width, height, glyph, x, y + face->baseline, color);
+            else draw(out, stride, width, height, glyph, x + centred, y + face->baseline, color);
             if (cell->mark && (glyph = vega_glyph(face->glyphs, cell->mark)))
                 draw(out, stride, width, height, glyph, x, y + face->baseline, color);
         }
