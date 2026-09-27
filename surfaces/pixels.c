@@ -67,6 +67,10 @@ static void missing(uint32_t *out, size_t stride, int x, int y, int width, int h
     for (int j = top; j <= bottom; ++j) out[(size_t)j * stride + (size_t)left] = out[(size_t)j * stride + (size_t)right] = color;
 }
 
+void vega_pixels_clear(uint32_t *out, size_t stride, unsigned width, unsigned height) {
+    fill(out, stride, 0, 0, (int)width, (int)height, background);
+}
+
 void vega_pixels(const VegaGrid *grid, VegaFace *face, uint32_t *out, size_t stride) {
     int width = (int)grid->width * face->cell_width, height = (int)grid->height * face->cell_height;
     /* Backgrounds first: a wide glyph spans its neighbour's cell. */

@@ -23,6 +23,11 @@
  *   pixels --symbols FONT.vsym [--size PX] --grid WxH --out PREFIX
  *                    the TUI's frames drawn with a font's glyphs, driven by a
  *                    script: each show writes PREFIX-N.ppm after the text
+ *   display --symbols FONT.vsym [--size PX] [--card PATH] [--writeback WxH --out PREFIX]
+ *                    the same on a display through KMS, as many cells as fit,
+ *                    driven by a script; with writeback each shown frame comes
+ *                    back from the display controller, is set against what was
+ *                    drawn and written to PREFIX-N.ppm
  * With --store the app's states live in that tree store: the app continues
  * where it was, whichever surface runs it. With --watch (tui, web) a module
  * written again replaces the running one and states keep their values by
@@ -459,7 +464,7 @@ static int interactive(void) {
 
 /* ---- scripts -------------------------------------------------------- */
 
-typedef enum { SURFACE_CLI, SURFACE_SAY, SURFACE_TUI, SURFACE_WEB, SURFACE_PIXELS } Surface;
+typedef enum { SURFACE_CLI, SURFACE_SAY, SURFACE_TUI, SURFACE_WEB, SURFACE_PIXELS, SURFACE_DISPLAY } Surface;
 
 /* The pixel surface's font and where its frames go. */
 static VegaFace face;
@@ -490,11 +495,48 @@ static bool write_frame(const VegaGrid *grid, char path[512]) {
     return ok;
 }
 
+static VegaDisplay *display;
+
+/* A frame on the display; with writeback, what came back is set against it
+ * and written (differing: how many pixels are not what was drawn). */
+static bool show_frame(const VegaGrid *grid, char path[512], unsigned long *differing) {
+    unsigned width, height;
+    size_t stride, captured_stride;
+    uint32_t *out = vega_display_buffer(display, &width, &height, &stride);
+    vega_pixels_clear(out, stride, width, height);
+    vega_pixels(grid, &face, out, stride);
+    if (!vega_display_show(display)) return false;
+    const uint32_t *back = vega_display_captured(display, &captured_stride);
+    *differing = 0;
+    path[0] = 0;
+    if (!back || !frames_prefix) return true;
+    /* The capture read once, a row at a time (it is not cached memory either). */
+    uint32_t *row = malloc((size_t)width * sizeof(*row));
+    unsigned char *rgb = malloc((size_t)width * height * 3);
+    bool ok = row && rgb;
+    for (unsigned y = 0; ok && y < height; ++y) {
+        memcpy(row, back + (size_t)y * captured_stride, (size_t)width * sizeof(*row));
+        for (unsigned x = 0; x < width; ++x) {
+            *differing += (row[x] & 0xffffff) != (out[(size_t)y * stride + x] & 0xffffff);
+            unsigned char *p = rgb + ((size_t)y * width + x) * 3;
+            p[0] = (unsigned char)(row[x] >> 16), p[1] = (unsigned char)(row[x] >> 8), p[2] = (unsigned char)row[x];
+        }
+    }
+    snprintf(path, 512, "%s-%u.ppm", frames_prefix, ++frames);
+    FILE *f = ok ? fopen(path, "wb") : NULL;
+    ok = f && fprintf(f, "P6\n%u %u\n255\n", width, height) > 0 && fwrite(rgb, 3, (size_t)width * height, f) == (size_t)width * height;
+    if (f && fclose(f)) ok = false;
+    free(row);
+    free(rgb);
+    return ok;
+}
+
+
 /* painting: show writes the terminal bytes of the frame, not the grid. */
 static int script(Surface surface, unsigned width, unsigned height, bool painting) {
     static char line[1 << 16];
     VegaGrid grid = {0};
-    bool gridded = surface == SURFACE_TUI || surface == SURFACE_PIXELS;
+    bool gridded = surface == SURFACE_TUI || surface == SURFACE_PIXELS || surface == SURFACE_DISPLAY;
     if (gridded && !vega_grid(&grid, width, height)) return 2;
     bool shown = false;
     drawn = gridded ? &grid : NULL;
@@ -572,9 +614,13 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
                 dump(&grid);
                 printf("cells %lu\n", vega_evaluations() - counted);
                 char path[512];
+                unsigned long differing;
                 if (surface == SURFACE_PIXELS) {
                     if (!write_frame(&grid, path)) { fprintf(stderr, "vega: cannot write %s\n", path); return 1; }
                     printf("frame %s %dx%d\n", path, (int)grid.width * face.cell_width, (int)grid.height * face.cell_height);
+                } else if (surface == SURFACE_DISPLAY) {
+                    if (!show_frame(&grid, path, &differing)) { fputs("vega: the display did not take the frame\n", stderr); return 1; }
+                    if (path[0]) printf("frame %s differing %lu grid %ux%u\n", path, differing, grid.width, grid.height);
                 }
             }
             counted = vega_evaluations();
@@ -593,6 +639,9 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
     vega_grid_free(&grid);
     return 0;
 }
+
+/* Surfaces that draw glyphs. */
+static bool glyphed(const char *surface) { return !strcmp(surface, "pixels") || !strcmp(surface, "display"); }
 
 /* The symbols a pixel surface draws with, read whole and kept. */
 static bool open_face(const char *path, float size) {
@@ -614,8 +663,9 @@ static bool open_face(const char *path, float size) {
 
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0, port = 8080;
-    const char *symbols_path = NULL;
+    const char *symbols_path = NULL, *card = "/dev/dri/card1";
     float size = 16;
+    bool writeback = false;
     bool dumped = false, painting = false, watch = false, usage = argc < 3;
     const char *store = NULL, *listen_on = "127.0.0.1";
     for (int i = 3; !usage && i < argc; i += 2) {
@@ -633,29 +683,47 @@ int main(int argc, char **argv) {
                   (!strcmp(argv[i], "--grid") && !strcmp(argv[1], "pixels"))) &&
                  sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height && width <= 1000 && height <= 1000)
             dumped = true, painting = !strcmp(argv[i], "--paint");
-        else if (!strcmp(argv[i], "--symbols") && !strcmp(argv[1], "pixels")) symbols_path = argv[i + 1];
-        else if (!strcmp(argv[i], "--out") && !strcmp(argv[1], "pixels")) frames_prefix = argv[i + 1];
-        else if (!strcmp(argv[i], "--size") && !strcmp(argv[1], "pixels") && sscanf(argv[i + 1], "%f", &size) == 1) {}
+        else if (!strcmp(argv[i], "--writeback") && !strcmp(argv[1], "display") &&
+                 sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height)
+            writeback = true;
+        else if (!strcmp(argv[i], "--card") && !strcmp(argv[1], "display")) card = argv[i + 1];
+        else if (!strcmp(argv[i], "--symbols") && glyphed(argv[1])) symbols_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--out") && glyphed(argv[1])) frames_prefix = argv[i + 1];
+        else if (!strcmp(argv[i], "--size") && glyphed(argv[1]) && sscanf(argv[i + 1], "%f", &size) == 1) {}
         else usage = true;
     }
-    bool pixels = argc > 1 && !strcmp(argv[1], "pixels");
+    bool pixels = argc > 1 && !strcmp(argv[1], "pixels"), on_display = argc > 1 && !strcmp(argv[1], "display");
     if (usage || (dumped && strcmp(argv[1], "tui") && !pixels) || (!strcmp(argv[1], "check") && argc != 3) ||
-        (pixels && (!dumped || !symbols_path || !frames_prefix))) {
+        (pixels && (!dumped || !symbols_path || !frames_prefix)) || (on_display && (!symbols_path || (writeback && !frames_prefix)))) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
               "vega tui MODULE.pmod [--store PATH] [--watch] | --dump|--paint WIDTHxHEIGHT < script\n"
               "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
               "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
+              "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] [--card PATH]\n"
+              "             [--writeback WIDTHxHEIGHT --out PREFIX] < script\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
-    if (pixels && !open_face(symbols_path, size)) return 2;
+    if ((pixels || on_display) && !open_face(symbols_path, size)) return 2;
+    if (on_display) {
+        char error[256];
+        if (!(display = vega_display_open(card, writeback, writeback ? width : 0, writeback ? height : 0, error, sizeof(error)))) {
+            fprintf(stderr, "vega: %s\n", error);
+            return 2;
+        }
+        unsigned pixels_across, pixels_down;
+        size_t stride;
+        vega_display_buffer(display, &pixels_across, &pixels_down, &stride);
+        width = pixels_across / (unsigned)face.cell_width;
+        height = pixels_down / (unsigned)face.cell_height;
+    }
     if (!strcmp(argv[1], "check")) {
         if (!load_module(argv[2], &modules[0])) return 2;
         return vega_check(&modules[0], print_finding, argv[2]) ? 1 : 0;
     }
     Surface surface = !strcmp(argv[1], "cli") ? SURFACE_CLI : !strcmp(argv[1], "say") ? SURFACE_SAY :
                       !strcmp(argv[1], "tui") ? SURFACE_TUI : !strcmp(argv[1], "web") ? SURFACE_WEB :
-                      pixels ? SURFACE_PIXELS : (Surface)-1;
+                      pixels ? SURFACE_PIXELS : on_display ? SURFACE_DISPLAY : (Surface)-1;
     if ((int)surface < 0) { fprintf(stderr, "vega: unknown surface %s\n", argv[1]); return 2; }
     if (!load(argv[2], store)) return 2;
     if (watch && !dumped) {
@@ -667,5 +735,6 @@ int main(int argc, char **argv) {
     /* Frame changes are stored with events; keep the last ones too. */
     if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }
     pure_app_stop(&app);
+    vega_display_close(display);
     return status;
 }

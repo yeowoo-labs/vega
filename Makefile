@@ -11,7 +11,8 @@ LIBPURE = $(PURE)/build/libpure.a
 # Parts: lib/ (the aup library: the interface vocabulary), surfaces/ (the vega
 # host: TUI, CLI, NUI sentences, web), symbols/ (glyphs and icons as one
 # format, drawn by CPU or GPU).
-SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/main.c
+SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/display.c \
+           surfaces/main.c
 
 .PHONY: all check FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols

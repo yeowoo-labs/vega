@@ -135,4 +135,20 @@ void vega_face_close(VegaFace *);
 /* The grid into out: 0xRRGGBB pixels, grid->width * cell_width across and
  * grid->height * cell_height down, stride pixels apart. */
 void vega_pixels(const VegaGrid *, VegaFace *, uint32_t *out, size_t stride);
+/* width x height of out in the background's colour. */
+void vega_pixels_clear(uint32_t *out, size_t stride, unsigned width, unsigned height);
+
+/* A display through KMS: the first connected connector (or, with writeback,
+ * a writeback connector: the frames come back to memory, so no screen is
+ * needed to check them), its preferred mode or width x height. */
+typedef struct VegaDisplay VegaDisplay;
+VegaDisplay *vega_display_open(const char *card, bool writeback, unsigned width, unsigned height, char *error,
+                               size_t error_size);
+/* The buffer to draw the next frame into: 0xRRGGBB, stride pixels apart. */
+uint32_t *vega_display_buffer(VegaDisplay *, unsigned *width, unsigned *height, size_t *stride);
+/* Show it (and, on writeback, wait until the frame has come back). */
+bool vega_display_show(VegaDisplay *);
+/* Writeback: the last frame as the display controller put it out. */
+const uint32_t *vega_display_captured(const VegaDisplay *, size_t *stride);
+void vega_display_close(VegaDisplay *);
 #endif

@@ -33,6 +33,9 @@
    (a Latin monospace font, then Korean from a CJK one): the same text, blank
    cells only background (a focused row's own colour), every other cell
    inked, so no glyph spills into its neighbour.
+12. Display: the same frames through KMS on a writeback connector (when the
+   device has one) come back from the display controller exactly as drawn,
+   and are the pixel surface's frames for the same grid.
 10. Symbols: SVG icons (arcs, compact flags, holes, no viewBox) become
    outlines of the right area, an icon asking for what symbols cannot hold is
    refused by name, damaged files are refused whole, and (when DejaVu Sans is
@@ -1074,6 +1077,39 @@ def pixels(vega, tool, module, work):
     return {'frames': len(frames), 'cells': checked}
 
 
+def display(vega, module, work):
+    """The same frames on a display through KMS, on a writeback connector: each
+    comes back from the display controller exactly as drawn, and it is the
+    pixel surface's frame for the same grid. None without such a device."""
+    card, face = Path('/dev/dri/card1'), work / 'ui.vsym'
+    if not card.exists() or not face.exists():
+        return None
+    items = ['우유 사기', 'Pure 런타임 문서 읽기', 'on the display']
+    script = ''.join(f'text {item.encode().hex()}\n' for item in items) + 'key Space\nshow\nkey ArrowUp\nshow\n'
+    shown = run(vega, 'display', module, '--symbols', face, '--size', 18, '--card', card, '--writeback', '640x480',
+                '--out', work / 'display', stdin=script)
+    if shown.returncode == 2 and ('writeback' in shown.stderr or 'cannot open' in shown.stderr):
+        return None  # no writeback connector, or no access to the card
+    assert shown.returncode == 0, shown.stderr
+    frames = [line.split() for line in shown.stdout.splitlines() if line.startswith('frame ')]
+    assert len(frames) == 2 and all(frame[3] == '0' for frame in frames), frames
+    grid = frames[0][5]
+    drawn = run(vega, 'pixels', module, '--symbols', face, '--size', 18, '--grid', grid, '--out', work / 'grid', stdin=script)
+    assert drawn.returncode == 0, drawn.stderr
+    assert [line for line in drawn.stdout.splitlines() if not line.startswith('frame ')] == \
+        [line for line in shown.stdout.splitlines() if not line.startswith('frame ')]
+    compared = 0
+    for (_, captured, *_), (_, pixel_path, size) in zip(frames, [l.split() for l in drawn.stdout.splitlines() if l.startswith('frame ')]):
+        header, image = Path(captured).read_bytes().split(b'255\n', 1)
+        full_width = int(header.split()[1])
+        head, grid_image = Path(pixel_path).read_bytes().split(b'255\n', 1)
+        width, height = map(int, head.split()[1:3])
+        for y in range(height):
+            assert image[3 * y * full_width:3 * (y * full_width + width)] == grid_image[3 * y * width:3 * (y + 1) * width], y
+        compared += width * height
+    return {'frames': len(frames), 'pixels': compared}
+
+
 def width_of(character):
     return width(character) or 0
 
@@ -1117,6 +1153,7 @@ def main():
         if args.symbols:
             report['symbols'] = symbols(args.symbols.resolve(), work)
             report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
+            report['display'] = display(vega, modules['todo'], work)
     print(json.dumps(report))
 
 
