@@ -29,8 +29,11 @@ $(BUILD)/vega: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $
 # The same host as a surface a Pure node maps (pure-serve --surface, Pure's
 # serve/surface.h): the node's display. It calls the app model pure-serve
 # exports, so it links no libpure.a of its own; it exports pure_surface_run
-# alone, and what only the vega command uses is left out.
-$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h | $(BUILD)
+# alone, and what only the vega command uses is left out. It is built again
+# when Pure's headers change: a node refuses a surface built for another
+# layout of its app and module.
+PURE_HEADERS = $(wildcard $(PURE)/core/*.h) $(PURE)/serve/surface.h
+$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $(PURE_HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -fPIC -shared -fvisibility=hidden -ffunction-sections \
 		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c \
 		$(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@
