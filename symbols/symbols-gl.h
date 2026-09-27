@@ -3,22 +3,41 @@
 #include "symbols.h"
 #include <GLES3/gl31.h>
 
-/* Symbols drawn by the GPU (OpenGL ES 3.1): the file's point table goes up
- * as it is, one storage buffer, and each pixel of a symbol's box sums the
- * exact area of the curves crossing its row, as vega_coverage does. Rows
- * are cut into bands at upload, each listing its curves, so a pixel reads
- * only those. Needs a current context. */
+/* Symbols on the GPU (OpenGL ES 3.1): the symbols wanted at one scale are
+ * drawn on the CPU into an atlas, each pixel the exact area its curves cover
+ * (vega_symbol_raster), and text is quads reading it. On the Pi 5 the CPU
+ * draws the atlas faster than the GPU's compute could, and the GPU composes
+ * a 1080p page of text in about a millisecond (docs/design/002). A scale that
+ * keeps changing (a zoom) draws its atlas again. Needs a current context. */
 typedef struct {
-    GLuint program, points, bands, instances, array;
-    GLint viewport;
+    GLuint draw, array, instances;
+    GLint target;
 } VegaGl;
 
-/* A symbol placed: its origin in pixels from the target's top left, and
- * pixels per unit. */
-typedef struct { float x, y, scale; uint32_t symbol; } VegaGlyph;
+/* Where each symbol is in an atlas: its rectangle there (x, y, width, height)
+ * and the pixel offset of that rectangle's top left from the symbol's origin
+ * (right, up). A symbol with nothing to draw has an empty rectangle. */
+typedef struct { int32_t x, y, width, height, left, top; } VegaPlace;
 
-bool vega_gl_open(VegaGl *, const VegaSymbols *, char *error, size_t error_size);
+typedef struct {
+    GLuint texture; /* 8-bit coverage */
+    int width, height;
+    float scale;    /* pixels per unit */
+    uint32_t symbols;
+    VegaPlace *places; /* per symbol index */
+} VegaAtlas;
+
+/* A symbol at a pen position (whole pixels from the target's top left, on the
+ * baseline). */
+typedef struct { int32_t x, y; uint32_t symbol; } VegaGlyph;
+
+bool vega_gl_open(VegaGl *, char *error, size_t error_size);
+/* Draw symbols (their indices; all when wanted is NULL) at scale into a new
+ * atlas; false when they do not fit one texture. */
+bool vega_gl_atlas(VegaGl *, const VegaSymbols *, float scale, const uint32_t *wanted, uint32_t count, VegaAtlas *out,
+                   char *error, size_t error_size);
 /* Coverage added into the red channel of the bound framebuffer. */
-void vega_gl_draw(VegaGl *, const VegaSymbols *, const VegaGlyph *, uint32_t count, int width, int height);
+void vega_gl_draw(VegaGl *, const VegaAtlas *, const VegaGlyph *, uint32_t count, int width, int height);
+void vega_gl_atlas_close(VegaAtlas *);
 void vega_gl_close(VegaGl *);
 #endif

@@ -33,8 +33,8 @@
    outlines of the right area, an icon asking for what symbols cannot hold is
    refused by name, damaged files are refused whole, and (when DejaVu Sans is
    there) glyphs keep their exact area and draw within a few levels of
-   FreeType's own coverage, and (when there is an OpenGL ES 3.1 device) the
-   GPU draws them as the CPU reference does.
+   FreeType's own coverage, and (when there is an OpenGL ES 3.1 device) text
+   the GPU composes from an atlas is what the CPU reference draws.
 """
 import argparse
 import json
@@ -985,12 +985,13 @@ def symbols(tool, work):
             size = json.loads(line)
             assert size['glyphs'] == 94 and size['mean_difference'] < 3 and size['within_16'] > 0.99, size
         report['glyph_sizes'] = len(lines) - 1
-        # The GPU draws what vega_coverage computes (when there is an OpenGL ES 3.1 device).
+        # Text composed by the GPU from the atlas is what vega_symbol_raster
+        # draws at the same pen positions (when there is an OpenGL ES 3.1 device).
         drawn = run(tool, 'gpu', glyphs, '--sizes', '12,32', '--frames', 1)
         if drawn.returncode == 0:
             for line in drawn.stdout.splitlines()[1:]:
                 size = json.loads(line)
-                assert size['symbols'] == 95 and size['mean_difference'] < 0.5 and size['worst'] <= 8, size
+                assert size['symbols'] == 95 and size['worst'] <= 1 and size['page_glyphs'] > 1000, size
             report['gpu_sizes'] = len(drawn.stdout.splitlines()) - 1
         else:
             assert 'EGL' in drawn.stderr or 'OpenGL' in drawn.stderr, drawn.stderr

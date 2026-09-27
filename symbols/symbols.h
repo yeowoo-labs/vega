@@ -47,8 +47,9 @@ uint32_t vega_symbol_curves(const VegaSymbols *, const VegaSymbol *, VegaCurve *
 /* The coverage (0 to 1) of the pixel whose center is (x, y) in units, at
  * scale pixels per unit: the exact area the curves' outline covers. */
 double vega_coverage(const VegaCurve *, uint32_t count, double scale, double x, double y);
-/* width x height 8-bit coverage, rows top first; pixel (i, j) has its center
- * at (left + (i + 0.5) / scale, top - (j + 0.5) / scale) in units. */
+/* width x height 8-bit coverage, rows top first, stride bytes apart; pixel
+ * (i, j) has its center at (left + (i + 0.5) / scale, top - (j + 0.5) / scale)
+ * in units. */
 void vega_symbol_raster(const VegaSymbols *, const VegaSymbol *, double scale, double left, double top, int width,
-                        int height, unsigned char *out);
+                        int height, unsigned char *out, size_t stride);
 #endif

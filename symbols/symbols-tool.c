@@ -667,7 +667,7 @@ static int compare(int argc, char **argv) {
             if (need > raster_size && !(raster = realloc(raster, raster_size = need))) fail("out of memory");
             double started = seconds();
             vega_symbol_raster(&s, &symbol, scale, face->glyph->bitmap_left / scale, face->glyph->bitmap_top / scale,
-                               (int)b->width, (int)b->rows, raster);
+                               (int)b->width, (int)b->rows, raster, b->width);
             ours_seconds += seconds() - started;
             for (unsigned j = 0; j < b->rows; ++j)
                 for (unsigned i2 = 0; i2 < b->width; ++i2) {
@@ -730,7 +730,7 @@ static int render(int argc, char **argv) {
     int width = (int)ceil((symbol.advance > symbol.right ? symbol.advance : symbol.right) * scale) + 2;
     int height = (int)ceil(pixels * 1.25) + 2;
     unsigned char *raster = malloc((size_t)width * (size_t)height);
-    vega_symbol_raster(&s, &symbol, scale, -1 / scale, (pixels + 1) / scale, width, height, raster);
+    vega_symbol_raster(&s, &symbol, scale, -1 / scale, (pixels + 1) / scale, width, height, raster, (size_t)width);
     FILE *f = fopen(argv[5], "wb");
     if (!f) fail("cannot write");
     fprintf(f, "P5\n%d %d\n255\n", width, height);
@@ -775,9 +775,10 @@ static GLuint gl_target(int width, int height) {
     return texture;
 }
 
-/* Every symbol in a grid of cells, drawn by the GPU and by vega_coverage:
- * how far apart; then pages of text (glyphs cycling through the file)
- * drawn again and again: how long a page takes. */
+/* At each size: every symbol drawn into an atlas and composed by the GPU at a
+ * pen position, read back against vega_symbol_raster over the same pixels;
+ * then pages of text (glyphs cycling through the file) composed again and
+ * again. */
 static int gpu(int argc, char **argv) {
     if (argc < 5 || strcmp(argv[3], "--sizes")) fail("usage: vega-symbols gpu SYMBOLS.vsym --sizes 12,16,32,64 [--frames N]");
     int frames = argc > 6 && !strcmp(argv[5], "--frames") ? atoi(argv[6]) : 20;
@@ -788,7 +789,7 @@ static int gpu(int argc, char **argv) {
     printf("{\"renderer\":\"%s\"}\n", (const char *)glGetString(GL_RENDERER));
     VegaGl gl;
     double started = seconds();
-    if (!vega_gl_open(&gl, &s, error, sizeof(error))) fail(error);
+    if (!vega_gl_open(&gl, error, sizeof(error))) fail(error);
     glFinish();
     double open_ms = (seconds() - started) * 1e3;
     for (const char *p = argv[4]; *p;) {
@@ -796,72 +797,91 @@ static int gpu(int argc, char **argv) {
         long size = strtol(p, &end, 10);
         p = *end == ',' ? end + 1 : end;
         if (size <= 0 || size > 512) fail("--sizes");
-        double scale = (double)size / s.units;
-        /* Cells that hold any symbol, so none reaches into another's. */
+        float scale = (float)size / s.units;
+        VegaAtlas atlas;
+        started = seconds();
+        if (!vega_gl_atlas(&gl, &s, scale, NULL, 0, &atlas, error, sizeof(error))) {
+            printf("{\"pixels_per_em\":%ld,\"error\":\"%s\"}\n", size, error);
+            continue;
+        }
+        glFinish();
+        double fill_ms = (seconds() - started) * 1e3;
+        /* Every symbol composed at a pen position of its own cell, read back
+         * and set against vega_symbol_raster at the same pixels. */
         int left = 0, bottom = 0, right = 0, top = 0;
         for (uint32_t i = 0; i < s.symbols; ++i) {
-            VegaSymbol symbol = vega_symbol_at(&s, i);
-            left = symbol.left < left ? symbol.left : left;
-            bottom = symbol.bottom < bottom ? symbol.bottom : bottom;
-            right = symbol.right > right ? symbol.right : right;
-            top = symbol.top > top ? symbol.top : top;
+            VegaPlace place = atlas.places[i];
+            if (!place.width) continue;
+            left = place.left < left ? place.left : left;
+            top = place.top > top ? place.top : top;
+            right = place.left + place.width > right ? place.left + place.width : right;
+            bottom = place.top - place.height < bottom ? place.top - place.height : bottom;
         }
-        int cell = (int)ceil((right - left > top - bottom ? right - left : top - bottom) * scale) + 4;
-        int across = 4096 / cell, rows = (int)((s.symbols + (uint32_t)across - 1) / (uint32_t)across);
-        if (rows * cell > 4096) rows = 4096 / cell;
-        int width = across * cell, height = rows * cell;
+        int cell_width = right - left + 2, cell_height = top - bottom + 2;
+        int across = 2048 / cell_width, rows = (int)((s.symbols + (uint32_t)across - 1) / (uint32_t)across);
+        if (rows * cell_height > 4096) rows = 4096 / cell_height;
+        int grid_width = across * cell_width, grid_height = rows * cell_height;
         uint32_t shown = s.symbols < (uint32_t)(across * rows) ? s.symbols : (uint32_t)(across * rows);
-        VegaGlyph *glyphs = malloc(shown * sizeof(*glyphs));
+        VegaGlyph *cells = malloc((shown ? shown : 1) * sizeof(*cells));
         for (uint32_t i = 0; i < shown; ++i)
-            glyphs[i] = (VegaGlyph){(float)(i % (uint32_t)across * (uint32_t)cell) + 2 - (float)(left * scale),
-                                    (float)(i / (uint32_t)across * (uint32_t)cell) + 2 + (float)(top * scale), (float)scale, i};
-        GLuint texture = gl_target(width, height);
-        vega_gl_draw(&gl, &s, glyphs, shown, width, height);
-        unsigned char *drawn = malloc((size_t)width * (size_t)height), *reference = malloc((size_t)cell * (size_t)cell);
+            cells[i] = (VegaGlyph){(int)(i % (uint32_t)across) * cell_width + 1 - left,
+                                   (int)(i / (uint32_t)across) * cell_height + 1 + top, i};
+        GLuint grid = gl_target(grid_width, grid_height);
+        vega_gl_draw(&gl, &atlas, cells, shown, grid_width, grid_height);
+        unsigned char *drawn = malloc((size_t)grid_width * (size_t)grid_height), *reference = NULL;
+        size_t reference_size = 0;
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels(0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, drawn);
+        glReadPixels(0, 0, grid_width, grid_height, GL_RED, GL_UNSIGNED_BYTE, drawn);
+        glDeleteTextures(1, &grid);
         double total = 0;
         uint64_t pixels = 0;
         int worst = 0;
+        size_t need = (size_t)cell_width * (size_t)cell_height;
+        if (!(reference = malloc(need))) fail("out of memory");
+        reference_size = need;
         for (uint32_t i = 0; i < shown; ++i) {
             VegaSymbol symbol = vega_symbol_at(&s, i);
-            int x0 = (int)(i % (uint32_t)across) * cell, y0 = (int)(i / (uint32_t)across) * cell;
-            vega_symbol_raster(&s, &symbol, scale, (x0 - glyphs[i].x) / scale, (glyphs[i].y - y0) / scale, cell, cell, reference);
-            for (int j = 0; j < cell; ++j)
-                for (int k = 0; k < cell; ++k) {
+            int x0 = (int)(i % (uint32_t)across) * cell_width, y0 = (int)(i / (uint32_t)across) * cell_height;
+            /* the cell's pixels, relative to the pen: from (x0 - pen x, pen y - y0) */
+            vega_symbol_raster(&s, &symbol, scale, (x0 - cells[i].x) / scale, (cells[i].y - y0) / scale, cell_width,
+                               cell_height, reference, (size_t)cell_width);
+            for (int j = 0; j < cell_height; ++j)
+                for (int k = 0; k < cell_width; ++k) {
                     /* GL's rows run bottom up */
-                    int gpu_value = drawn[(size_t)(height - 1 - (y0 + j)) * (size_t)width + (size_t)(x0 + k)];
-                    int difference = abs(gpu_value - reference[j * cell + k]);
+                    int gpu_value = drawn[(size_t)(grid_height - 1 - (y0 + j)) * (size_t)grid_width + (size_t)(x0 + k)];
+                    int difference = abs(gpu_value - reference[(size_t)j * (size_t)cell_width + (size_t)k]);
                     total += difference;
                     worst = difference > worst ? difference : worst;
                     ++pixels;
                 }
         }
-        /* Pages: glyphs at their advances in lines, a full target's worth. */
+        (void)reference_size;
+        free(cells);
+        /* Pages: glyphs at their advances in lines, a 1920x1080 target's worth. */
         int page_width = 1920, page_height = 1080;
         uint32_t page = 0, capacity = 1 << 16;
         VegaGlyph *text = malloc(capacity * sizeof(*text));
-        float x = 0, line = (float)size * 1.2f;
-        for (float y = line; y + (float)size * 0.3f < (float)page_height && page < capacity; ) {
-            VegaSymbol symbol = vega_symbol_at(&s, page % s.symbols);
-            float advance = (float)(symbol.advance * scale);
-            if (x + advance > (float)page_width) { x = 0; y += line; continue; }
-            text[page++] = (VegaGlyph){x, y, (float)scale, page % s.symbols};
+        int x = 0, line = (int)(size * 1.2);
+        for (int y = line; y + size / 3 < page_height && page < capacity;) {
+            uint32_t index = page % s.symbols;
+            int advance = (int)lroundf(vega_symbol_at(&s, index).advance * scale);
+            if (x + advance > page_width) { x = 0; y += line; continue; }
+            text[page++] = (VegaGlyph){x, y, index};
             x += advance;
         }
-        glDeleteTextures(1, &texture);
-        texture = gl_target(page_width, page_height);
-        vega_gl_draw(&gl, &s, text, page, page_width, page_height);
+        GLuint texture = gl_target(page_width, page_height);
+        vega_gl_draw(&gl, &atlas, text, page, page_width, page_height);
         glFinish();
         started = seconds();
-        for (int f = 0; f < frames; ++f) vega_gl_draw(&gl, &s, text, page, page_width, page_height);
+        for (int f = 0; f < frames; ++f) vega_gl_draw(&gl, &atlas, text, page, page_width, page_height);
         glFinish();
         double page_ms = (seconds() - started) / frames * 1e3;
-        printf("{\"pixels_per_em\":%ld,\"symbols\":%u,\"mean_difference\":%.3f,\"worst\":%d,\"page_glyphs\":%u,"
-               "\"page_ms\":%.2f,\"upload_ms\":%.1f}\n", size, shown, pixels ? total / (double)pixels : 0, worst, page, page_ms, open_ms);
+        printf("{\"pixels_per_em\":%ld,\"symbols\":%u,\"mean_difference\":%.3f,\"worst\":%d,\"atlas\":\"%dx%d\","
+               "\"fill_ms\":%.1f,\"page_glyphs\":%u,\"page_ms\":%.2f,\"upload_ms\":%.1f}\n", size, shown,
+               pixels ? total / (double)pixels : 0, worst, atlas.width, atlas.height, fill_ms, page, page_ms, open_ms);
         glDeleteTextures(1, &texture);
+        vega_gl_atlas_close(&atlas);
         free(text);
-        free(glyphs);
         free(drawn);
         free(reference);
     }

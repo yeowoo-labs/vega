@@ -173,13 +173,13 @@ double vega_coverage(const VegaCurve *curves, uint32_t count, double scale, doub
 }
 
 void vega_symbol_raster(const VegaSymbols *s, const VegaSymbol *symbol, double scale, double left, double top, int width,
-                        int height, unsigned char *out) {
+                        int height, unsigned char *out, size_t stride) {
     VegaCurve *curves = malloc((symbol->count ? symbol->count : 1) * sizeof(*curves));
     uint32_t count = curves ? vega_symbol_curves(s, symbol, curves) : 0;
     for (int j = 0; j < height; ++j)
         for (int i = 0; i < width; ++i) {
             double coverage = vega_coverage(curves, count, scale, left + (i + 0.5) / scale, top - (j + 0.5) / scale);
-            out[(size_t)j * (size_t)width + (size_t)i] = (unsigned char)lround(coverage * 255);
+            out[(size_t)j * stride + (size_t)i] = (unsigned char)lround(coverage * 255);
         }
     free(curves);
 }
