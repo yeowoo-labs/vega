@@ -155,8 +155,8 @@ void vega_display_close(VegaDisplay *);
 
 /* Input from evdev: keyboards (key names and the text they type on a US
  * layout), mice and touch screens (presses at a pixel of a width x height
- * screen). With paths, recorded events are read from those files instead,
- * positions in screen pixels. */
+ * screen). With count paths, recorded events are read from those files
+ * instead, positions in screen pixels; with paths NULL, there is none. */
 typedef enum { VEGA_EVENT_KEY, VEGA_EVENT_TEXT, VEGA_EVENT_PRESS, VEGA_EVENT_WHEEL } VegaEventKind;
 typedef struct {
     VegaEventKind kind;

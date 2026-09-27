@@ -15,7 +15,7 @@ SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c sur
            surfaces/input.c surfaces/main.c
 
 .PHONY: all check FORCE
-all: $(BUILD)/vega $(BUILD)/vega-symbols
+all: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so
 
 $(BUILD):
 	mkdir -p $@
@@ -24,7 +24,16 @@ $(LIBPURE): FORCE
 	$(MAKE) -C $(PURE) build/libpure.a
 
 $(BUILD)/vega: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $(LIBPURE) | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -Isymbols $(SURFACES) symbols/symbols.c $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
+
+# The same host as a surface a Pure node maps (pure-serve --surface, Pure's
+# serve/surface.h): the node's display. It calls the app model pure-serve
+# exports, so it links no libpure.a of its own; it exports pure_surface_run
+# alone, and what only the vega command uses is left out.
+$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -fPIC -shared -fvisibility=hidden -ffunction-sections \
+		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c \
+		$(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@
 
 # Building symbol files reads fonts through FreeType; reading them does not.
 FREETYPE_CFLAGS ?= $(shell pkg-config --cflags freetype2)
@@ -36,7 +45,7 @@ $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbo
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) symbols/symbols-tool.c $(SYMBOLS) $(LDFLAGS) \
 		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
-check: $(BUILD)/vega $(BUILD)/vega-symbols
+check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so
 	$(MAKE) -C $(AUP) build/aup
 	$(MAKE) -C $(PURE) build/pure-serve
 	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve

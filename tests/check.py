@@ -1160,6 +1160,89 @@ def live_display(vega, module, work):
     return {'events': len(events), 'lines': len(got)}
 
 
+def node_display(vega, serve, module, work):
+    """Vega in a Pure node (vega-surface.so run by pure-serve --surface): the
+    node's app, which an HTTP client gave an item, is on its display, and
+    recorded keys typed there (an item, Enter, Tab, Space) go to the node's
+    owner. The last frame is the one the vega command draws for the same
+    state and keys, it came back from the display controller as drawn, and
+    the node's HTTP views show what was typed."""
+    import http.client
+    import select
+    import shutil
+    import signal
+    import struct
+    import time
+    card, face, library = Path('/dev/dri/card1'), work / 'ui.vsym', vega.parent / 'vega-surface.so'
+    if not card.exists() or not face.exists() or not library.exists():
+        return None
+    store = work / 'node-store'
+
+    def start(*extra):
+        """The node, its port, and what it printed after the line that tells it."""
+        process = subprocess.Popen([str(a) for a in (serve, '--module', module, '--store', store, '--port', 0, *extra)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        printed, deadline = '', time.time() + 10
+        while '\n' not in printed and time.time() < deadline:
+            if select.select([process.stdout], [], [], 1)[0]:
+                printed += os.read(process.stdout.fileno(), 65536).decode()
+        assert '\n' in printed, 'node did not start'
+        first, rest = printed.split('\n', 1)
+        return process, json.loads(first)['port'], rest
+
+    def post(port, path, body):
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        connection.request('POST', path, body)
+        status = connection.getresponse().status
+        connection.close()
+        return status
+
+    node, port, _ = start()
+    try:
+        assert post(port, '/inputs/add', b'eggs') == 200
+    finally:
+        node.send_signal(signal.SIGTERM)
+        node.communicate(timeout=30)
+    before = work / 'node-store-before'
+    shutil.copytree(store, before)
+    codes = {'m': 50, 'i': 23, 'l': 38, 'k': 37, 'enter': 28, 'tab': 15, 'space': 57}
+    events = []  # (type, code, value): EV_KEY 1, EV_SYN 0
+    for name in ('m', 'i', 'l', 'k', 'enter', 'tab', 'space'):
+        events.extend([(1, codes[name], 1), (0, 0, 0), (1, codes[name], 0), (0, 0, 0)])
+    recording = work / 'node-events.bin'
+    recording.write_bytes(b''.join(struct.pack('llHHi', 0, 0, *event) for event in events))
+    node, port, printed = start('--surface', library, '--', 'display', '--symbols', face, '--size', 18, '--card', card,
+                                '--writeback', '640x480', '--out', work / 'node', '--input', recording)
+    lines = []
+    try:
+        deadline = time.time() + 30
+        while '\nframe ' not in '\n' + printed and time.time() < deadline:
+            ready, _, _ = select.select([node.stdout], [], [], 1)
+            if ready:
+                printed += os.read(node.stdout.fileno(), 65536).decode()
+        lines = printed.splitlines()
+        assert any(line.startswith('frame ') for line in lines), lines
+        left = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        left.request('GET', '/views/left')
+        shown = left.getresponse().read().decode()
+        left.close()
+    finally:
+        node.send_signal(signal.SIGTERM)
+        _, error = node.communicate(timeout=30)
+    if node.returncode == 1 and b'writeback' in error:
+        return None
+    assert node.returncode == 0 and b'"returned":0' in error, error[-800:]
+    assert shown == '1 of 2', shown  # eggs to do, milk done
+    frame = next(line.split() for line in lines if line.startswith('frame '))
+    assert frame[3] == '0', frame  # came back as drawn
+    script = f'type {"milk".encode().hex()}\nenter\ntab\nkey Space\nshow\n'
+    tui = run(vega, 'tui', module, '--store', before, '--dump', frame[5], stdin=script)
+    expected = [line for line in tui.stdout.splitlines() if not line.startswith('cells ')]
+    got = [line for line in lines if not line.startswith('frame ')]
+    assert got == expected, (got, expected)
+    return {'events': len(events), 'lines': len(got)}
+
+
 def width_of(character):
     return width(character) or 0
 
@@ -1205,6 +1288,7 @@ def main():
             report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
             report['display'] = display(vega, modules['todo'], work)
             report['live_display'] = live_display(vega, modules['todo'], work)
+            report['node_display'] = node_display(vega, args.serve.resolve(), modules['todo'], work)
     print(json.dumps(report))
 
 

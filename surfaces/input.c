@@ -84,6 +84,7 @@ VegaInput *vega_input_open(const char *const *paths, unsigned count, unsigned wi
     VegaInput *input = calloc(1, sizeof(*input));
     if (!input) return NULL;
     input->width = width, input->height = height, input->x = (int)width / 2, input->y = (int)height / 2;
+    if (!paths) return input; /* none */
     if (count) { /* files of recorded events, positions already in screen pixels */
         for (unsigned i = 0; i < count; ++i) {
             int fd = open(paths[i], O_RDONLY | O_CLOEXEC);

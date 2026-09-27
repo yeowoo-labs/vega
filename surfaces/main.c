@@ -2,6 +2,7 @@
 #include "vega.h"
 #include "module-store.h"
 #include "store.h"
+#include "surface.h"
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -42,11 +43,19 @@
  * (0 first) of a list or table; click is a mouse click on the last shown TUI
  * frame (1 first, as terminals report it); time sets the time the next
  * events see (live surfaces use the clock) and tick ticks a timer (live
- * surfaces tick them on time); swap replaces the module as --watch does. */
+ * surfaces tick them on time); swap replaces the module as --watch does.
+ *
+ * Built with VEGA_SURFACE the same host is a library a Pure node maps
+ * (pure-serve --surface vega-surface.so -- display ARGUMENTS, Pure's
+ * serve/surface.h): the display shows the node's app as of each save, read
+ * where it is, and what people type goes to the node's owner. */
 
 static PureModule modules[2]; /* the running one (app.module) and the next */
 static unsigned current;
 static PureApp app;
+/* In a node: the node, whose owner applies the events; app then shows its
+ * last save (a reader) and applies none itself. */
+static const PureSurface *node;
 static VegaScreen screen;
 static VegaGrid *drawn; /* the TUI's last frame, which a click lands on */
 static char entry[VEGA_TEXT];
@@ -153,10 +162,16 @@ static int key_input(const char *key) { return vega_key_input(app.module, key); 
 /* A key press and release; false when the app has no such key or the press failed. */
 static bool press(const char *key, int *input) {
     *input = key_input(key);
+    if (*input >= 0 && node) return node->press(node->host, (uint32_t)*input) == PURE_OK;
     return *input >= 0 && vega_press(&app, key);
 }
 
-static bool commit(const char *text, size_t length) { return vega_commit(&app, &screen, text, length); }
+static bool commit(const char *text, size_t length) {
+    if (node)
+        return screen.prompt >= 0 &&
+               node->type(node->host, (uint32_t)screen.prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
+    return vega_commit(&app, &screen, text, length);
+}
 
 static const VegaPart *part_named(const char *name) {
     for (unsigned i = 0; i < screen.count; ++i)
@@ -179,7 +194,7 @@ static bool mouse(unsigned button, unsigned line) {
             item = button == 64 ? focus - 1 : focus + 1;
         }
     } else if (button) return false;
-    return vega_point(&app, part, item);
+    return !node && vega_point(&app, part, item); /* a node takes keys and text, not pointing yet */
 }
 
 static int hex(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; }
@@ -552,23 +567,29 @@ static void show_pointer(uint32_t *out, size_t stride, int x, int y, unsigned wi
 }
 
 /* Draw, show, then wait for input or the next tick, until a signal (or the
- * end of recorded events: the last frame is then printed as text). */
+ * end of recorded events: the last frame is then printed as text). In a
+ * node: draw its last save, wait for input or its next save, until it stops;
+ * its owner runs the timers, and the signals are its own. */
 static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded) {
     VegaGrid grid = {0};
     if (!vega_grid(&grid, columns, rows)) return 2;
     drawn = &grid;
-    signal(SIGINT, on_stop);
-    signal(SIGTERM, on_stop);
+    if (!node) {
+        signal(SIGINT, on_stop);
+        signal(SIGTERM, on_stop);
+    }
     VegaTimers timers;
     vega_timers_start(&timers, app.module, vega_now());
     char path[512] = "";
     unsigned long differing = 0;
     bool open_input = true;
     int status = 0;
-    while (!stopping) {
+    while (!stopping && !(node && node->stopping(node->host))) {
         bool ticked = false;
-        long due = vega_timers_run(&timers, &app, vega_now(), &ticked);
-        vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+        long due = node ? -1 : vega_timers_run(&timers, &app, vega_now(), &ticked);
+        PureSnapshot *snapshot = node ? node->read(node->host, &app) : NULL;
+        if (!node || snapshot) vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+        if (snapshot) node->release(node->host, snapshot);
         unsigned width, height;
         size_t stride;
         uint32_t *out = vega_display_buffer(display, &width, &height, &stride);
@@ -580,18 +601,25 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         if (pointer) show_pointer(out, stride, x, y, width, height);
         if (!show_frame(&grid, path, &differing, false)) { fputs("vega: the display did not take the frame\n", stderr); status = 1; break; }
         if (!open_input) break;
-        struct pollfd waits[32];
+        struct pollfd waits[33];
         unsigned count = vega_input_fds(input, waits, 32);
-        int timeout = screen.ticks ? 16 : -1;
+        if (node) waits[count++] = (struct pollfd){node->changes, POLLIN, 0}; /* the node saved: draw again */
+        int timeout = screen.ticks && !node ? 16 : -1;
         if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
         if (poll(waits, count, timeout) <= 0) {
+            if (node) continue;
             app.now = vega_now();
             if (screen.ticks) pure_app_frame(&app);
             continue;
         }
-        app.now = vega_now();
+        if (!node) app.now = vega_now();
         for (unsigned i = 0; i < count; ++i) {
             if (!(waits[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (node && waits[i].fd == node->changes) {
+                uint64_t saves;
+                if (read(node->changes, &saves, sizeof(saves)) < 0) { /* cleared already */ }
+                continue;
+            }
             VegaEvent events[64];
             bool ended;
             unsigned n = vega_input_read(input, waits[i].fd, events, 64, &ended);
@@ -610,6 +638,7 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         dump(&grid);
         if (path[0]) printf("frame %s differing %lu grid %ux%u cell %dx%d\n", path, differing, grid.width, grid.height, face.cell_width,
                    face.cell_height);
+        fflush(stdout);
     }
     drawn = NULL;
     vega_grid_free(&grid);
@@ -746,6 +775,77 @@ static bool open_face(const char *path, float size) {
     return ok; /* the bytes stay: the face reads them */
 }
 
+#ifdef VEGA_SURFACE
+/* Vega in a Pure node (serve/surface.h): pure-serve ... --surface
+ * vega-surface.so -- display --symbols FONT.vsym [--size PX] [--card PATH]
+ * [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS]. The
+ * display shows the node's app as of each save; keys and text go to its
+ * owner. Recorded events are read to their end, then the last frame is
+ * printed as text (on the node's standard output); live, it runs until the
+ * node stops. */
+__attribute__((visibility("default"))) int pure_surface_run(const PureSurface *surface, int argc, char **argv) {
+    if (surface->version != PURE_SURFACE_VERSION || surface->app_size != sizeof(PureApp) ||
+        surface->module_size != sizeof(PureModule)) {
+        fputs("vega: this surface was built for another Pure\n", stderr);
+        return 2;
+    }
+    const char *symbols_path = NULL, *card = "/dev/dri/card1", *recorded = NULL;
+    unsigned width = 0, height = 0;
+    float size = 16;
+    bool writeback = false, live_input = false, usage = argc < 2 || strcmp(argv[1], "display");
+    for (int i = 2; !usage && i < argc; i += 2) {
+        if (!strcmp(argv[i], "--live")) {
+            live_input = true;
+            --i;
+            continue;
+        }
+        if (i + 1 >= argc) usage = true;
+        else if (!strcmp(argv[i], "--symbols")) symbols_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--size") && sscanf(argv[i + 1], "%f", &size) == 1) {}
+        else if (!strcmp(argv[i], "--card")) card = argv[i + 1];
+        else if (!strcmp(argv[i], "--input")) recorded = argv[i + 1];
+        else if (!strcmp(argv[i], "--out")) frames_prefix = argv[i + 1];
+        else if (!strcmp(argv[i], "--writeback") && sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height)
+            writeback = true;
+        else usage = true;
+    }
+    if (usage || !symbols_path || (writeback && !frames_prefix) || (live_input && recorded)) {
+        fputs("vega-surface.so display --symbols FONT.vsym [--size PX] [--card PATH] [--writeback WIDTHxHEIGHT --out PREFIX]\n"
+              "                        [--live | --input EVENTS]\n", stderr);
+        return 2;
+    }
+    if (!open_face(symbols_path, size)) return 2;
+    char error[256];
+    if (!(display = vega_display_open(card, writeback, writeback ? width : 0, writeback ? height : 0, error, sizeof(error)))) {
+        fprintf(stderr, "vega: %s\n", error);
+        return 2;
+    }
+    unsigned pixels_across, pixels_down;
+    size_t stride;
+    vega_display_buffer(display, &pixels_across, &pixels_down, &stride);
+    node = surface;
+    vega_screen(&screen, surface->module);
+    typing = screen.prompt >= 0;
+    const char *paths[1] = {recorded};
+    /* Without --live or --input, no devices: the node's saves alone draw it. */
+    VegaInput *input = vega_input_open(live_input || recorded ? paths : NULL, recorded ? 1 : 0, pixels_across, pixels_down);
+    int status = 2;
+    if (!input) fprintf(stderr, "vega: cannot read %s\n", recorded ? recorded : "input devices");
+    else {
+        PureSnapshot *first = node->read(node->host, &app); /* app shows the node's states from here on */
+        if (first) node->release(node->host, first);
+        status = first ? live(input, pixels_across / (unsigned)face.cell_width, pixels_down / (unsigned)face.cell_height,
+                              recorded != NULL)
+                       : 2;
+        vega_input_close(input);
+    }
+    pure_app_stop(&app);
+    vega_display_close(display);
+    display = NULL;
+    node = NULL;
+    return status;
+}
+#else
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0, port = 8080;
     const char *symbols_path = NULL, *card = "/dev/dri/card1";
@@ -841,3 +941,4 @@ int main(int argc, char **argv) {
     vega_display_close(display);
     return status;
 }
+#endif

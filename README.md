@@ -33,7 +33,15 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"title": "ship it", "la
 curl -s 'localhost:8767/views/cards_list?from=0&count=20'
 ```
 
-한 저장소는 한 번에 한 호스트가 연다(상태의 소유자는 하나다).
+한 저장소는 한 번에 한 호스트가 연다(상태의 소유자는 하나다). 사람과 프로그램이 동시에 쓰려면 Vega를 노드 안에서
+돌린다. `pure-serve`가 `build/vega-surface.so`를 매핑해 제 스레드에서 돌린다([Pure 설계 010](/srv/git/pure.git):
+`docs/design/010-surfaces.md`). 디스플레이는 노드의 마지막 저장을 제자리에서 읽어 그리고, 사람이 치는 키와 글자는 HTTP
+요청과 같은 줄로 노드의 소유자에게 간다. 그 사이에 HTTP나 JSON이 없다.
+
+```sh
+../pure/build/pure-serve --module board.pmod --store ~/.board \
+    --surface build/vega-surface.so -- display --symbols ui.vsym --live   # 디스플레이와 HTTP가 한 노드를 쓴다
+```
 
 글자와 아이콘은 하나의 바이너리 형식(심볼 파일)으로 그린다. 폰트와 SVG는 빌드할 때 한 번만 해석한다
 ([설계 002](docs/design/002-symbol-format.md)).
@@ -50,7 +58,7 @@ build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
 | 디렉터리 | 무엇 | 만드는 것 |
 |---|---|---|
 | `lib/` | aup 라이브러리(`use vega`): 목록·표·포커스·톤 같은 인터페이스 어휘 | aup가 읽는다 |
-| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹, 픽셀, 디스플레이(KMS). Pure의 `libpure.a`를 링크한다 | `build/vega` |
+| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹, 픽셀, 디스플레이(KMS). Pure의 `libpure.a`를 링크한다. 같은 호스트가 Pure 노드 안의 디스플레이도 된다(`pure-serve --surface`, 노드가 내보내는 앱 모델을 부른다) | `build/vega`, `build/vega-surface.so` |
 | `symbols/` | 글리프와 아이콘을 한 형식으로, CPU와 GPU로 그리기([설계 002](docs/design/002-symbol-format.md)) | `build/vega-symbols` |
 
 Pure와 같은 규칙이다([Pure 009](/srv/git/pure.git): `docs/design/009-layout.md`). 최상위 디렉터리가 역할별 부품이고,
