@@ -1243,6 +1243,152 @@ def node_display(vega, serve, module, work):
     return {'events': len(events), 'lines': len(got)}
 
 
+def messenger(vega, serve, module, work):
+    """Two nodes of examples/messenger.aup, Alice's and Bob's, each with a key
+    of its own, sealing to the other's and taking lines only from the other
+    (pure-serve --key, --send, --seal, --sender), each showing its app
+    through Vega's pixels in the node. A line typed on Alice's display
+    (recorded keys) reaches Bob's node sealed and is drawn on his; Bob's
+    answer, posted by a program, is drawn on hers. Each last frame is the one
+    the vega command draws from that node's store, and the relay between the
+    nodes saw no line's text nor a field's name, only seals made in one
+    session each and naming the sender's key."""
+    import http.client
+    import select
+    import shutil
+    import signal
+    import struct
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    face, library = work / 'ui.vsym', vega.parent / 'vega-surface.so'
+    if not face.exists() or not library.exists():
+        return None
+    nodes = {}  # name: (process, port)
+    seen = []   # (path, headers, body) relayed
+
+    class Relay(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            to, _, path = self.path[1:].partition('/')
+            headers = {k: v for k, v in self.headers.items() if k.lower().startswith('x-pure-') or
+                       k.lower() in ('content-type', 'idempotency-key')}
+            seen.append((self.path, headers, body))
+            connection = http.client.HTTPConnection('127.0.0.1', nodes[to][1], timeout=10)
+            connection.request('POST', '/' + path, body, headers)
+            answer = connection.getresponse()
+            data = answer.read()
+            connection.close()
+            self.send_response(answer.status)
+            for k, v in answer.getheaders():
+                if k.lower().startswith('x-pure-'):
+                    self.send_header(k, v)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    def start(name, *extra):
+        process = subprocess.Popen([str(a) for a in (serve, '--module', module, '--store', work / f'{name}-store',
+                                                     '--port', 0, '--key', work / f'{name}.key', '--name', name, *extra)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        printed, deadline = '', time.time() + 10
+        while '\n' not in printed and time.time() < deadline:
+            if select.select([process.stdout], [], [], 1)[0]:
+                printed += os.read(process.stdout.fileno(), 65536).decode()
+        assert '\n' in printed, 'node did not start'
+        first, rest = printed.split('\n', 1)
+        nodes[name] = (process, json.loads(first)['port'])
+        return json.loads(first)['public_key'], rest
+
+    def stop(name):
+        process = nodes[name][0]
+        process.send_signal(signal.SIGTERM)
+        _, error = process.communicate(timeout=30)
+        assert process.returncode == 0, error[-800:]
+        return error
+
+    def call(name, method, path, body=None):
+        connection = http.client.HTTPConnection('127.0.0.1', nodes[name][1], timeout=10)
+        connection.request(method, path, body)
+        answer = connection.getresponse()
+        data = answer.read()
+        connection.close()
+        return answer.status, data.decode()
+
+    def wait_for(condition, seconds=20):
+        deadline = time.time() + seconds
+        while not condition() and time.time() < deadline:
+            time.sleep(0.05)
+        return condition()
+
+    relay = ThreadingHTTPServer(('127.0.0.1', 0), Relay)
+    threading.Thread(target=relay.serve_forever, daemon=True).start()
+    keys = {}
+    try:
+        # Each node's key made, its name set (by a program: a message of one text field takes the body), before they meet.
+        for name in ('alice', 'bob'):
+            keys[name], _ = start(name)
+            assert call(name, 'POST', '/inputs/rename', name.encode())[0] == 200
+            stop(name)
+        other = {'alice': 'bob', 'bob': 'alice'}
+        wiring = {name: ['--send', f'said=http://127.0.0.1:{relay.server_address[1]}/{other[name]}/inputs/heard',
+                         '--seal', f'said={keys[other[name]]}', '--sender', f'{other[name]}.said={keys[other[name]]}',
+                         '--surface', library, '--', 'pixels', '--symbols', face, '--size', 16, '--grid', '40x8',
+                         '--out', work / f'{name}-frame'] for name in ('alice', 'bob')}
+        start('bob', *wiring['bob'])
+        codes = {'h': 35, 'e': 18, 'l': 38, 'o': 24, 'b': 48, 'space': 57, 'enter': 28}
+        events = []
+        for name in ('h', 'e', 'l', 'l', 'o', 'space', 'b', 'o', 'b', 'enter'):
+            events.extend([(1, codes[name], 1), (0, 0, 0), (1, codes[name], 0), (0, 0, 0)])
+        recording = work / 'alice-events.bin'
+        recording.write_bytes(b''.join(struct.pack('llHHi', 0, 0, *event) for event in events))
+        _, printed = start('alice', *wiring['alice'], '--input', recording)
+        process = nodes['alice'][0]
+        deadline = time.time() + 20
+        while '\nframe ' not in '\n' + printed and time.time() < deadline:
+            if select.select([process.stdout], [], [], 1)[0]:
+                printed += os.read(process.stdout.fileno(), 65536).decode()
+        assert 'hello bob' in printed and '\nframe ' in '\n' + printed, printed
+        assert wait_for(lambda: call('bob', 'GET', '/views/title')[1] == 'bob: 1 lines'), call('bob', 'GET', '/views/title')
+        assert call('bob', 'POST', '/inputs/say', b'hi alice')[0] == 200
+        assert wait_for(lambda: call('alice', 'GET', '/views/title')[1] == 'alice: 2 lines')
+        drawn = {}
+        for name in ('alice', 'bob'):
+            # Its surface draws after each save: the last frame shows the last save.
+            frames = work / f'{name}-frame'
+            count = lambda: len(list(work.glob(f'{name}-frame-*.ppm')))
+            settled = count()
+            time.sleep(0.3)
+            assert count() == settled
+            drawn[name] = max(work.glob(f'{name}-frame-*.ppm'), key=lambda path: int(path.stem.rsplit('-', 1)[1]))
+            error = stop(name)
+            assert b'"returned":0' in error, error[-800:]
+        for name in ('alice', 'bob'):
+            copy = work / f'{name}-copy'
+            shutil.copytree(work / f'{name}-store', copy)
+            expected = run(vega, 'pixels', module, '--store', copy, '--symbols', face, '--size', 16, '--grid', '40x8',
+                           '--out', work / f'{name}-expected', stdin='show\n')
+            assert expected.returncode == 0, expected.stderr
+            assert 'hello bob' in expected.stdout and 'hi alice' in expected.stdout, expected.stdout
+            assert drawn[name].read_bytes() == (work / f'{name}-expected-1.ppm').read_bytes(), name
+    finally:
+        for process, _ in nodes.values():
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        relay.shutdown()
+    assert seen and all(len(headers['X-Pure-Seal'].split()) == 4 for _, headers, _ in seen), seen[:1]
+    assert not any(word in body for _, _, body in seen for word in (b'hello', b'hi alice', b'body', b'from'))
+    sessions = {(headers['X-Pure-Source'], headers['X-Pure-Seal'].split()[1]) for _, headers, _ in seen}
+    assert len(sessions) == 2, sessions  # one session each way
+    return {'relayed': len(seen), 'lines': 2}
+
+
 def width_of(character):
     return width(character) or 0
 
@@ -1262,7 +1408,7 @@ def main():
         work = Path(directory)
         env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
         modules = {}
-        for name in ('todo', 'scores', 'today', 'stopwatch', 'board'):
+        for name in ('todo', 'scores', 'today', 'stopwatch', 'board', 'messenger'):
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
@@ -1289,6 +1435,7 @@ def main():
             report['display'] = display(vega, modules['todo'], work)
             report['live_display'] = live_display(vega, modules['todo'], work)
             report['node_display'] = node_display(vega, args.serve.resolve(), modules['todo'], work)
+            report['messenger'] = messenger(vega, args.serve.resolve(), modules['messenger'], work)
     print(json.dumps(report))
 
 

@@ -1,0 +1,55 @@
+# A messenger between two nodes. A line typed here is kept and goes to the
+# other node; the other node's lines come here; all stay in order. Each node
+# runs it with a key of its own, seals to the other's key, and takes lines
+# only from the other, by name and key (pure-serve --key, --send, --seal,
+# --sender): what passes between them is sealed end to end, and nothing on
+# the way can read or change it. People type on the node's display (Vega in
+# the node, pure-serve --surface); programs use the same node over HTTP.
+use vega
+
+record Line {
+  from: text
+  body: text
+}
+
+state lines: list of Line
+state at: index of lines
+state me: text = "me"
+
+input say = text
+input up = key ArrowUp
+input down = key ArrowDown
+input rename = message {
+  name: text
+}
+input heard = message {
+  from: text
+  body: text
+}
+output said = message {
+  from: text
+  body: text
+}
+
+on say {
+  lines.append(Line { from: me, body: say })
+  at = lines.last
+  send said { from: me, body: say }
+}
+on heard {
+  lines.append(Line { from: heard.from, body: heard.body })
+  at = lines.last
+}
+on rename { me = rename.name }
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+
+view title = "{me}: {lines.count} lines"
+
+# A list: each line's text, who wrote it as its badge, the other's in accent.
+view lines_list = each line in lines {
+  label = line.body
+  badge = line.from
+  tone = if line.from == me { vega.normal } else { vega.accent }
+}
+view lines_list_focus = at.position

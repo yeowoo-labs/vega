@@ -43,6 +43,19 @@ curl -s 'localhost:8767/views/cards_list?from=0&count=20'
     --surface build/vega-surface.so -- display --symbols ui.vsym --live   # 디스플레이와 HTTP가 한 노드를 쓴다
 ```
 
+`examples/messenger.aup`는 두 노드 사이의 메신저다. 여기서 쓴 줄은 저장되고 상대 노드로 간다. 노드마다 제 키를 갖고,
+상대의 키로 봉인하며, 상대만을 이름과 키로 받는다. 그래서 사이의 중계는 읽지도 바꾸지도 못한다(Pure 086, 088). 화면은 노드
+안의 Vega다.
+
+```sh
+AUP_PATH=lib ../aup/build/aup build examples/messenger.aup -o messenger.pmod
+# 앨리스의 노드(밥의 노드는 이름과 키를 바꿔 같게). 두 공개키는 각 노드를 --key로 한 번 띄우면 시작 줄에 나온다.
+../pure/build/pure-serve --module messenger.pmod --store ~/.alice --key ~/.alice.key --name alice --port 8801 \
+    --send said=http://bob.local:8802/inputs/heard --seal said=BOB_KEY --sender bob.said=BOB_KEY \
+    --surface build/vega-surface.so -- display --symbols ui.vsym --live
+curl -s -X POST -d alice localhost:8801/inputs/rename   # 이름(한 번)
+```
+
 글자와 아이콘은 하나의 바이너리 형식(심볼 파일)으로 그린다. 폰트와 SVG는 빌드할 때 한 번만 해석한다
 ([설계 002](docs/design/002-symbol-format.md)).
 
