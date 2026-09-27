@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 /* vega-symbols: build symbol files from fonts and SVG icons, and measure them
  * against FreeType (docs/design/002-symbol-format.md).
- *   vega-symbols build [--font FONT.ttf --codes 0x20-0x7e,...] [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym
+ *   vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,...]... [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym
  *   vega-symbols compare FONT.ttf OUT.vsym --sizes 12,16,32,64
  *   vega-symbols info OUT.vsym
  *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm
@@ -407,7 +407,9 @@ static int by_code(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-static void write_symbols(const char *out, uint16_t units, Built *built, size_t count, const Path *path) {
+/* line: a font's ascent and descent in the build's units (0 and 0 without a font). */
+static void write_symbols(const char *out, uint16_t units, const long line[2], Built *built, size_t count, const Path *path) {
+    long ascent = line[0], descent = line[1];
     qsort(built, count, sizeof(*built), by_code);
     for (size_t i = 1; i < count; ++i) if (built[i].code == built[i - 1].code) fail("a code is given twice");
     Points points = {0};
@@ -422,16 +424,21 @@ static void write_symbols(const char *out, uint16_t units, Built *built, size_t 
         bool even = units % 2 == 0 && units > 16;
         for (size_t i = 0; even && i < points.count; ++i) even = points.items[i].x % 2 == 0 && points.items[i].y % 2 == 0;
         for (size_t i = 0; even && i < count; ++i) even = built[i].advance % 2 == 0;
+        even = even && ascent % 2 == 0 && descent % 2 == 0;
         if (!even) break;
         for (size_t i = 0; i < points.count; ++i) { points.items[i].x /= 2; points.items[i].y /= 2; }
         for (size_t i = 0; i < count; ++i) built[i].advance = (int16_t)(built[i].advance / 2);
+        ascent /= 2, descent /= 2;
         units /= 2;
     }
+    if (ascent > INT16_MAX || descent < INT16_MIN) fail("the font's line does not fit 16 bits");
     size_t size = VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES + points.count * VEGA_POINT_BYTES;
     unsigned char *bytes = calloc(1, size);
     if (!bytes) fail("out of memory");
-    memcpy(bytes, "VEGASYM2", 8);
+    memcpy(bytes, "VEGASYM3", 8);
     put16(bytes + 8, units);
+    put16(bytes + 24, (int)ascent);
+    put16(bytes + 26, (int)descent);
     put32(bytes + 12, (uint32_t)count);
     put32(bytes + 16, (uint32_t)points.count);
     put32(bytes + 20, (uint32_t)size);
@@ -506,48 +513,68 @@ static double seconds(void) {
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
 
-#define BUILD_USAGE "usage: vega-symbols build [--font FONT.ttf --codes 0x20-0x7e,...] [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym"
+#define BUILD_USAGE \
+    "usage: vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,...]... [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym"
+
+/* Fonts in order, each with the codes to take from it: a code an earlier
+ * font gave is not taken again, so later fonts fill what earlier ones lack
+ * (a monospace Latin font, then a CJK one for Hangul). */
+typedef struct { const char *path, *codes; long face; } Font;
 
 static int build(int argc, char **argv) {
-    const char *font = NULL, *out = NULL, *codes = NULL, **icons = calloc((size_t)argc, sizeof(*icons));
-    size_t icon_count = 0;
+    const char *out = NULL, **icons = calloc((size_t)argc, sizeof(*icons));
+    Font *fonts = calloc((size_t)argc, sizeof(*fonts));
+    size_t icon_count = 0, font_count = 0;
     long units = 0;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 == argc) fail(BUILD_USAGE);
         if (!strcmp(argv[i], "-o")) out = argv[i + 1];
-        else if (!strcmp(argv[i], "--font")) font = argv[i + 1];
-        else if (!strcmp(argv[i], "--codes")) codes = argv[i + 1];
+        else if (!strcmp(argv[i], "--font")) fonts[font_count++] = (Font){argv[i + 1], NULL, 0};
+        else if (!strcmp(argv[i], "--face") && font_count) fonts[font_count - 1].face = strtol(argv[i + 1], NULL, 10); /* in a .ttc */
+        else if (!strcmp(argv[i], "--codes") && font_count) fonts[font_count - 1].codes = argv[i + 1];
         else if (!strcmp(argv[i], "--units")) units = strtol(argv[i + 1], NULL, 10);
         else if (!strcmp(argv[i], "--svg")) icons[icon_count++] = argv[i + 1];
         else fail(BUILD_USAGE);
     }
-    if (!out || !font != !codes) fail(BUILD_USAGE);
+    if (!out) fail(BUILD_USAGE);
+    for (size_t f = 0; f < font_count; ++f) if (!fonts[f].codes) fail(BUILD_USAGE);
     FT_Library library = NULL;
-    FT_Face face = NULL;
-    if (font && (FT_Init_FreeType(&library) || FT_New_Face(library, font, 0, &face))) fail("cannot open the font");
-    /* Twice a font's units by default: TrueType's implied points, halfway
-     * between two control points, then land on whole units. (FreeType finds
-     * them by integer halving, so outlines are doubled before it walks them.) */
-    if (!units) units = face ? 2 * face->units_per_EM : 4096;
+    FT_Face *faces = calloc(font_count + 1, sizeof(*faces));
+    if (font_count && FT_Init_FreeType(&library)) fail("cannot start FreeType");
+    for (size_t f = 0; f < font_count; ++f)
+        if (FT_New_Face(library, fonts[f].path, fonts[f].face, &faces[f])) fail("cannot open a font");
+    /* Twice the first font's units by default: TrueType's implied points,
+     * halfway between two control points, then land on whole units. (FreeType
+     * finds them by integer halving, so outlines are doubled before it walks
+     * them.) Other fonts are scaled into the same units. */
+    if (!units) units = font_count ? 2 * faces[0]->units_per_EM : 4096;
     if (units < 16 || units > 16384) fail("--units: 16 to 16384");
-    uint32_t *list = NULL;
-    size_t count = codes ? codes_of(codes, &list) : 0;
-    Built *built = calloc(count + icon_count + 1, sizeof(*built));
-    Path path = {.font_scale = face ? (double)units / (2.0 * face->units_per_EM) : 1};
+    size_t capacity = icon_count + 1;
+    uint32_t **lists = calloc(font_count + 1, sizeof(*lists));
+    size_t *counts = calloc(font_count + 1, sizeof(*counts));
+    for (size_t f = 0; f < font_count; ++f) capacity += counts[f] = codes_of(fonts[f].codes, &lists[f]);
+    Built *built = calloc(capacity, sizeof(*built));
+    Path path = {.font_scale = 1};
     size_t made = 0;
     FT_Outline_Funcs walk = {ft_move, ft_line, ft_conic, ft_cubic, 0, 0};
-    for (size_t i = 0; i < count; ++i) {
-        FT_UInt glyph = FT_Get_Char_Index(face, list[i]);
-        if (!glyph || FT_Load_Glyph(face, glyph, FT_LOAD_NO_SCALE)) continue; /* the font lacks it */
-        size_t first = path.count;
-        path.open = false;
-        if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
-            FT_Outline_Transform(&face->glyph->outline, &(FT_Matrix){0x20000, 0, 0, 0x20000});
-            if (FT_Outline_Decompose(&face->glyph->outline, &walk, &path)) fail("cannot walk an outline");
+    for (size_t f = 0; f < font_count; ++f) {
+        FT_Face face = faces[f];
+        path.font_scale = (double)units / (2.0 * face->units_per_EM);
+        for (size_t i = 0; i < counts[f]; ++i) {
+            bool given = false;
+            for (size_t k = 0; k < made && !given; ++k) given = built[k].code == lists[f][i];
+            FT_UInt glyph = given ? 0 : FT_Get_Char_Index(face, lists[f][i]);
+            if (!glyph || FT_Load_Glyph(face, glyph, FT_LOAD_NO_SCALE)) continue; /* given, or the font lacks it */
+            size_t first = path.count;
+            path.open = false;
+            if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+                FT_Outline_Transform(&face->glyph->outline, &(FT_Matrix){0x20000, 0, 0, 0x20000});
+                if (FT_Outline_Decompose(&face->glyph->outline, &walk, &path)) fail("cannot walk an outline");
+            }
+            close_path(&path);
+            long advance = lround((double)face->glyph->metrics.horiAdvance * units / face->units_per_EM);
+            built[made++] = (Built){lists[f][i], first, path.count - first, (int16_t)(advance > INT16_MAX ? INT16_MAX : advance)};
         }
-        close_path(&path);
-        long advance = lround((double)face->glyph->metrics.horiAdvance * units / face->units_per_EM);
-        built[made++] = (Built){list[i], first, path.count - first, (int16_t)(advance > INT16_MAX ? INT16_MAX : advance)};
     }
     for (size_t i = 0; i < icon_count; ++i) {
         char *equals = strchr(icons[i], '=');
@@ -558,11 +585,20 @@ static int build(int argc, char **argv) {
         svg_icon(&path, equals + 1, (uint16_t)units, &advance);
         built[made++] = (Built){(uint32_t)strtoul(icons[i], NULL, 0), first, path.count - first, advance};
     }
-    write_symbols(out, (uint16_t)units, built, made, &path);
-    if (face) FT_Done_Face(face);
+    /* The first font's line as FreeType reports it (hhea or typo metrics). */
+    long line[2] = {font_count ? lround((double)faces[0]->ascender * units / faces[0]->units_per_EM) : 0,
+                    font_count ? lround((double)faces[0]->descender * units / faces[0]->units_per_EM) : 0};
+    write_symbols(out, (uint16_t)units, line, built, made, &path);
+    for (size_t f = 0; f < font_count; ++f) {
+        FT_Done_Face(faces[f]);
+        free(lists[f]);
+    }
     if (library) FT_Done_FreeType(library);
+    free(faces);
+    free(lists);
+    free(counts);
+    free(fonts);
     free(icons);
-    free(list);
     free(built);
     free(path.items);
     return 0;
@@ -698,7 +734,7 @@ static int info(int argc, char **argv) {
     if (argc < 3) fail("usage: vega-symbols info SYMBOLS.vsym");
     char *bytes;
     VegaSymbols s = open_symbols(argv[2], &bytes);
-    printf("{\"units\":%u,\"symbols\":[", s.units);
+    printf("{\"units\":%u,\"ascent\":%d,\"descent\":%d,\"symbols\":[", s.units, s.ascent, s.descent);
     for (uint32_t i = 0; i < s.symbols; ++i) {
         VegaSymbol symbol = vega_symbol_at(&s, i);
         double area = 0;

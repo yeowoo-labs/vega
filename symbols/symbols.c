@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const unsigned char magic[8] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M', '2'};
+static const unsigned char magic[8] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M', '3'};
 
 static uint16_t u16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static int16_t i16(const unsigned char *p) { return (int16_t)u16(p); }
@@ -17,7 +17,7 @@ VegaSymbol vega_symbol_at(const VegaSymbols *s, uint32_t index) {
 
 /* A point is two i16s, each its coordinate times two plus a flag: off the
  * curve in x, starting a contour in y. */
-VegaPoint vega_point(const VegaSymbols *s, uint32_t index) {
+VegaPoint vega_symbols_point(const VegaSymbols *s, uint32_t index) {
     const unsigned char *p = s->bytes + VEGA_SYMBOLS_HEADER + (size_t)s->symbols * VEGA_SYMBOL_BYTES +
                              (size_t)index * VEGA_POINT_BYTES;
     int x = i16(p), y = i16(p + 2);
@@ -29,9 +29,9 @@ VegaPoint vega_point(const VegaSymbols *s, uint32_t index) {
 
 bool vega_symbols_open(VegaSymbols *s, const unsigned char *bytes, size_t size, char *error, size_t error_size) {
     if (size < VEGA_SYMBOLS_HEADER || memcmp(bytes, magic, sizeof(magic))) REFUSE("not a symbol file");
-    *s = (VegaSymbols){bytes, size, u16(bytes + 8), u32(bytes + 12), u32(bytes + 16)};
+    *s = (VegaSymbols){bytes, size, u16(bytes + 8), i16(bytes + 24), i16(bytes + 26), u32(bytes + 12), u32(bytes + 16)};
     uint64_t expected = VEGA_SYMBOLS_HEADER + (uint64_t)s->symbols * VEGA_SYMBOL_BYTES + (uint64_t)s->points * VEGA_POINT_BYTES;
-    if (u16(bytes + 10) || u32(bytes + 24) || !s->units) REFUSE("header");
+    if (u16(bytes + 10) || !s->units || s->ascent < s->descent) REFUSE("header");
     if (u32(bytes + 20) != size || expected != size) REFUSE("size: %zu bytes for %u symbols and %u points", size, s->symbols, s->points);
     for (uint32_t i = 0; i < s->symbols; ++i) {
         VegaSymbol symbol = vega_symbol_at(s, i);
@@ -42,7 +42,7 @@ bool vega_symbols_open(VegaSymbols *s, const unsigned char *bytes, size_t size, 
         if (symbol.left > symbol.right || symbol.bottom > symbol.top) REFUSE("symbol %u: bounds", i);
         /* An off point then always has both neighbours within the symbol. */
         if (symbol.count) {
-            VegaPoint first = vega_point(s, symbol.first), last = vega_point(s, symbol.first + symbol.count - 1);
+            VegaPoint first = vega_symbols_point(s, symbol.first), last = vega_symbols_point(s, symbol.first + symbol.count - 1);
             if (first.off || !first.move) REFUSE("symbol %u: its first point does not start a contour on the curve", i);
             if (last.off) REFUSE("symbol %u: its last point is off the curve", i);
         }
@@ -62,15 +62,15 @@ bool vega_symbol(const VegaSymbols *s, uint32_t code, VegaSymbol *out) {
 }
 
 bool vega_symbol_curve(const VegaSymbols *s, const VegaSymbol *symbol, uint32_t index, VegaCurve *out) {
-    VegaPoint p = vega_point(s, index);
+    VegaPoint p = vega_symbols_point(s, index);
     if (p.off) {
-        VegaPoint a = vega_point(s, index - 1), b = vega_point(s, index + 1);
+        VegaPoint a = vega_symbols_point(s, index - 1), b = vega_symbols_point(s, index + 1);
         *out = (VegaCurve){a.off ? (a.x + p.x) * 0.5f : a.x, a.off ? (a.y + p.y) * 0.5f : a.y, p.x, p.y,
                            b.off ? (p.x + b.x) * 0.5f : b.x, b.off ? (p.y + b.y) * 0.5f : b.y};
         return true;
     }
     if (index + 1 >= symbol->first + symbol->count) return false;
-    VegaPoint b = vega_point(s, index + 1);
+    VegaPoint b = vega_symbols_point(s, index + 1);
     if (b.off || b.move) return false;
     *out = (VegaCurve){p.x, p.y, (p.x + b.x) * 0.5f, (p.y + b.y) * 0.5f, b.x, b.y};
     return true;
@@ -182,4 +182,68 @@ void vega_symbol_raster(const VegaSymbols *s, const VegaSymbol *symbol, double s
             out[(size_t)j * stride + (size_t)i] = (unsigned char)lround(coverage * 255);
         }
     free(curves);
+}
+
+VegaPlace vega_symbol_place(const VegaSymbol *symbol, float scale) {
+    if (!symbol->count) return (VegaPlace){0};
+    int left = (int)floorf(symbol->left * scale) - 1, right = (int)ceilf(symbol->right * scale) + 1;
+    int top = (int)ceilf(symbol->top * scale) + 1, bottom = (int)floorf(symbol->bottom * scale) - 1;
+    return (VegaPlace){0, 0, right - left, top - bottom, left, top};
+}
+
+/* An open table from code to bitmap, twice as large as what it holds. */
+typedef struct { uint32_t code; bool used, missing; VegaBitmap bitmap; } Slot;
+struct VegaGlyphs {
+    const VegaSymbols *symbols;
+    float scale;
+    Slot *slots;
+    size_t capacity, count;
+};
+
+VegaGlyphs *vega_glyphs_open(const VegaSymbols *s, float scale) {
+    VegaGlyphs *glyphs = calloc(1, sizeof(*glyphs));
+    if (!glyphs) return NULL;
+    *glyphs = (VegaGlyphs){s, scale, calloc(256, sizeof(Slot)), 256, 0};
+    if (!glyphs->slots) { free(glyphs); return NULL; }
+    return glyphs;
+}
+
+static Slot *slot_of(Slot *slots, size_t capacity, uint32_t code) {
+    size_t at = (code * 2654435761u) & (capacity - 1);
+    while (slots[at].used && slots[at].code != code) at = (at + 1) & (capacity - 1);
+    return &slots[at];
+}
+
+const VegaBitmap *vega_glyph(VegaGlyphs *glyphs, uint32_t code) {
+    Slot *slot = slot_of(glyphs->slots, glyphs->capacity, code);
+    if (slot->used) return slot->missing ? NULL : &slot->bitmap;
+    if (2 * (glyphs->count + 1) > glyphs->capacity) {
+        Slot *larger = calloc(2 * glyphs->capacity, sizeof(Slot));
+        if (!larger) return NULL;
+        for (size_t i = 0; i < glyphs->capacity; ++i)
+            if (glyphs->slots[i].used) *slot_of(larger, 2 * glyphs->capacity, glyphs->slots[i].code) = glyphs->slots[i];
+        free(glyphs->slots);
+        glyphs->slots = larger;
+        glyphs->capacity *= 2;
+        slot = slot_of(glyphs->slots, glyphs->capacity, code);
+    }
+    VegaSymbol symbol;
+    *slot = (Slot){.code = code, .used = true};
+    ++glyphs->count;
+    if (!vega_symbol(glyphs->symbols, code, &symbol)) { slot->missing = true; return NULL; }
+    VegaPlace place = vega_symbol_place(&symbol, glyphs->scale);
+    unsigned char *pixels = place.width ? malloc((size_t)place.width * (size_t)place.height) : NULL;
+    if (place.width && !pixels) { slot->missing = true; return NULL; }
+    if (pixels)
+        vega_symbol_raster(glyphs->symbols, &symbol, glyphs->scale, place.left / glyphs->scale, place.top / glyphs->scale,
+                           place.width, place.height, pixels, (size_t)place.width);
+    slot->bitmap = (VegaBitmap){place, pixels};
+    return &slot->bitmap;
+}
+
+void vega_glyphs_close(VegaGlyphs *glyphs) {
+    if (!glyphs) return;
+    for (size_t i = 0; i < glyphs->capacity; ++i) free((void *)glyphs->slots[i].bitmap.pixels);
+    free(glyphs->slots);
+    free(glyphs);
 }

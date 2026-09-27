@@ -87,14 +87,6 @@ bool vega_gl_open(VegaGl *gl, char *error, size_t error_size) {
     return true;
 }
 
-/* The pixels a symbol reaches at scale, one more on each side. */
-static VegaPlace place_of(const VegaSymbol *symbol, float scale) {
-    if (!symbol->count) return (VegaPlace){0};
-    int left = (int)floorf(symbol->left * scale) - 1, right = (int)ceilf(symbol->right * scale) + 1;
-    int top = (int)ceilf(symbol->top * scale) + 1, bottom = (int)floorf(symbol->bottom * scale) - 1;
-    return (VegaPlace){0, 0, right - left, top - bottom, left, top};
-}
-
 bool vega_gl_atlas(VegaGl *gl, const VegaSymbols *s, float scale, const uint32_t *wanted, uint32_t count, VegaAtlas *out,
                    char *error, size_t error_size) {
     (void)gl;
@@ -112,7 +104,7 @@ bool vega_gl_atlas(VegaGl *gl, const VegaSymbols *s, float scale, const uint32_t
         uint32_t index = wanted ? wanted[i] : i;
         if (index >= s->symbols) continue;
         VegaSymbol symbol = vega_symbol_at(s, index);
-        VegaPlace p = place_of(&symbol, scale);
+        VegaPlace p = vega_symbol_place(&symbol, scale);
         area += (uint64_t)p.width * (uint64_t)p.height;
     }
     int width = 64;
@@ -122,7 +114,7 @@ bool vega_gl_atlas(VegaGl *gl, const VegaSymbols *s, float scale, const uint32_t
         uint32_t index = wanted ? wanted[i] : i;
         if (index >= s->symbols) continue;
         VegaSymbol symbol = vega_symbol_at(s, index);
-        VegaPlace p = place_of(&symbol, scale);
+        VegaPlace p = vega_symbol_place(&symbol, scale);
         if (!p.width) continue;
         if (p.width > width) width = p.width;
         if (x + p.width > width) { x = 0; y += shelf; shelf = 0; }

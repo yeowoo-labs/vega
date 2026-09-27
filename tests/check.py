@@ -29,6 +29,10 @@
    text and row clicks, holds only the rows asked for around the focus, and
    every open page hears of each change. In headless Chromium (when node and
    chromium are there) the page itself takes keys, a click and typed text.
+11. Pixels: the pixel surface draws the TUI's frames with a font's glyphs
+   (a Latin monospace font, then Korean from a CJK one): the same text, blank
+   cells only background (a focused row's own colour), every other cell
+   inked, so no glyph spills into its neighbour.
 10. Symbols: SVG icons (arcs, compact flags, holes, no viewBox) become
    outlines of the right area, an icon asking for what symbols cannot hold is
    refused by name, damaged files are refused whole, and (when DejaVu Sans is
@@ -1013,6 +1017,67 @@ def symbols(tool, work):
     return report
 
 
+def pixels(vega, tool, module, work):
+    """The pixel surface draws the TUI's grid: the same frames as text, and in
+    the image every blank cell is its row's background (the focused row's
+    own colour) and every other cell has ink."""
+    latin = Path('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf')
+    korean = Path('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
+    if not latin.exists() or not korean.exists():
+        return None
+    # A monospace Latin font first (its arrows are one cell wide), then Hangul
+    # from Noto Sans Mono CJK KR (face 6 of the collection) where it lacks them.
+    face = work / 'ui.vsym'
+    built = run(tool, 'build', '--font', latin, '--codes', '0x20-0x7e,0x2190-0x21ff', '--font', korean, '--face', 6,
+                '--codes', '0x3131-0x318e,0xac00-0xd7a3', '-o', face)
+    assert built.returncode == 0, built.stderr
+    items = ['우유 사기', 'Pure 런타임 문서 읽기', 'aup로 앱 만들기', 'draw pixels']
+    script = ''.join(f'text {item.encode().hex()}\n' for item in items) + 'key Space\nshow\nkey ArrowUp\nkey ArrowUp\nshow\n'
+    columns, rows = 44, 12
+    text = run(vega, 'tui', module, '--dump', f'{columns}x{rows}', stdin=script)
+    drawn = run(vega, 'pixels', module, '--symbols', face, '--size', 18, '--grid', f'{columns}x{rows}',
+                '--out', work / 'frame', stdin=script)
+    assert text.returncode == 0 and drawn.returncode == 0, drawn.stderr
+    frames = [line.split() for line in drawn.stdout.splitlines() if line.startswith('frame ')]
+    assert [line for line in drawn.stdout.splitlines() if not line.startswith('frame ')] == text.stdout.splitlines()
+    assert len(frames) == 2
+    lines = text.stdout.splitlines()
+    background, focused = (0x1e, 0x1e, 0x2e), (0x31, 0x32, 0x44)
+    checked = 0
+    for number, (_, path, size) in enumerate(frames):
+        data = Path(path).read_bytes()
+        header, image = data.split(b'255\n', 1)
+        width, height = map(int, header.split()[1:3])
+        assert f'{width}x{height}' == size and width % columns == 0 and height % rows == 0 and len(image) == width * height * 3
+        cell_width, cell_height = width // columns, height // rows
+        frame_lines = lines[number * (rows + 1):number * (rows + 1) + rows]
+        for row, line in enumerate(frame_lines):
+            shown = line[1:].split('\t')[0]
+            color = focused if line[0] == '>' else background
+            # each character's first cell, as the grid lays them out
+            cells, column = {}, 0
+            for character in shown:
+                cells[column] = character
+                column += width_of(character)
+            for column in range(columns):
+                x0, y0 = column * cell_width, row * cell_height
+                inked = any(tuple(image[3 * ((y0 + j) * width + x0 + i):3 * ((y0 + j) * width + x0 + i) + 3]) != color
+                            for j in range(cell_height) for i in range(cell_width))
+                character = cells.get(column)
+                if character is None and any(start < column < start + width_of(c) for start, c in cells.items()):
+                    continue  # the second half of a wide character
+                if character in (None, ' '):
+                    assert not inked, (number, row, column, line)
+                else:
+                    assert inked, (number, row, column, character, line)
+                checked += 1
+    return {'frames': len(frames), 'cells': checked}
+
+
+def width_of(character):
+    return width(character) or 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -1051,6 +1116,7 @@ def main():
         report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
         if args.symbols:
             report['symbols'] = symbols(args.symbols.resolve(), work)
+            report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
     print(json.dumps(report))
 
 

@@ -14,17 +14,12 @@ typedef struct {
     GLint target;
 } VegaGl;
 
-/* Where each symbol is in an atlas: its rectangle there (x, y, width, height)
- * and the pixel offset of that rectangle's top left from the symbol's origin
- * (right, up). A symbol with nothing to draw has an empty rectangle. */
-typedef struct { int32_t x, y, width, height, left, top; } VegaPlace;
-
 typedef struct {
     GLuint texture; /* 8-bit coverage */
     int width, height;
     float scale;    /* pixels per unit */
     uint32_t symbols;
-    VegaPlace *places; /* per symbol index */
+    VegaPlace *places; /* per symbol index: its box and where the atlas keeps it */
 } VegaAtlas;
 
 /* A symbol at a pen position (whole pixels from the target's top left, on the

@@ -15,6 +15,7 @@ printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega cli todo.pmod
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
 build/vega web todo.pmod --watch              # 브라우저(GUI). --watch: 모듈이 다시 빌드되면 상태를 이어 바꾼다
                                               # (옆에서 AUP_PATH=lib aup watch examples/todo.aup -o todo.pmod)
+build/vega pixels todo.pmod --symbols ui.vsym --grid 48x12 --out frame < script   # 픽셀: frame-N.ppm (설계 003)
 make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
 ```
 
@@ -36,7 +37,8 @@ curl -s 'localhost:8767/views/cards_list?from=0&count=20'
 ([설계 002](docs/design/002-symbol-format.md)).
 
 ```sh
-build/vega-symbols build --font DejaVuSans.ttf --codes 0x20-0x7e --svg 0xE000=icon.svg -o ui.vsym
+build/vega-symbols build --font DejaVuSansMono.ttf --codes 0x20-0x7e,0x2190-0x21ff \
+    --font NotoSansCJK-Regular.ttc --face 6 --codes 0xac00-0xd7a3 --svg 0xE000=icon.svg -o ui.vsym   # 앞 글꼴에 없는 것만 뒤에서
 build/vega-symbols compare DejaVuSans.ttf ui.vsym --sizes 12,16,32   # FreeType과 픽셀 차이, 읽는 비용
 build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
 ```
@@ -46,7 +48,7 @@ build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
 | 디렉터리 | 무엇 | 만드는 것 |
 |---|---|---|
 | `lib/` | aup 라이브러리(`use vega`): 목록·표·포커스·톤 같은 인터페이스 어휘 | aup가 읽는다 |
-| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹. Pure의 `libpure.a`를 링크한다 | `build/vega` |
+| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹, 픽셀. Pure의 `libpure.a`를 링크한다 | `build/vega` |
 | `symbols/` | 글리프와 아이콘을 한 형식으로, CPU와 GPU로 그리기([설계 002](docs/design/002-symbol-format.md)) | `build/vega-symbols` |
 
 Pure와 같은 규칙이다([Pure 009](/srv/git/pure.git): `docs/design/009-layout.md`). 최상위 디렉터리가 역할별 부품이고,

@@ -11,7 +11,7 @@ LIBPURE = $(PURE)/build/libpure.a
 # Parts: lib/ (the aup library: the interface vocabulary), surfaces/ (the vega
 # host: TUI, CLI, NUI sentences, web), symbols/ (glyphs and icons as one
 # format, drawn by CPU or GPU).
-SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/main.c
+SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/main.c
 
 .PHONY: all check FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols
@@ -22,8 +22,8 @@ $(BUILD):
 $(LIBPURE): FORCE
 	$(MAKE) -C $(PURE) build/libpure.a
 
-$(BUILD)/vega: $(SURFACES) surfaces/vega.h $(LIBPURE) | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core $(SURFACES) $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
+$(BUILD)/vega: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $(LIBPURE) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -Isymbols $(SURFACES) symbols/symbols.c $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
 
 # Building symbol files reads fonts through FreeType; reading them does not.
 FREETYPE_CFLAGS ?= $(shell pkg-config --cflags freetype2)

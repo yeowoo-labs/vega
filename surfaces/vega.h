@@ -1,6 +1,7 @@
 #ifndef VEGA_H
 #define VEGA_H
 #include "module.h"
+#include "symbols.h"
 #include <stdio.h>
 
 /* Vega reads a verified Pure module by convention (docs/design/001-first-component.md):
@@ -121,4 +122,17 @@ void vega_grid_free(VegaGrid *);
 void vega_draw(VegaGrid *, PureApp *, const VegaScreen *, const char *prompt, size_t prompt_length, bool typing);
 /* The part and item a line of the last drawn grid shows. */
 bool vega_hit(const VegaGrid *, unsigned line, unsigned *part, size_t *item);
+
+/* Pixels: the grid drawn with a font's glyphs (a symbol file, pixels per em).
+ * A cell is as wide as a digit and as tall as the font's line; each glyph is
+ * drawn once, the first time a cell shows it. */
+typedef struct {
+    VegaGlyphs *glyphs;
+    int cell_width, cell_height, baseline;
+} VegaFace;
+bool vega_face_open(VegaFace *, const VegaSymbols *, float pixels);
+void vega_face_close(VegaFace *);
+/* The grid into out: 0xRRGGBB pixels, grid->width * cell_width across and
+ * grid->height * cell_height down, stride pixels apart. */
+void vega_pixels(const VegaGrid *, VegaFace *, uint32_t *out, size_t stride);
 #endif
