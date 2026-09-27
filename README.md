@@ -41,6 +41,17 @@ build/vega-symbols compare DejaVuSans.ttf ui.vsym --sizes 12,16,32   # FreeType�
 build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
 ```
 
+## 부품
+
+| 디렉터리 | 무엇 | 만드는 것 |
+|---|---|---|
+| `lib/` | aup 라이브러리(`use vega`): 목록·표·포커스·톤 같은 인터페이스 어휘 | aup가 읽는다 |
+| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹. Pure의 `libpure.a`를 링크한다 | `build/vega` |
+| `symbols/` | 글리프와 아이콘을 한 형식으로, CPU와 GPU로 그리기([설계 002](docs/design/002-symbol-format.md)) | `build/vega-symbols` |
+
+Pure와 같은 규칙이다([Pure 009](/srv/git/pure.git): `docs/design/009-layout.md`). 최상위 디렉터리가 역할별 부품이고,
+`tests/check.py`가 저장소 전체를 끝에서 끝까지 확인한다.
+
 ## 위치
 
 | 층 | 역할 | 비유 |

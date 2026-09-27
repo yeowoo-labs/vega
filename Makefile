@@ -8,7 +8,10 @@ PURE ?= ../pure
 AUP ?= ../aup
 LIBPURE = $(PURE)/build/libpure.a
 
-SOURCES = src/screen.c src/draw.c src/width.c src/web.c src/main.c
+# Parts: lib/ (the aup library: the interface vocabulary), surfaces/ (the vega
+# host: TUI, CLI, NUI sentences, web), symbols/ (glyphs and icons as one
+# format, drawn by CPU or GPU).
+SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/main.c
 
 .PHONY: all check FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols
@@ -19,16 +22,17 @@ $(BUILD):
 $(LIBPURE): FORCE
 	$(MAKE) -C $(PURE) build/libpure.a
 
-$(BUILD)/vega: $(SOURCES) src/vega.h $(LIBPURE) | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core $(SOURCES) $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
+$(BUILD)/vega: $(SURFACES) surfaces/vega.h $(LIBPURE) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core $(SURFACES) $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
 
 # Building symbol files reads fonts through FreeType; reading them does not.
 FREETYPE_CFLAGS ?= $(shell pkg-config --cflags freetype2)
 FREETYPE_LIBS ?= $(shell pkg-config --libs freetype2)
 # Drawing them on the GPU takes OpenGL ES 3.1 through EGL.
 GL_LIBS ?= $(shell pkg-config --libs egl glesv2)
-$(BUILD)/vega-symbols: src/symbols-tool.c src/symbols.c src/symbols.h src/symbols-gl.c src/symbols-gl.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) src/symbols-tool.c src/symbols.c src/symbols-gl.c $(LDFLAGS) \
+SYMBOLS = symbols/symbols.c symbols/symbols-gl.c
+$(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbols/symbols-gl.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) symbols/symbols-tool.c $(SYMBOLS) $(LDFLAGS) \
 		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
 check: $(BUILD)/vega $(BUILD)/vega-symbols

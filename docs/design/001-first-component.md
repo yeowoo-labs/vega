@@ -1,6 +1,6 @@
 # 001 — 첫 컴포넌트: 목록·표·포커스·톤, 표면 셋
 
-2026-09-25. 상태: 구현(`src/`, `lib/vega.aup`, `examples/`).
+2026-09-25. 상태: 구현(`surfaces/`, `lib/vega.aup`, `examples/`).
 
 ## 결정
 
@@ -127,7 +127,7 @@ vega tui app.pmod --watch --store ~/.app        # 또는 vega web app.pmod --wat
 
 `vega check app.pmod`는 모듈이 뜻한 듯하지만 규약에 맞지 않는 곳을 알린다. 표면은 이런 보기를 조용히 다른
 부품으로 읽는다. 검사는 그 읽기를 드러내어 오타나 타입 실수가 화면에서 사라지지 않게 한다. 찾으면 종료 코드 1이다.
-규칙은 화면을 읽는 코드와 같은 파일(`src/screen.c`)에 있다.
+규칙은 화면을 읽는 코드와 같은 파일(`surfaces/screen.c`)에 있다.
 
 | 찾는 것 | 표면이 대신 하는 일 |
 |---|---|
