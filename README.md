@@ -7,7 +7,7 @@ Vega는 **인터페이스 구현자**이며 하나의 **aup 라이브러리**다
 [설계 001](docs/design/001-first-component.md).
 
 ```sh
-make                                          # build/vega (옆의 ../pure 체크아웃을 링크)
+make                                          # build/vega (옆의 ../pure 체크아웃의 libpure.a를 링크)
 AUP_PATH=lib ../aup/build/aup build examples/todo.aup -o todo.pmod
 build/vega tui todo.pmod --store ~/.todo      # 터미널. 글자 입력 후 Enter, Tab으로 키 모드, Ctrl-C로 끝.
                                               # --store가 있으면 목록이 다음 실행에도 남는다(어느 표면이든)
@@ -24,7 +24,7 @@ make check                                    # 참조 모델 대조, 프레임 
 ```sh
 AUP_PATH=lib ../aup/build/aup build examples/board.aup -o board.pmod
 build/vega tui board.pmod --store ~/.board           # 사람: 제목을 쓰고 Enter, Tab 뒤 ←→로 칸을 옮긴다
-../pure/prototypes/connections/build/pure-serve --module board.pmod --store ~/.board --threads 2 &
+../pure/build/pure-serve --module board.pmod --store ~/.board --threads 2 &
 curl -s localhost:8767/views/counts                  # 1 to do, 1 doing, 0 done
 curl -s -X POST -H 'Content-Type: application/json' -d '{"title": "ship it", "lane": 2}' localhost:8767/inputs/post
 curl -s 'localhost:8767/views/cards_list?from=0&count=20'
