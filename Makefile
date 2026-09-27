@@ -22,8 +22,11 @@ $(BUILD)/vega: $(SOURCES) src/vega.h $(PURE_SOURCES) | $(BUILD)
 # Building symbol files reads fonts through FreeType; reading them does not.
 FREETYPE_CFLAGS ?= $(shell pkg-config --cflags freetype2)
 FREETYPE_LIBS ?= $(shell pkg-config --libs freetype2)
-$(BUILD)/vega-symbols: src/symbols-tool.c src/symbols.c src/symbols.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) src/symbols-tool.c src/symbols.c $(LDFLAGS) $(FREETYPE_LIBS) -lm $(LDLIBS) -o $@
+# Drawing them on the GPU takes OpenGL ES 3.1 through EGL.
+GL_LIBS ?= $(shell pkg-config --libs egl glesv2)
+$(BUILD)/vega-symbols: src/symbols-tool.c src/symbols.c src/symbols.h src/symbols-gl.c src/symbols-gl.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) src/symbols-tool.c src/symbols.c src/symbols-gl.c $(LDFLAGS) \
+		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
 check: $(BUILD)/vega $(BUILD)/vega-symbols
 	$(MAKE) -C $(AUP) build/aup

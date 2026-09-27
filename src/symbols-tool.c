@@ -4,8 +4,12 @@
  *   vega-symbols build [--font FONT.ttf --codes 0x20-0x7e,...] [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym
  *   vega-symbols compare FONT.ttf OUT.vsym --sizes 12,16,32,64
  *   vega-symbols info OUT.vsym
- *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm */
+ *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm
+ *   vega-symbols gpu OUT.vsym --sizes 12,16,32,64 [--frames N] */
+#include "symbols-gl.h"
 #include "symbols.h"
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
@@ -737,11 +741,141 @@ static int render(int argc, char **argv) {
     return 0;
 }
 
+/* ---- The GPU: a context of its own, no window (EGL, Mesa's surfaceless platform). */
+
+static void gl_context(void) {
+    PFNEGLGETPLATFORMDISPLAYEXTPROC platform = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    EGLDisplay display = platform ? platform(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
+    EGLint major, minor, found;
+    EGLConfig config;
+    EGLint wanted[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE};
+    EGLint version[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE};
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor) || !eglBindAPI(EGL_OPENGL_ES_API) ||
+        !eglChooseConfig(display, wanted, &config, 1, &found))
+        fail("no EGL display for OpenGL ES 3.1");
+    /* With no surface, a context needs no config (EGL_KHR_no_config_context). */
+    EGLContext context = eglCreateContext(display, found ? config : EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, version);
+    if (context == EGL_NO_CONTEXT || !eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context))
+        fail("no OpenGL ES 3.1 context");
+}
+
+/* A width x height target of 8-bit red, bound. */
+static GLuint gl_target(int width, int height) {
+    GLuint texture, framebuffer;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) fail("no framebuffer");
+    glViewport(0, 0, width, height);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    return texture;
+}
+
+/* Every symbol in a grid of cells, drawn by the GPU and by vega_coverage:
+ * how far apart; then pages of text (glyphs cycling through the file)
+ * drawn again and again: how long a page takes. */
+static int gpu(int argc, char **argv) {
+    if (argc < 5 || strcmp(argv[3], "--sizes")) fail("usage: vega-symbols gpu SYMBOLS.vsym --sizes 12,16,32,64 [--frames N]");
+    int frames = argc > 6 && !strcmp(argv[5], "--frames") ? atoi(argv[6]) : 20;
+    if (frames < 1) fail("--frames");
+    char *bytes, error[4096];
+    VegaSymbols s = open_symbols(argv[2], &bytes);
+    gl_context();
+    printf("{\"renderer\":\"%s\"}\n", (const char *)glGetString(GL_RENDERER));
+    VegaGl gl;
+    double started = seconds();
+    if (!vega_gl_open(&gl, &s, error, sizeof(error))) fail(error);
+    glFinish();
+    double open_ms = (seconds() - started) * 1e3;
+    for (const char *p = argv[4]; *p;) {
+        char *end;
+        long size = strtol(p, &end, 10);
+        p = *end == ',' ? end + 1 : end;
+        if (size <= 0 || size > 512) fail("--sizes");
+        double scale = (double)size / s.units;
+        /* Cells that hold any symbol, so none reaches into another's. */
+        int left = 0, bottom = 0, right = 0, top = 0;
+        for (uint32_t i = 0; i < s.symbols; ++i) {
+            VegaSymbol symbol = vega_symbol_at(&s, i);
+            left = symbol.left < left ? symbol.left : left;
+            bottom = symbol.bottom < bottom ? symbol.bottom : bottom;
+            right = symbol.right > right ? symbol.right : right;
+            top = symbol.top > top ? symbol.top : top;
+        }
+        int cell = (int)ceil((right - left > top - bottom ? right - left : top - bottom) * scale) + 4;
+        int across = 4096 / cell, rows = (int)((s.symbols + (uint32_t)across - 1) / (uint32_t)across);
+        if (rows * cell > 4096) rows = 4096 / cell;
+        int width = across * cell, height = rows * cell;
+        uint32_t shown = s.symbols < (uint32_t)(across * rows) ? s.symbols : (uint32_t)(across * rows);
+        VegaGlyph *glyphs = malloc(shown * sizeof(*glyphs));
+        for (uint32_t i = 0; i < shown; ++i)
+            glyphs[i] = (VegaGlyph){(float)(i % (uint32_t)across * (uint32_t)cell) + 2 - (float)(left * scale),
+                                    (float)(i / (uint32_t)across * (uint32_t)cell) + 2 + (float)(top * scale), (float)scale, i};
+        GLuint texture = gl_target(width, height);
+        vega_gl_draw(&gl, &s, glyphs, shown, width, height);
+        unsigned char *drawn = malloc((size_t)width * (size_t)height), *reference = malloc((size_t)cell * (size_t)cell);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, drawn);
+        double total = 0;
+        uint64_t pixels = 0;
+        int worst = 0;
+        for (uint32_t i = 0; i < shown; ++i) {
+            VegaSymbol symbol = vega_symbol_at(&s, i);
+            int x0 = (int)(i % (uint32_t)across) * cell, y0 = (int)(i / (uint32_t)across) * cell;
+            vega_symbol_raster(&s, &symbol, scale, (x0 - glyphs[i].x) / scale, (glyphs[i].y - y0) / scale, cell, cell, reference);
+            for (int j = 0; j < cell; ++j)
+                for (int k = 0; k < cell; ++k) {
+                    /* GL's rows run bottom up */
+                    int gpu_value = drawn[(size_t)(height - 1 - (y0 + j)) * (size_t)width + (size_t)(x0 + k)];
+                    int difference = abs(gpu_value - reference[j * cell + k]);
+                    total += difference;
+                    worst = difference > worst ? difference : worst;
+                    ++pixels;
+                }
+        }
+        /* Pages: glyphs at their advances in lines, a full target's worth. */
+        int page_width = 1920, page_height = 1080;
+        uint32_t page = 0, capacity = 1 << 16;
+        VegaGlyph *text = malloc(capacity * sizeof(*text));
+        float x = 0, line = (float)size * 1.2f;
+        for (float y = line; y + (float)size * 0.3f < (float)page_height && page < capacity; ) {
+            VegaSymbol symbol = vega_symbol_at(&s, page % s.symbols);
+            float advance = (float)(symbol.advance * scale);
+            if (x + advance > (float)page_width) { x = 0; y += line; continue; }
+            text[page++] = (VegaGlyph){x, y, (float)scale, page % s.symbols};
+            x += advance;
+        }
+        glDeleteTextures(1, &texture);
+        texture = gl_target(page_width, page_height);
+        vega_gl_draw(&gl, &s, text, page, page_width, page_height);
+        glFinish();
+        started = seconds();
+        for (int f = 0; f < frames; ++f) vega_gl_draw(&gl, &s, text, page, page_width, page_height);
+        glFinish();
+        double page_ms = (seconds() - started) / frames * 1e3;
+        printf("{\"pixels_per_em\":%ld,\"symbols\":%u,\"mean_difference\":%.3f,\"worst\":%d,\"page_glyphs\":%u,"
+               "\"page_ms\":%.2f,\"upload_ms\":%.1f}\n", size, shown, pixels ? total / (double)pixels : 0, worst, page, page_ms, open_ms);
+        glDeleteTextures(1, &texture);
+        free(text);
+        free(glyphs);
+        free(drawn);
+        free(reference);
+    }
+    vega_gl_close(&gl);
+    free(bytes);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "build")) return build(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "compare")) return compare(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "info")) return info(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "render")) return render(argc, argv);
-    fail("vega-symbols build|compare|info|render ...");
+    if (argc > 1 && !strcmp(argv[1], "gpu")) return gpu(argc, argv);
+    fail("vega-symbols build|compare|info|render|gpu ...");
     return 2;
 }
