@@ -24,10 +24,13 @@
  *                    the TUI's frames drawn with a font's glyphs, driven by a
  *                    script: each show writes PREFIX-N.ppm after the text
  *   display --symbols FONT.vsym [--size PX] [--card PATH] [--writeback WxH --out PREFIX]
+ *           [--live | --input EVENTS]
  *                    the same on a display through KMS, as many cells as fit,
- *                    driven by a script; with writeback each shown frame comes
- *                    back from the display controller, is set against what was
- *                    drawn and written to PREFIX-N.ppm
+ *                    driven by a script, or live: keyboards, mice and touch
+ *                    screens (evdev), or events recorded in a file (read to its
+ *                    end, then the last frame shown as text); with writeback
+ *                    each shown frame comes back from the display controller,
+ *                    is set against what was drawn and written to PREFIX-N.ppm
  * With --store the app's states live in that tree store: the app continues
  * where it was, whichever surface runs it. With --watch (tui, web) a module
  * written again replaces the running one and states keep their values by
@@ -499,12 +502,14 @@ static VegaDisplay *display;
 
 /* A frame on the display; with writeback, what came back is set against it
  * and written (differing: how many pixels are not what was drawn). */
-static bool show_frame(const VegaGrid *grid, char path[512], unsigned long *differing) {
+static bool show_frame(const VegaGrid *grid, char path[512], unsigned long *differing, bool compose) {
     unsigned width, height;
     size_t stride, captured_stride;
     uint32_t *out = vega_display_buffer(display, &width, &height, &stride);
-    vega_pixels_clear(out, stride, width, height);
-    vega_pixels(grid, &face, out, stride);
+    if (compose) {
+        vega_pixels_clear(out, stride, width, height);
+        vega_pixels(grid, &face, out, stride);
+    }
     if (!vega_display_show(display)) return false;
     const uint32_t *back = vega_display_captured(display, &captured_stride);
     *differing = 0;
@@ -531,6 +536,85 @@ static bool show_frame(const VegaGrid *grid, char path[512], unsigned long *diff
     return ok;
 }
 
+
+/* ---- the display, live ---------------------------------------------- */
+
+static volatile sig_atomic_t stopping;
+static void on_stop(int signal) { (void)signal; stopping = 1; }
+
+static void show_pointer(uint32_t *out, size_t stride, int x, int y, unsigned width, unsigned height) {
+    /* The cell under a mouse pointer, outlined. */
+    int left = x / face.cell_width * face.cell_width, top = y / face.cell_height * face.cell_height;
+    for (int i = 0; i < face.cell_width; ++i)
+        for (int j = 0; j < face.cell_height; ++j)
+            if ((!i || !j || i == face.cell_width - 1 || j == face.cell_height - 1) && left + i < (int)width && top + j < (int)height)
+                out[(size_t)(top + j) * stride + (size_t)(left + i)] = 0xf5e0dc;
+}
+
+/* Draw, show, then wait for input or the next tick, until a signal (or the
+ * end of recorded events: the last frame is then printed as text). */
+static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded) {
+    VegaGrid grid = {0};
+    if (!vega_grid(&grid, columns, rows)) return 2;
+    drawn = &grid;
+    signal(SIGINT, on_stop);
+    signal(SIGTERM, on_stop);
+    VegaTimers timers;
+    vega_timers_start(&timers, app.module, vega_now());
+    char path[512] = "";
+    unsigned long differing = 0;
+    bool open_input = true;
+    int status = 0;
+    while (!stopping) {
+        bool ticked = false;
+        long due = vega_timers_run(&timers, &app, vega_now(), &ticked);
+        vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+        unsigned width, height;
+        size_t stride;
+        uint32_t *out = vega_display_buffer(display, &width, &height, &stride);
+        vega_pixels_clear(out, stride, width, height);
+        vega_pixels(&grid, &face, out, stride);
+        int x, y;
+        bool pointer;
+        vega_input_pointer(input, &x, &y, &pointer);
+        if (pointer) show_pointer(out, stride, x, y, width, height);
+        if (!show_frame(&grid, path, &differing, false)) { fputs("vega: the display did not take the frame\n", stderr); status = 1; break; }
+        if (!open_input) break;
+        struct pollfd waits[32];
+        unsigned count = vega_input_fds(input, waits, 32);
+        int timeout = screen.ticks ? 16 : -1;
+        if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
+        if (poll(waits, count, timeout) <= 0) {
+            app.now = vega_now();
+            if (screen.ticks) pure_app_frame(&app);
+            continue;
+        }
+        app.now = vega_now();
+        for (unsigned i = 0; i < count; ++i) {
+            if (!(waits[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            VegaEvent events[64];
+            bool ended;
+            unsigned n = vega_input_read(input, waits[i].fd, events, 64, &ended);
+            for (unsigned k = 0; k < n; ++k) {
+                const VegaEvent *e = &events[k];
+                unsigned line = e->y >= 0 ? (unsigned)(e->y / face.cell_height) : 0;
+                if (e->kind == VEGA_EVENT_TEXT && typing) handle_text(e->text, strlen(e->text));
+                else if (e->kind == VEGA_EVENT_TEXT || e->kind == VEGA_EVENT_KEY) handle_key(e->name);
+                else if (e->kind == VEGA_EVENT_PRESS) mouse(0, line);
+                else if (e->kind == VEGA_EVENT_WHEEL) mouse(e->steps < 0 ? 64 : 65, line);
+            }
+            if (ended && recorded) open_input = false; /* draw once more, then stop */
+        }
+    }
+    if (recorded) {
+        dump(&grid);
+        if (path[0]) printf("frame %s differing %lu grid %ux%u cell %dx%d\n", path, differing, grid.width, grid.height, face.cell_width,
+                   face.cell_height);
+    }
+    drawn = NULL;
+    vega_grid_free(&grid);
+    return status;
+}
 
 /* painting: show writes the terminal bytes of the frame, not the grid. */
 static int script(Surface surface, unsigned width, unsigned height, bool painting) {
@@ -619,8 +703,9 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
                     if (!write_frame(&grid, path)) { fprintf(stderr, "vega: cannot write %s\n", path); return 1; }
                     printf("frame %s %dx%d\n", path, (int)grid.width * face.cell_width, (int)grid.height * face.cell_height);
                 } else if (surface == SURFACE_DISPLAY) {
-                    if (!show_frame(&grid, path, &differing)) { fputs("vega: the display did not take the frame\n", stderr); return 1; }
-                    if (path[0]) printf("frame %s differing %lu grid %ux%u\n", path, differing, grid.width, grid.height);
+                    if (!show_frame(&grid, path, &differing, true)) { fputs("vega: the display did not take the frame\n", stderr); return 1; }
+                    if (path[0]) printf("frame %s differing %lu grid %ux%u cell %dx%d\n", path, differing, grid.width, grid.height, face.cell_width,
+                   face.cell_height);
                 }
             }
             counted = vega_evaluations();
@@ -665,13 +750,19 @@ int main(int argc, char **argv) {
     unsigned width = 0, height = 0, port = 8080;
     const char *symbols_path = NULL, *card = "/dev/dri/card1";
     float size = 16;
-    bool writeback = false;
+    bool writeback = false, live_input = false;
+    const char *recorded = NULL;
     bool dumped = false, painting = false, watch = false, usage = argc < 3;
     const char *store = NULL, *listen_on = "127.0.0.1";
     for (int i = 3; !usage && i < argc; i += 2) {
         if (!strcmp(argv[i], "--watch") && (!strcmp(argv[1], "tui") || !strcmp(argv[1], "web"))) {
             watch = true;
             --i; /* a flag without a value */
+            continue;
+        }
+        if (!strcmp(argv[i], "--live") && !strcmp(argv[1], "display")) {
+            live_input = true;
+            --i;
             continue;
         }
         if (i + 1 >= argc) usage = true;
@@ -687,6 +778,7 @@ int main(int argc, char **argv) {
                  sscanf(argv[i + 1], "%ux%u", &width, &height) == 2 && width && height)
             writeback = true;
         else if (!strcmp(argv[i], "--card") && !strcmp(argv[1], "display")) card = argv[i + 1];
+        else if (!strcmp(argv[i], "--input") && !strcmp(argv[1], "display")) recorded = argv[i + 1];
         else if (!strcmp(argv[i], "--symbols") && glyphed(argv[1])) symbols_path = argv[i + 1];
         else if (!strcmp(argv[i], "--out") && glyphed(argv[1])) frames_prefix = argv[i + 1];
         else if (!strcmp(argv[i], "--size") && glyphed(argv[1]) && sscanf(argv[i + 1], "%f", &size) == 1) {}
@@ -700,7 +792,7 @@ int main(int argc, char **argv) {
               "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
               "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
               "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] [--card PATH]\n"
-              "             [--writeback WIDTHxHEIGHT --out PREFIX] < script\n"
+              "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [< script]\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
@@ -730,7 +822,18 @@ int main(int argc, char **argv) {
         watched = argv[2];
         watched_digest = module_digest; /* of what load read */
     }
-    int status = surface == SURFACE_WEB ? vega_web(&app, &screen, listen_on, port, watched ? module_changed : NULL) :
+    int status;
+    if (on_display && (live_input || recorded)) {
+        unsigned pixels_across, pixels_down;
+        size_t stride;
+        vega_display_buffer(display, &pixels_across, &pixels_down, &stride);
+        const char *paths[1] = {recorded};
+        VegaInput *input = vega_input_open(paths, recorded ? 1 : 0, pixels_across, pixels_down);
+        if (!input) { fprintf(stderr, "vega: cannot read %s\n", recorded ? recorded : "input devices"); return 2; }
+        status = live(input, width, height, recorded != NULL);
+        vega_input_close(input);
+    } else
+        status = surface == SURFACE_WEB ? vega_web(&app, &screen, listen_on, port, watched ? module_changed : NULL) :
                  surface == SURFACE_TUI && !dumped ? interactive() : script(surface, width, height, painting);
     /* Frame changes are stored with events; keep the last ones too. */
     if (pure_app_save(&app) != PURE_OK) { fputs("vega: cannot save\n", stderr); status = status ? status : 1; }

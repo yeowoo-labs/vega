@@ -35,7 +35,9 @@
    inked, so no glyph spills into its neighbour.
 12. Display: the same frames through KMS on a writeback connector (when the
    device has one) come back from the display controller exactly as drawn,
-   and are the pixel surface's frames for the same grid.
+   and are the pixel surface's frames for the same grid. Live, fed recorded
+   evdev events (typing with Shift, Enter, Tab, Space, a touch on a row), it
+   ends on the TUI's frame after the same keys and click.
 10. Symbols: SVG icons (arcs, compact flags, holes, no viewBox) become
    outlines of the right area, an icon asking for what symbols cannot hold is
    refused by name, damaged files are refused whole, and (when DejaVu Sans is
@@ -1110,6 +1112,54 @@ def display(vega, module, work):
     return {'frames': len(frames), 'pixels': compared}
 
 
+def live_display(vega, module, work):
+    """The display live, fed recorded evdev events (a keyboard typing two items,
+    Tab, Space, then a touch on the first item's row): its last frame is the
+    TUI's after the same keys and click, and it came back from the display
+    controller as drawn."""
+    import struct
+    card, face = Path('/dev/dri/card1'), work / 'ui.vsym'
+    if not card.exists() or not face.exists():
+        return None
+    display_args = ['--symbols', face, '--size', 18, '--card', card, '--writeback', '640x480']
+    first = run(vega, 'display', module, *display_args, '--out', work / 'first', stdin='show\n')
+    if first.returncode == 2 and ('writeback' in first.stderr or 'cannot open' in first.stderr):
+        return None
+    lines = first.stdout.splitlines()
+    frame = next(line.split() for line in lines if line.startswith('frame '))
+    grid, cell_height = frame[5], int(frame[7].split('x')[1])
+    heading = next(i for i, line in enumerate(lines) if line[1:].startswith('tasks_list'))
+    codes = {'m': 50, 'i': 23, 'l': 38, 'k': 37, 'b': 48, 'r': 19, 'e': 18, 'a': 30, 'd': 32,
+             'enter': 28, 'tab': 15, 'space': 57, 'shift': 42}
+    events = []  # (type, code, value): EV_KEY 1, EV_ABS 3, EV_SYN 0
+    def key(name, value=None):
+        for v in ((1, 0) if value is None else (value,)):
+            events.extend([(1, codes[name], v), (0, 0, 0)])
+    for letter in 'milk':
+        key(letter)
+    key('enter')
+    key('shift', 1), key('b'), key('shift', 0)
+    for letter in 'read':
+        key(letter)
+    key('enter'), key('tab'), key('space')
+    # a touch on the first item's row (the line after the list's heading), in screen pixels
+    events.extend([(3, 0, 20), (3, 1, (heading + 1) * cell_height + cell_height // 2), (1, 330, 1), (0, 0, 0),
+                   (1, 330, 0), (0, 0, 0)])
+    recording = work / 'events.bin'
+    recording.write_bytes(b''.join(struct.pack('llHHi', 0, 0, *event) for event in events))
+    live = run(vega, 'display', module, *display_args, '--out', work / 'live', '--input', recording)
+    assert live.returncode == 0, live.stderr
+    last = [line.split() for line in live.stdout.splitlines() if line.startswith('frame ')][-1]
+    assert last[3] == '0', last  # came back as drawn
+    script = f'type {"milk".encode().hex()}\nenter\ntype {"Bread".encode().hex()}\nenter\ntab\nkey Space\n' \
+             f'click {heading + 2} 3\nshow\n'
+    tui = run(vega, 'tui', module, '--dump', grid, stdin=script)
+    expected = [line for line in tui.stdout.splitlines() if not line.startswith('cells ')]
+    got = [line for line in live.stdout.splitlines() if not line.startswith('frame ')]
+    assert got == expected, (got, expected)
+    return {'events': len(events), 'lines': len(got)}
+
+
 def width_of(character):
     return width(character) or 0
 
@@ -1154,6 +1204,7 @@ def main():
             report['symbols'] = symbols(args.symbols.resolve(), work)
             report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
             report['display'] = display(vega, modules['todo'], work)
+            report['live_display'] = live_display(vega, modules['todo'], work)
     print(json.dumps(report))
 
 

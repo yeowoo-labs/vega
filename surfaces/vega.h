@@ -2,6 +2,7 @@
 #define VEGA_H
 #include "module.h"
 #include "symbols.h"
+#include <poll.h>
 #include <stdio.h>
 
 /* Vega reads a verified Pure module by convention (docs/design/001-first-component.md):
@@ -151,4 +152,23 @@ bool vega_display_show(VegaDisplay *);
 /* Writeback: the last frame as the display controller put it out. */
 const uint32_t *vega_display_captured(const VegaDisplay *, size_t *stride);
 void vega_display_close(VegaDisplay *);
+
+/* Input from evdev: keyboards (key names and the text they type on a US
+ * layout), mice and touch screens (presses at a pixel of a width x height
+ * screen). With paths, recorded events are read from those files instead,
+ * positions in screen pixels. */
+typedef enum { VEGA_EVENT_KEY, VEGA_EVENT_TEXT, VEGA_EVENT_PRESS, VEGA_EVENT_WHEEL } VegaEventKind;
+typedef struct {
+    VegaEventKind kind;
+    char name[24], text[8]; /* a key's name; the text it types */
+    int x, y, steps;        /* where a press or the wheel is; steps down (negative up) */
+} VegaEvent;
+typedef struct VegaInput VegaInput;
+VegaInput *vega_input_open(const char *const *paths, unsigned count, unsigned width, unsigned height);
+unsigned vega_input_fds(const VegaInput *, struct pollfd *out, unsigned max);
+/* What the device on fd has for us; ended: it has no more (a file read out). */
+unsigned vega_input_read(VegaInput *, int fd, VegaEvent *out, unsigned max, bool *ended);
+/* Where the pointer is, and whether a mouse moved it (a finger's is not shown). */
+void vega_input_pointer(const VegaInput *, int *x, int *y, bool *shown);
+void vega_input_close(VegaInput *);
 #endif

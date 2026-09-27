@@ -16,7 +16,8 @@ printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
 build/vega web todo.pmod --watch              # 브라우저(GUI). --watch: 모듈이 다시 빌드되면 상태를 이어 바꾼다
                                               # (옆에서 AUP_PATH=lib aup watch examples/todo.aup -o todo.pmod)
 build/vega pixels todo.pmod --symbols ui.vsym --grid 48x12 --out frame < script   # 픽셀: frame-N.ppm (설계 003)
-build/vega display todo.pmod --symbols ui.vsym < script     # 디스플레이(KMS). --writeback WxH --out: 화면 없이 되돌려 받기
+build/vega display todo.pmod --symbols ui.vsym --live      # 디스플레이(KMS)와 키보드·마우스·터치(evdev)
+                                              # (< script, --input 기록한 사건, --writeback WxH --out: 화면 없이 되돌려 받기)
 make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
 ```
 
