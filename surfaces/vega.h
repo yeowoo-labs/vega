@@ -153,6 +153,25 @@ bool vega_display_show(VegaDisplay *);
 const uint32_t *vega_display_captured(const VegaDisplay *, size_t *stride);
 void vega_display_close(VegaDisplay *);
 
+/* Hangul typed on a US keyboard as the two-set layout (두벌식, hangul.c):
+ * letter keys give jamo that compose syllables as they come. type takes a
+ * letter (A-Z with Shift) and gives what it finished (UTF-8, at most one
+ * syllable) into done; false for a key that is not a letter. composing is
+ * the syllable being composed (0 bytes: none); back takes back its last jamo
+ * (false: none was being composed); finish ends it into out. */
+struct VegaJamo { signed char initial, vowel; unsigned char final; };
+typedef struct {
+    signed char initial, vowel; /* -1: none */
+    unsigned char final;        /* 0: none */
+    unsigned char steps;        /* what it was before each jamo, for Backspace */
+    struct VegaJamo before[8];
+} VegaHangul;
+void vega_hangul_reset(VegaHangul *);
+bool vega_hangul_type(VegaHangul *, char key, char done[4], size_t *done_length);
+size_t vega_hangul_composing(const VegaHangul *, char out[4]);
+bool vega_hangul_back(VegaHangul *);
+size_t vega_hangul_finish(VegaHangul *, char out[4]);
+
 /* Input from evdev: keyboards (key names and the text they type on a US
  * layout), mice and touch screens (presses at a pixel of a width x height
  * screen). With count paths, recorded events are read from those files

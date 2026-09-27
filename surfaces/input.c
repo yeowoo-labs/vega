@@ -52,6 +52,7 @@ static const struct { unsigned short code; const char *name; char plain, shifted
     {KEY_HOME, "Home", 0, 0}, {KEY_UP, "ArrowUp", 0, 0}, {KEY_PAGEUP, "PageUp", 0, 0}, {KEY_LEFT, "ArrowLeft", 0, 0},
     {KEY_RIGHT, "ArrowRight", 0, 0}, {KEY_END, "End", 0, 0}, {KEY_DOWN, "ArrowDown", 0, 0},
     {KEY_PAGEDOWN, "PageDown", 0, 0}, {KEY_INSERT, "Insert", 0, 0}, {KEY_DELETE, "Delete", 0, 0},
+    {KEY_HANGEUL, "Lang1", 0, 0}, {KEY_RIGHTALT, "AltRight", 0, 0}, /* 한/영, or the right Alt that stands for it */
 };
 
 static bool has(int fd, unsigned type, unsigned code) {

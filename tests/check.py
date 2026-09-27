@@ -1160,6 +1160,31 @@ def live_display(vega, module, work):
     return {'events': len(events), 'lines': len(got)}
 
 
+def hangul(vega, module):
+    """Hangul typed on the keyboard (두벌식, surfaces/hangul.c): letter keys
+    compose syllables in the entry line after the 한/영 key, and Enter commits
+    them. Joined vowels and finals, a final moving on to a vowel after it,
+    Shift's doubled consonants, a lone jamo, Backspace taking back one jamo at
+    a time, and a space or digit ending a syllable, each as an item."""
+    cases = [('dkssudgktpdy', '', '안녕하세요'), ('rkqtdmf', '', '값을'), ('dkswk', '', '안자'),
+             ('dhkdnjs', '', '와원'), ('Rkdnjs', '', '까원'), ('rkqt', 'back', '갑'), ('gksrmf', '', '한글'),
+             ('k', '', 'ㅏ'), ('dkswk', 'back', '안ㅈ'), ('dkssud 2', '', '안녕 2')]
+    script = 'hangul\n' + ''.join(f'letters {keys.encode().hex()}\n' + (f'{after}\n' if after else '') + 'enter\n'
+                                  for keys, after, _ in cases) + 'show\n'
+    shown = run(vega, 'tui', module, '--dump', '40x16', stdin=script)
+    assert shown.returncode == 0, shown.stderr
+    labels = [line[1:].strip().split('  ')[0].strip() for line in shown.stdout.splitlines()
+              if line[1:].startswith('  ') or line[1:].startswith('> ')]
+    labels = [label.lstrip('> ').strip() for label in labels]
+    assert labels[:len(cases)] == [want for _, _, want in cases], (labels, shown.stdout)
+    # The syllable being composed shows on the entry line; Backspace takes it back jamo by jamo, then a letter.
+    typing = run(vega, 'tui', module, '--dump', '30x5',
+                 stdin=f'hangul\nletters {"dkssu".encode().hex()}\nshow\nback\nshow\nback\nback\nshow\n')
+    prompts = [line for line in typing.stdout.splitlines() if line.startswith('|') and '>' in line[:6] and 'add' in line]
+    assert [p.split('>', 1)[1].split('\t')[0].strip() for p in prompts] == ['안녀', '안ㄴ', ''], typing.stdout
+    return {'items': len(cases)}
+
+
 def node_display(vega, serve, module, work):
     """Vega in a Pure node (vega-surface.so run by pure-serve --surface): the
     node's app, which an HTTP client gave an item, is on its display, and
@@ -1247,9 +1272,10 @@ def messenger(vega, serve, module, work):
     """Two nodes of examples/messenger.aup, Alice's and Bob's, each with a key
     of its own, sealing to the other's and taking lines only from the other
     (pure-serve --key, --send, --seal, --sender), each showing its app
-    through Vega's pixels in the node. A line typed on Alice's display
-    (recorded keys) reaches Bob's node sealed and is drawn on his; Bob's
-    answer, posted by a program, is drawn on hers. Each last frame is the one
+    through Vega's pixels in the node. Lines typed on Alice's display
+    (recorded keys: one in English, one in Hangul after the 한/영 key) reach
+    Bob's node sealed and are drawn on his; Bob's answer, posted by a
+    program, is drawn on hers. Each last frame is the one
     the vega command draws from that node's store, and the relay between the
     nodes saw no line's text nor a field's name, only seals made in one
     session each and naming the sender's key."""
@@ -1341,9 +1367,11 @@ def messenger(vega, serve, module, work):
                          '--surface', library, '--', 'pixels', '--symbols', face, '--size', 16, '--grid', '40x8',
                          '--out', work / f'{name}-frame'] for name in ('alice', 'bob')}
         start('bob', *wiring['bob'])
-        codes = {'h': 35, 'e': 18, 'l': 38, 'o': 24, 'b': 48, 'space': 57, 'enter': 28}
+        codes = {'h': 35, 'e': 18, 'l': 38, 'o': 24, 'b': 48, 'space': 57, 'enter': 28, 'lang1': 122, 'd': 32,
+                 'k': 37, 's': 31, 'u': 22}
         events = []
-        for name in ('h', 'e', 'l', 'l', 'o', 'space', 'b', 'o', 'b', 'enter'):
+        for name in ('h', 'e', 'l', 'l', 'o', 'space', 'b', 'o', 'b', 'enter', 'lang1', 'd', 'k', 's', 's', 'u', 'd',
+                     'enter'):
             events.extend([(1, codes[name], 1), (0, 0, 0), (1, codes[name], 0), (0, 0, 0)])
         recording = work / 'alice-events.bin'
         recording.write_bytes(b''.join(struct.pack('llHHi', 0, 0, *event) for event in events))
@@ -1353,10 +1381,10 @@ def messenger(vega, serve, module, work):
         while '\nframe ' not in '\n' + printed and time.time() < deadline:
             if select.select([process.stdout], [], [], 1)[0]:
                 printed += os.read(process.stdout.fileno(), 65536).decode()
-        assert 'hello bob' in printed and '\nframe ' in '\n' + printed, printed
-        assert wait_for(lambda: call('bob', 'GET', '/views/title')[1] == 'bob: 1 lines'), call('bob', 'GET', '/views/title')
+        assert 'hello bob' in printed and '안녕' in printed and '\nframe ' in '\n' + printed, printed
+        assert wait_for(lambda: call('bob', 'GET', '/views/title')[1] == 'bob: 2 lines'), call('bob', 'GET', '/views/title')
         assert call('bob', 'POST', '/inputs/say', b'hi alice')[0] == 200
-        assert wait_for(lambda: call('alice', 'GET', '/views/title')[1] == 'alice: 2 lines')
+        assert wait_for(lambda: call('alice', 'GET', '/views/title')[1] == 'alice: 3 lines')
         drawn = {}
         for name in ('alice', 'bob'):
             # Its surface draws after each save: the last frame shows the last save.
@@ -1374,7 +1402,7 @@ def messenger(vega, serve, module, work):
             expected = run(vega, 'pixels', module, '--store', copy, '--symbols', face, '--size', 16, '--grid', '40x8',
                            '--out', work / f'{name}-expected', stdin='show\n')
             assert expected.returncode == 0, expected.stderr
-            assert 'hello bob' in expected.stdout and 'hi alice' in expected.stdout, expected.stdout
+            assert all(line in expected.stdout for line in ('hello bob', '안녕', 'hi alice')), expected.stdout
             assert drawn[name].read_bytes() == (work / f'{name}-expected-1.ppm').read_bytes(), name
     finally:
         for process, _ in nodes.values():
@@ -1383,10 +1411,11 @@ def messenger(vega, serve, module, work):
                 process.wait()
         relay.shutdown()
     assert seen and all(len(headers['X-Pure-Seal'].split()) == 4 for _, headers, _ in seen), seen[:1]
-    assert not any(word in body for _, _, body in seen for word in (b'hello', b'hi alice', b'body', b'from'))
+    assert not any(word in body for _, _, body in seen
+                   for word in (b'hello', '안녕'.encode(), b'hi alice', b'body', b'from'))
     sessions = {(headers['X-Pure-Source'], headers['X-Pure-Seal'].split()[1]) for _, headers, _ in seen}
     assert len(sessions) == 2, sessions  # one session each way
-    return {'relayed': len(seen), 'lines': 2}
+    return {'relayed': len(seen), 'lines': 3}
 
 
 def width_of(character):
@@ -1427,6 +1456,7 @@ def main():
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
             interactive(vega, modules['todo'], work / 'interactive-store')
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
+        report['hangul'] = hangul(vega, modules['todo'])
         report['convention_findings'] = conventions(vega, aup, work, modules)
         report['examples'], report['robustness_runs'] = robustness(vega, aup, work, args.rounds)
         if args.symbols:

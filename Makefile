@@ -12,7 +12,7 @@ LIBPURE = $(PURE)/build/libpure.a
 # host: TUI, CLI, NUI sentences, web), symbols/ (glyphs and icons as one
 # format, drawn by CPU or GPU).
 SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/display.c \
-           surfaces/input.c surfaces/main.c
+           surfaces/input.c surfaces/hangul.c surfaces/main.c
 
 .PHONY: all check FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so

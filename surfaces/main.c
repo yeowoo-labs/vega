@@ -37,9 +37,12 @@
  * written again replaces the running one and states keep their values by
  * name: aup watch app.aup -o app.pmod beside it makes a saved edit show at once.
  * Script commands, one per line: key KEYNAME | text HEX|- | type HEX | enter |
- * tab | frame [N] | point VIEW ROW | click LINE COLUMN | time MS | tick TIMER | swap MODULE | show. key presses and
+ * tab | hangul | letters HEX | back | frame [N] | point VIEW ROW | click LINE COLUMN | time MS | tick TIMER |
+ * swap MODULE | show. key presses and
  * releases the input bound to that key; text commits text to the screen's text
- * input; type, enter and tab act on the TUI's input line; point focuses a row
+ * input; type, enter and tab act on the TUI's input line, and so do hangul (the
+ * 한/영 key), letters (keys typed, each byte one, through Hangul when it is on)
+ * and back (Backspace); point focuses a row
  * (0 first) of a list or table; click is a mouse click on the last shown TUI
  * frame (1 first, as terminals report it); time sets the time the next
  * events see (live surfaces use the clock) and tick ticks a timer (live
@@ -61,6 +64,10 @@ static VegaGrid *drawn; /* the TUI's last frame, which a click lands on */
 static char entry[VEGA_TEXT];
 static size_t entry_length;
 static bool typing;
+/* Hangul typed on the keyboard (Lang1, the 한/영 key, or AltRight switches):
+ * the syllable being composed shows after the entry line until it is done. */
+static bool korean;
+static VegaHangul hangul = {-1, -1, 0, 0, {{0, 0, 0}}};
 
 /* The module file last read, and a digest of its bytes. A loaded module
  * keeps nothing of them, so one buffer, grown to the largest, serves every load. */
@@ -357,15 +364,38 @@ static bool raw_mode(void) {
 /* Whether the app takes Tab itself; otherwise Tab switches typing and keys. */
 static bool tab_switches(void) { return screen.prompt >= 0 && key_input("Tab") < 0; }
 
+static void append(const char *bytes, size_t length) {
+    if (entry_length + length < sizeof(entry)) { memcpy(entry + entry_length, bytes, length); entry_length += length; }
+}
+
+/* The syllable being composed, done: into the entry line. */
+static void finish_hangul(void) {
+    char done[4];
+    append(done, vega_hangul_finish(&hangul, done));
+}
+
+/* The entry line as shown: what was typed, then the syllable being composed. */
+static size_t shown_entry(char out[VEGA_TEXT + 4]) {
+    memcpy(out, entry, entry_length);
+    return entry_length + vega_hangul_composing(&hangul, out + entry_length);
+}
+
 /* One key from the terminal, as typed text or as a Pure key name. */
 static void handle_key(const char *name) {
     int input;
-    if (!strcmp(name, "Tab") && tab_switches()) { typing = !typing; return; }
+    if (!strcmp(name, "Lang1") || !strcmp(name, "AltRight")) { /* 한/영 */
+        finish_hangul();
+        korean = !korean;
+        return;
+    }
+    if (!strcmp(name, "Tab") && tab_switches()) { finish_hangul(); typing = !typing; return; }
     if (typing && !strcmp(name, "Enter")) {
+        finish_hangul();
         if (entry_length && commit(entry, entry_length)) entry_length = 0;
         return;
     }
     if (typing && !strcmp(name, "Backspace")) {
+        if (vega_hangul_back(&hangul)) return; /* a jamo of the syllable being composed */
         while (entry_length && ((unsigned char)entry[entry_length - 1] & 0xC0) == 0x80) --entry_length;
         if (entry_length) --entry_length;
         return;
@@ -375,7 +405,14 @@ static void handle_key(const char *name) {
 
 static void handle_text(const char *bytes, size_t length) {
     if (typing) {
-        if (entry_length + length < sizeof(entry)) { memcpy(entry + entry_length, bytes, length); entry_length += length; }
+        char done[4];
+        size_t finished;
+        if (korean && length == 1 && vega_hangul_type(&hangul, bytes[0], done, &finished)) {
+            append(done, finished);
+            return;
+        }
+        finish_hangul(); /* anything but a letter ends the syllable */
+        append(bytes, length);
         return;
     }
     if (length != 1) return;
@@ -457,7 +494,8 @@ static int interactive(void) {
         /* Tick what is due, draw, then wait for input, a frame or the next tick. */
         bool ticked = false;
         long due = vega_timers_run(&timers, &app, vega_now(), &ticked);
-        vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+        char line[VEGA_TEXT + 4];
+        vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
         paint_terminal(&grid);
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
         int timeout = screen.ticks ? 16 : watched ? 200 : -1;
@@ -597,7 +635,8 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         bool ticked = false;
         long due = node ? -1 : vega_timers_run(&timers, &app, vega_now(), &ticked);
         PureSnapshot *snapshot = node ? node->read(node->host, &app) : NULL;
-        if (!node || snapshot) vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+        char line[VEGA_TEXT + 4];
+        if (!node || snapshot) vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
         if (snapshot) node->release(node->host, snapshot);
         if (!display) { /* a node's pixels: each frame into a file */
             if (!write_frame(&grid, path)) { fprintf(stderr, "vega: cannot write %s\n", path); status = 1; break; }
@@ -688,6 +727,14 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
         } else if (!strcmp(command, "tab")) {
             handle_key("Tab");
             acted = false;
+        } else if (!strcmp(command, "hangul") || !strcmp(command, "back")) {
+            handle_key(!strcmp(command, "hangul") ? "Lang1" : "Backspace");
+            acted = false;
+        } else if (!strcmp(command, "letters")) {
+            char keys[VEGA_TEXT];
+            size_t count = unhex(argument, keys, sizeof(keys));
+            for (size_t i = 0; i < count; ++i) handle_text(keys + i, 1);
+            acted = false;
         } else if (!strcmp(command, "point")) {
             char name[PURE_MODULE_NAME];
             long row = -1;
@@ -728,14 +775,16 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
             else if (surface == SURFACE_SAY) vega_say(stdout, &app, &screen, true);
             else if ((shown = true) && painting) {
                 Out out = {0};
-                vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+                char prompt[VEGA_TEXT + 4];
+                vega_draw(&grid, &app, &screen, prompt, shown_entry(prompt), typing);
                 paint(&grid, &out);
                 printf("paint %zu\n", out.used);
                 fwrite(out.bytes, 1, out.used, stdout);
                 putchar('\n');
                 free(out.bytes);
             } else {
-                vega_draw(&grid, &app, &screen, entry, entry_length, typing);
+                char prompt[VEGA_TEXT + 4];
+                vega_draw(&grid, &app, &screen, prompt, shown_entry(prompt), typing);
                 dump(&grid);
                 printf("cells %lu\n", vega_evaluations() - counted);
                 char path[512];
