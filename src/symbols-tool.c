@@ -18,81 +18,129 @@
 #define PI 3.14159265358979323846
 
 typedef struct { double x, y; } Point;
-typedef struct { Point p[3]; } Quad;
-typedef struct { Quad *items; size_t count, capacity; Point at, start; bool open; double font_scale; } Path;
-typedef struct { uint32_t code; size_t first, count; int16_t advance; } Built;
+/* An outline as the pen drew it. smooth: the end lies halfway between this
+ * control and the next, by construction, so it may go unwritten. */
+typedef enum { MOVE, LINE, QUAD } Kind;
+typedef struct { Kind kind; bool smooth; Point control, end; } Segment;
+typedef struct { Segment *items; size_t count, capacity; Point at, start; bool open; double font_scale; } Path;
+typedef struct { uint32_t code; size_t first, count; int16_t advance; } Built; /* segments [first, first + count) */
 
 static void fail(const char *why) {
     fprintf(stderr, "vega-symbols: %s\n", why);
     exit(1);
 }
 
-static void add_quad(Path *path, Point a, Point b, Point c) {
+static void add(Path *path, Segment segment) {
     if (path->count == path->capacity) {
         path->capacity = path->capacity ? 2 * path->capacity : 64;
         if (!(path->items = realloc(path->items, path->capacity * sizeof(*path->items)))) fail("out of memory");
     }
-    path->items[path->count++] = (Quad){{a, b, c}};
+    path->items[path->count++] = segment;
+    path->at = segment.end;
 }
 
-/* A line is a quadratic whose control point is its middle. */
+static bool same(Point a, Point b) { return a.x == b.x && a.y == b.y; }
+
 static void line_to(Path *path, Point to) {
-    if (to.x != path->at.x || to.y != path->at.y)
-        add_quad(path, path->at, (Point){(path->at.x + to.x) / 2, (path->at.y + to.y) / 2}, to);
-    path->at = to;
+    if (!same(to, path->at)) add(path, (Segment){LINE, false, to, to});
 }
 
-static void quad_to(Path *path, Point control, Point to) {
-    add_quad(path, path->at, control, to);
-    path->at = to;
+static void quad_to(Path *path, Point control, Point to) { add(path, (Segment){QUAD, false, control, to}); }
+
+static Point lerp(Point a, Point b, double t) { return (Point){a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t}; }
+static double length(double x, double y) { return sqrt(x * x + y * y); }
+
+/* Whether the cubic of these differences stays within tolerance of zero
+ * (split in halves until its control points do). */
+static bool fits(Point p0, Point p1, Point p2, Point p3, double tolerance) {
+    if (length(p1.x, p1.y) <= tolerance && length(p2.x, p2.y) <= tolerance) return true;
+    Point mid = {(p0.x + 3 * (p1.x + p2.x) + p3.x) / 8, (p0.y + 3 * (p1.y + p2.y) + p3.y) / 8};
+    if (length(mid.x, mid.y) > tolerance) return false;
+    Point d = {(p3.x + p2.x - p1.x - p0.x) / 8, (p3.y + p2.y - p1.y - p0.y) / 8};
+    return fits(p0, lerp(p0, p1, 0.5), (Point){mid.x - d.x, mid.y - d.y}, mid, tolerance) &&
+           fits(mid, (Point){mid.x + d.x, mid.y + d.y}, lerp(p2, p3, 0.5), p3, tolerance);
 }
 
-/* A cubic as quadratics, within half a unit: split in n equal pieces, each
- * approximated by the quadratic through its ends with the control point
- * (3(c1 + c2) - (p0 + p3)) / 4. The error shrinks with the cube of n. */
-static void cubic_to(Path *path, Point c1, Point c2, Point to) {
-    Point p0 = path->at;
-    double dx = to.x - 3 * c2.x + 3 * c1.x - p0.x, dy = to.y - 3 * c2.y + 3 * c1.y - p0.y;
-    double error = sqrt(3) / 36 * sqrt(dx * dx + dy * dy);
-    int n = (int)ceil(cbrt(error / 0.5));
-    if (n < 1) n = 1;
-    if (n > 64) n = 64;
-    for (int i = 0; i < n; ++i) {
-        double t0 = (double)i / n, t1 = (double)(i + 1) / n;
-        Point q[4];
-        double ts[2] = {t0, t1};
-        /* The piece's points by de Casteljau at t0 and t1, and its control points. */
-        Point e[2];
-        for (int k = 0; k < 2; ++k) {
-            double t = ts[k], u = 1 - t;
-            e[k] = (Point){u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * to.x,
-                           u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * to.y};
-        }
-        /* Derivatives give the piece's cubic control points. */
-        double h = t1 - t0;
-        for (int k = 0; k < 2; ++k) {
-            double t = ts[k], u = 1 - t;
-            Point d = {3 * (u * u * (c1.x - p0.x) + 2 * u * t * (c2.x - c1.x) + t * t * (to.x - c2.x)),
-                       3 * (u * u * (c1.y - p0.y) + 2 * u * t * (c2.y - c1.y) + t * t * (to.y - c2.y))};
-            q[k ? 2 : 1] = k ? (Point){e[1].x - d.x * h / 3, e[1].y - d.y * h / 3} : (Point){e[0].x + d.x * h / 3, e[0].y + d.y * h / 3};
-        }
-        q[0] = e[0];
-        q[3] = e[1];
-        Point control = {(3 * (q[1].x + q[2].x) - (q[0].x + q[3].x)) / 4, (3 * (q[1].y + q[2].y) - (q[0].y + q[3].y)) / 4};
-        path->at = q[0];
-        quad_to(path, control, q[3]);
+/* The piece of cubic c over [a, b], as a cubic. */
+static void piece(const Point c[4], double a, double b, Point out[4]) {
+    Point q[4];
+    for (int k = 0; k < 2; ++k) {
+        double t = k ? b : a, u = 1 - t;
+        Point e = {u * u * u * c[0].x + 3 * u * u * t * c[1].x + 3 * u * t * t * c[2].x + t * t * t * c[3].x,
+                   u * u * u * c[0].y + 3 * u * u * t * c[1].y + 3 * u * t * t * c[2].y + t * t * t * c[3].y};
+        Point d = {3 * (u * u * (c[1].x - c[0].x) + 2 * u * t * (c[2].x - c[1].x) + t * t * (c[3].x - c[2].x)),
+                   3 * (u * u * (c[1].y - c[0].y) + 2 * u * t * (c[2].y - c[1].y) + t * t * (c[3].y - c[2].y))};
+        double h = (b - a) / 3 * (k ? -1 : 1);
+        q[3 * k] = e;
+        q[1 + k] = (Point){e.x + d.x * h, e.y + d.y * h};
     }
-    path->at = to;
+    memcpy(out, q, sizeof(q));
+}
+
+/* A cubic as a quadratic spline whose joins lie halfway between neighbouring
+ * controls (so they go unwritten), within tolerance: the approach of cu2qu
+ * (fontTools). With n pieces, piece i takes its control on the line between
+ * the points where the cubic's end tangents reach 1.5 times their control
+ * arms, at i / (n - 1); the fewest pieces that fit win. */
+static bool spline(const Point c[4], int n, double tolerance, Point *controls) {
+    if (n == 1) {
+        /* One quadratic: its control where the end tangents meet. */
+        Point a = {c[1].x - c[0].x, c[1].y - c[0].y}, b = {c[2].x - c[3].x, c[2].y - c[3].y};
+        double cross = a.x * b.y - a.y * b.x;
+        if (fabs(cross) < 1e-12) return false;
+        double t = ((c[3].x - c[0].x) * b.y - (c[3].y - c[0].y) * b.x) / cross;
+        controls[0] = (Point){c[0].x + a.x * t, c[0].y + a.y * t};
+        Point q1 = lerp(c[0], controls[0], 2.0 / 3), q2 = lerp(c[3], controls[0], 2.0 / 3);
+        return fits((Point){0, 0}, (Point){q1.x - c[1].x, q1.y - c[1].y}, (Point){q2.x - c[2].x, q2.y - c[2].y},
+                     (Point){0, 0}, tolerance);
+    }
+    Point from = c[0], before = {0, 0};
+    for (int i = 0; i < n; ++i) {
+        Point p[4];
+        piece(c, (double)i / n, (double)(i + 1) / n, p);
+        Point near = lerp(p[0], p[1], 1.5), far = lerp(p[3], p[2], 1.5);
+        controls[i] = lerp(near, far, (double)i / (n - 1));
+    }
+    for (int i = 0; i < n; ++i) {
+        Point p[4];
+        piece(c, (double)i / n, (double)(i + 1) / n, p);
+        Point to = i + 1 < n ? lerp(controls[i], controls[i + 1], 0.5) : c[3];
+        Point after = {to.x - p[3].x, to.y - p[3].y};
+        Point q1 = lerp(from, controls[i], 2.0 / 3), q2 = lerp(to, controls[i], 2.0 / 3);
+        if (length(after.x, after.y) > tolerance ||
+            !fits(before, (Point){q1.x - p[1].x, q1.y - p[1].y}, (Point){q2.x - p[2].x, q2.y - p[2].y}, after, tolerance))
+            return false;
+        from = to;
+        before = after;
+    }
+    return true;
+}
+
+static void cubic_to(Path *path, Point c1, Point c2, Point to) {
+    Point c[4] = {path->at, c1, c2, to}, controls[64];
+    if (same(c[0], c1) && same(c1, c2) && same(c2, to)) return;
+    for (int n = 1; n <= 64; ++n)
+        if (spline(c, n, 1, controls)) {
+            for (int i = 0; i < n; ++i)
+                add(path, (Segment){QUAD, i + 1 < n, controls[i], i + 1 < n ? lerp(controls[i], controls[i + 1], 0.5) : to});
+            return;
+        }
+    fail("a cubic that 64 quadratics do not fit");
 }
 
 static void close_path(Path *path) {
-    if (path->open) line_to(path, path->start);
+    if (path->open) {
+        line_to(path, path->start);
+        /* A contour of a move alone draws nothing: drop it. */
+        if (path->count && path->items[path->count - 1].kind == MOVE) --path->count;
+    }
     path->open = false;
 }
 
 static void move_to(Path *path, Point to) {
     close_path(path);
-    path->at = path->start = to;
+    add(path, (Segment){MOVE, false, to, to});
+    path->start = to;
     path->open = true;
 }
 
@@ -300,13 +348,54 @@ static void svg_icon(Path *path, const char *file, uint16_t units, int16_t *adva
 
 /* ---- Writing. */
 
+typedef struct { long x, y; bool off, move; } Emitted;
+typedef struct { Emitted *items; size_t count, capacity; } Points;
+
 static void put16(unsigned char *p, int v) { p[0] = (unsigned char)v; p[1] = (unsigned char)((unsigned)v >> 8); }
 static void put32(unsigned char *p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
 
-static int16_t unit(double v) {
-    long r = lround(v);
-    if (r < INT16_MIN || r > INT16_MAX) fail("a coordinate does not fit 16 bits");
-    return (int16_t)r;
+static void emit(Points *points, Point at, bool off, bool move) {
+    if (points->count == points->capacity) {
+        points->capacity = points->capacity ? 2 * points->capacity : 256;
+        if (!(points->items = realloc(points->items, points->capacity * sizeof(*points->items)))) fail("out of memory");
+    }
+    points->items[points->count++] = (Emitted){lround(at.x), lround(at.y), off, move};
+}
+
+/* Whether s ends where its control and the next curve's would imply. */
+static bool implied(const Segment *s, const Segment *next) {
+    if (s->kind != QUAD || !next || next->kind != QUAD) return false;
+    return s->smooth || (2 * lround(s->end.x) == lround(s->control.x) + lround(next->control.x) &&
+                         2 * lround(s->end.y) == lround(s->control.y) + lround(next->control.y));
+}
+
+/* One symbol's segments as points: each contour an on point that starts it,
+ * then per segment its control (if a curve) and its end, unless the next
+ * curve's control implies it; the last end, back at the start, is written.
+ * A contour that starts at an implied point (as FreeType starts TrueType's
+ * when its first point is off) starts instead at its first written one. */
+static void emit_symbol(Points *points, const Segment *segments, size_t count) {
+    for (size_t i = 0; i < count;) {
+        size_t end = i + 1;
+        while (end < count && segments[end].kind != MOVE) ++end;
+        const Segment *body = segments + i + 1;
+        size_t n = end - i - 1, from = 0;
+        if (n > 1 && implied(&body[n - 1], &body[0]))
+            for (size_t k = 0; k + 1 < n; ++k)
+                if (!implied(&body[k], &body[k + 1])) { from = k + 1; break; }
+        emit(points, from ? body[from - 1].end : segments[i].end, false, true);
+        for (size_t m = 0; m < n; ++m) {
+            const Segment *s = &body[(from + m) % n], *next = m + 1 < n ? &body[(from + m + 1) % n] : NULL;
+            const Emitted *last = &points->items[points->count - 1];
+            if (s->kind == LINE) {
+                if (last->off || last->x != lround(s->end.x) || last->y != lround(s->end.y)) emit(points, s->end, false, false);
+                continue;
+            }
+            emit(points, s->control, true, false);
+            if (!implied(s, next)) emit(points, s->end, false, false);
+        }
+        i = end;
+    }
 }
 
 static int by_code(const void *a, const void *b) {
@@ -317,53 +406,74 @@ static int by_code(const void *a, const void *b) {
 static void write_symbols(const char *out, uint16_t units, Built *built, size_t count, const Path *path) {
     qsort(built, count, sizeof(*built), by_code);
     for (size_t i = 1; i < count; ++i) if (built[i].code == built[i - 1].code) fail("a code is given twice");
-    size_t size = VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES + path->count * VEGA_CURVE_BYTES;
+    Points points = {0};
+    size_t *first = calloc(count + 1, sizeof(*first));
+    for (size_t i = 0; i < count; ++i) {
+        first[i] = points.count;
+        emit_symbol(&points, path->items + built[i].first, built[i].count);
+    }
+    first[count] = points.count;
+    /* Halve units while every coordinate is even: a TrueType font's own. */
+    for (;;) {
+        bool even = units % 2 == 0 && units > 16;
+        for (size_t i = 0; even && i < points.count; ++i) even = points.items[i].x % 2 == 0 && points.items[i].y % 2 == 0;
+        for (size_t i = 0; even && i < count; ++i) even = built[i].advance % 2 == 0;
+        if (!even) break;
+        for (size_t i = 0; i < points.count; ++i) { points.items[i].x /= 2; points.items[i].y /= 2; }
+        for (size_t i = 0; i < count; ++i) built[i].advance = (int16_t)(built[i].advance / 2);
+        units /= 2;
+    }
+    size_t size = VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES + points.count * VEGA_POINT_BYTES;
     unsigned char *bytes = calloc(1, size);
     if (!bytes) fail("out of memory");
-    memcpy(bytes, "VEGASYM1", 8);
+    memcpy(bytes, "VEGASYM2", 8);
     put16(bytes + 8, units);
     put32(bytes + 12, (uint32_t)count);
-    put32(bytes + 16, (uint32_t)path->count);
+    put32(bytes + 16, (uint32_t)points.count);
     put32(bytes + 20, (uint32_t)size);
-    unsigned char *curves = bytes + VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES;
-    uint32_t next = 0;
+    unsigned char *at = bytes + VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES;
+    for (size_t i = 0; i < points.count; ++i) {
+        const Emitted *e = &points.items[i];
+        if (e->x < -16384 || e->x > 16383 || e->y < -16384 || e->y > 16383) fail("a coordinate does not fit 15 bits");
+        put16(at + 4 * i, (int)(2 * e->x + e->off));
+        put16(at + 4 * i + 2, (int)(2 * e->y + e->move));
+    }
     for (size_t i = 0; i < count; ++i) {
-        int16_t left = 0, bottom = 0, right = 0, top = 0;
-        for (size_t k = 0; k < built[i].count; ++k) {
-            const Quad *q = &path->items[built[i].first + k];
-            unsigned char *c = curves + (size_t)(next + k) * VEGA_CURVE_BYTES;
-            for (int j = 0; j < 3; ++j) {
-                int16_t x = unit(q->p[j].x), y = unit(q->p[j].y);
-                put16(c + 4 * j, x);
-                put16(c + 4 * j + 2, y);
-                if (!k && !j) { left = right = x; bottom = top = y; }
-                if (x < left) left = x;
-                if (x > right) right = x;
-                if (y < bottom) bottom = y;
-                if (y > top) top = y;
-            }
+        long left = 0, bottom = 0, right = 0, top = 0;
+        for (size_t k = first[i]; k < first[i + 1]; ++k) {
+            const Emitted *e = &points.items[k];
+            if (k == first[i]) { left = right = e->x; bottom = top = e->y; }
+            left = e->x < left ? e->x : left;
+            right = e->x > right ? e->x : right;
+            bottom = e->y < bottom ? e->y : bottom;
+            top = e->y > top ? e->y : top;
         }
-        unsigned char *s = bytes + VEGA_SYMBOLS_HEADER + i * VEGA_SYMBOL_BYTES;
-        put32(s, built[i].code);
-        put32(s + 4, next);
-        put32(s + 8, (uint32_t)built[i].count);
-        put16(s + 12, left);
-        put16(s + 14, bottom);
-        put16(s + 16, right);
-        put16(s + 18, top);
-        put16(s + 20, built[i].advance);
-        next += (uint32_t)built[i].count;
+        unsigned char *p = bytes + VEGA_SYMBOLS_HEADER + i * VEGA_SYMBOL_BYTES;
+        put32(p, built[i].code);
+        put32(p + 4, (uint32_t)first[i]);
+        put32(p + 8, (uint32_t)(first[i + 1] - first[i]));
+        put16(p + 12, (int)left);
+        put16(p + 14, (int)bottom);
+        put16(p + 16, (int)right);
+        put16(p + 18, (int)top);
+        put16(p + 20, built[i].advance);
     }
     FILE *f = fopen(out, "wb");
     if (!f || fwrite(bytes, 1, size, f) != size || fclose(f)) fail("cannot write the symbol file");
-    free(bytes);
     char error[128];
     VegaSymbols check;
-    size_t read_size;
-    char *again = read_file(out, &read_size);
-    if (!again || !vega_symbols_open(&check, (unsigned char *)again, read_size, error, sizeof(error))) fail(error);
-    free(again);
-    printf("{\"symbols\":%zu,\"curves\":%zu,\"bytes\":%zu}\n", count, path->count, size);
+    if (!vega_symbols_open(&check, bytes, size, error, sizeof(error))) fail(error);
+    size_t curves = 0;
+    VegaCurve curve;
+    for (uint32_t i = 0; i < check.symbols; ++i) {
+        VegaSymbol symbol = vega_symbol_at(&check, i);
+        for (uint32_t k = symbol.first; k < symbol.first + symbol.count; ++k) curves += vega_symbol_curve(&check, &symbol, k, &curve);
+    }
+    printf("{\"symbols\":%zu,\"points\":%zu,\"curves\":%zu,\"units\":%u,\"bytes\":%zu}\n", count, points.count, curves,
+           units, size);
+    free(bytes);
+    free(first);
+    free(points.items);
 }
 
 /* 0x20-0x7e,0xac00 as a list of codes. */
@@ -432,7 +542,7 @@ static int build(int argc, char **argv) {
             if (FT_Outline_Decompose(&face->glyph->outline, &walk, &path)) fail("cannot walk an outline");
         }
         close_path(&path);
-        long advance = lround(face->glyph->metrics.horiAdvance * path.font_scale);
+        long advance = lround((double)face->glyph->metrics.horiAdvance * units / face->units_per_EM);
         built[made++] = (Built){list[i], first, path.count - first, (int16_t)(advance > INT16_MAX ? INT16_MAX : advance)};
     }
     for (size_t i = 0; i < icon_count; ++i) {
@@ -496,12 +606,16 @@ static void measure_open(FT_Library library, const char *font, const VegaSymbols
     if (FT_New_Memory_Face(library, (const FT_Byte *)font_bytes, (FT_Long)font_size, 0, &face)) fail("cannot open the font");
     FT_Outline_Funcs walk = {ignore_point, ignore_point, ignore_conic, ignore_cubic, 0, 0};
     long touched = 0, walked = 0;
+    uint32_t most = 0;
+    for (uint32_t i = 0; i < s->symbols; ++i) most = vega_symbol_at(s, i).count > most ? vega_symbol_at(s, i).count : most;
+    VegaCurve *curves = malloc((most + 1) * sizeof(*curves));
     started = seconds();
     for (int r = 0; r < rounds; ++r)
         for (uint32_t i = 0; i < s->symbols; ++i) {
             VegaSymbol symbol;
             if (!vega_symbol(s, vega_symbol_at(s, i).code, &symbol)) fail("lookup");
-            for (uint32_t k = symbol.first; k < symbol.first + symbol.count; ++k) touched += vega_curve(s, k).x2;
+            uint32_t count = vega_symbol_curves(s, &symbol, curves);
+            touched += count ? (long)curves[count - 1].x2 : 0;
         }
     double outline_ns = (seconds() - started) / rounds / s->symbols * 1e9;
     started = seconds();
@@ -516,6 +630,7 @@ static void measure_open(FT_Library library, const char *font, const VegaSymbols
     sink = touched + walked;
     FT_Done_Face(face);
     free(font_bytes);
+    free(curves);
 }
 
 /* Every symbol with a glyph in the font, at each size: our coverage against
@@ -572,7 +687,7 @@ static int compare(int argc, char **argv) {
     return 0;
 }
 
-/* Each symbol's code, curves, bounds, advance and filled area (in square
+/* Each symbol's code, points, curves, bounds, advance and filled area (in square
  * units: the integral of x dy around its outline, as a check against other
  * readers of the same fonts and icons). */
 static int info(int argc, char **argv) {
@@ -583,14 +698,18 @@ static int info(int argc, char **argv) {
     for (uint32_t i = 0; i < s.symbols; ++i) {
         VegaSymbol symbol = vega_symbol_at(&s, i);
         double area = 0;
+        uint32_t curves = 0;
+        VegaCurve c;
         for (uint32_t k = symbol.first; k < symbol.first + symbol.count; ++k) {
-            VegaCurve c = vega_curve(&s, k);
+            if (!vega_symbol_curve(&s, &symbol, k, &c)) continue;
+            ++curves;
             /* x(t) = x0 - 2 bx t + ax t^2, y'(t) = -2 by + 2 ay t, over [0, 1]. */
             double ax = c.x0 - 2 * c.x1 + c.x2, bx = c.x0 - c.x1, ay = c.y0 - 2 * c.y1 + c.y2, by = c.y0 - c.y1;
             area += c.x0 * -2 * by + (c.x0 * 2 * ay + 4 * bx * by) / 2 + (-4 * bx * ay - 2 * ax * by) / 3 + ax * ay / 2;
         }
-        printf("%s{\"code\":%u,\"curves\":%u,\"bounds\":[%d,%d,%d,%d],\"advance\":%d,\"area\":%.1f}", i ? "," : "",
-               symbol.code, symbol.count, symbol.left, symbol.bottom, symbol.right, symbol.top, symbol.advance, area);
+        printf("%s{\"code\":%u,\"points\":%u,\"curves\":%u,\"bounds\":[%d,%d,%d,%d],\"advance\":%d,\"area\":%.1f}",
+               i ? "," : "", symbol.code, symbol.count, curves, symbol.left, symbol.bottom, symbol.right, symbol.top,
+               symbol.advance, area);
     }
     printf("]}\n");
     free(bytes);

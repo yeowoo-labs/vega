@@ -1,9 +1,10 @@
 #include "symbols.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static const unsigned char magic[8] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M', '1'};
+static const unsigned char magic[8] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M', '2'};
 
 static uint16_t u16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static int16_t i16(const unsigned char *p) { return (int16_t)u16(p); }
@@ -14,10 +15,14 @@ VegaSymbol vega_symbol_at(const VegaSymbols *s, uint32_t index) {
     return (VegaSymbol){u32(p), u32(p + 4), u32(p + 8), i16(p + 12), i16(p + 14), i16(p + 16), i16(p + 18), i16(p + 20)};
 }
 
-VegaCurve vega_curve(const VegaSymbols *s, uint32_t index) {
+/* A point is two i16s, each its coordinate times two plus a flag: off the
+ * curve in x, starting a contour in y. */
+VegaPoint vega_point(const VegaSymbols *s, uint32_t index) {
     const unsigned char *p = s->bytes + VEGA_SYMBOLS_HEADER + (size_t)s->symbols * VEGA_SYMBOL_BYTES +
-                             (size_t)index * VEGA_CURVE_BYTES;
-    return (VegaCurve){i16(p), i16(p + 2), i16(p + 4), i16(p + 6), i16(p + 8), i16(p + 10)};
+                             (size_t)index * VEGA_POINT_BYTES;
+    int x = i16(p), y = i16(p + 2);
+    /* x >> 1 without relying on how a negative number shifts */
+    return (VegaPoint){(int16_t)((x - (x & 1)) / 2), (int16_t)((y - (y & 1)) / 2), x & 1, y & 1};
 }
 
 #define REFUSE(...) do { snprintf(error, error_size, __VA_ARGS__); return false; } while (0)
@@ -25,16 +30,22 @@ VegaCurve vega_curve(const VegaSymbols *s, uint32_t index) {
 bool vega_symbols_open(VegaSymbols *s, const unsigned char *bytes, size_t size, char *error, size_t error_size) {
     if (size < VEGA_SYMBOLS_HEADER || memcmp(bytes, magic, sizeof(magic))) REFUSE("not a symbol file");
     *s = (VegaSymbols){bytes, size, u16(bytes + 8), u32(bytes + 12), u32(bytes + 16)};
-    uint64_t expected = VEGA_SYMBOLS_HEADER + (uint64_t)s->symbols * VEGA_SYMBOL_BYTES + (uint64_t)s->curves * VEGA_CURVE_BYTES;
+    uint64_t expected = VEGA_SYMBOLS_HEADER + (uint64_t)s->symbols * VEGA_SYMBOL_BYTES + (uint64_t)s->points * VEGA_POINT_BYTES;
     if (u16(bytes + 10) || u32(bytes + 24) || !s->units) REFUSE("header");
-    if (u32(bytes + 20) != size || expected != size) REFUSE("size: %zu bytes for %u symbols and %u curves", size, s->symbols, s->curves);
+    if (u32(bytes + 20) != size || expected != size) REFUSE("size: %zu bytes for %u symbols and %u points", size, s->symbols, s->points);
     for (uint32_t i = 0; i < s->symbols; ++i) {
         VegaSymbol symbol = vega_symbol_at(s, i);
         const unsigned char *p = bytes + VEGA_SYMBOLS_HEADER + (size_t)i * VEGA_SYMBOL_BYTES;
         if (u16(p + 22)) REFUSE("symbol %u: flags", i);
         if (i && symbol.code <= vega_symbol_at(s, i - 1).code) REFUSE("symbol %u: codes out of order", i);
-        if (symbol.first > s->curves || symbol.count > s->curves - symbol.first) REFUSE("symbol %u: curves", i);
+        if (symbol.first > s->points || symbol.count > s->points - symbol.first) REFUSE("symbol %u: points", i);
         if (symbol.left > symbol.right || symbol.bottom > symbol.top) REFUSE("symbol %u: bounds", i);
+        /* An off point then always has both neighbours within the symbol. */
+        if (symbol.count) {
+            VegaPoint first = vega_point(s, symbol.first), last = vega_point(s, symbol.first + symbol.count - 1);
+            if (first.off || !first.move) REFUSE("symbol %u: its first point does not start a contour on the curve", i);
+            if (last.off) REFUSE("symbol %u: its last point is off the curve", i);
+        }
     }
     return true;
 }
@@ -48,6 +59,21 @@ bool vega_symbol(const VegaSymbols *s, uint32_t code, VegaSymbol *out) {
         if (symbol.code < code) low = middle + 1; else high = middle;
     }
     return false;
+}
+
+bool vega_symbol_curve(const VegaSymbols *s, const VegaSymbol *symbol, uint32_t index, VegaCurve *out) {
+    VegaPoint p = vega_point(s, index);
+    if (p.off) {
+        VegaPoint a = vega_point(s, index - 1), b = vega_point(s, index + 1);
+        *out = (VegaCurve){a.off ? (a.x + p.x) * 0.5f : a.x, a.off ? (a.y + p.y) * 0.5f : a.y, p.x, p.y,
+                           b.off ? (p.x + b.x) * 0.5f : b.x, b.off ? (p.y + b.y) * 0.5f : b.y};
+        return true;
+    }
+    if (index + 1 >= symbol->first + symbol->count) return false;
+    VegaPoint b = vega_point(s, index + 1);
+    if (b.off || b.move) return false;
+    *out = (VegaCurve){p.x, p.y, (p.x + b.x) * 0.5f, (p.y + b.y) * 0.5f, b.x, b.y};
+    return true;
 }
 
 /* Where a t^2 + b t + c = 0 inside (0, 1), appended to ts. */
@@ -106,13 +132,41 @@ static double curve_area(double x0, double y0, double x1, double y1, double x2, 
     return area;
 }
 
-double vega_symbol_coverage(const VegaSymbols *s, const VegaSymbol *symbol, double scale, double x, double y) {
+/* Without branches on the flags, which no predictor guesses: implied points
+ * and whether a point begins a curve come out of arithmetic on them. */
+uint32_t vega_symbol_curves(const VegaSymbols *s, const VegaSymbol *symbol, VegaCurve *out) {
+    if (!symbol->count) return 0;
+    const unsigned char *p = s->bytes + VEGA_SYMBOLS_HEADER + (size_t)s->symbols * VEGA_SYMBOL_BYTES +
+                             (size_t)symbol->first * VEGA_POINT_BYTES;
+    uint32_t count = 0;
+    int x = i16(p), y = i16(p + 2), off = x & 1;
+    float bx = 0, by = 0, bo = 0, hx = (float)(x - off) * 0.5f, hy = (float)(y - (y & 1)) * 0.5f, ho = (float)off;
+    for (uint32_t k = 1; k < symbol->count; ++k) {
+        p += VEGA_POINT_BYTES;
+        x = i16(p);
+        y = i16(p + 2);
+        float nx = (float)(x - (x & 1)) * 0.5f, ny = (float)(y - (y & 1)) * 0.5f, no = (float)(x & 1);
+        /* before, or halfway to here if before is off; here if here is on */
+        float sx = bx + (hx - bx) * 0.5f * bo, sy = by + (hy - by) * 0.5f * bo;
+        out[count] = (VegaCurve){hx + (sx - hx) * ho, hy + (sy - hy) * ho, hx + (nx - hx) * 0.5f * (1 - ho),
+                                 hy + (ny - hy) * 0.5f * (1 - ho), nx + (hx - nx) * 0.5f * no, ny + (hy - ny) * 0.5f * no};
+        /* an off point begins a curve, and so does an on point before an on
+         * point of the same contour (a line) */
+        count += (uint32_t)(off | (((x & 1) ^ 1) & ((y & 1) ^ 1)));
+        off = x & 1;
+        bx = hx, by = hy, bo = ho;
+        hx = nx, hy = ny, ho = no;
+    }
+    return count;
+}
+
+double vega_coverage(const VegaCurve *curves, uint32_t count, double scale, double x, double y) {
     /* The pixel's lower left corner, in units. */
     double left = x - 0.5 / scale, bottom = y - 0.5 / scale, area = 0;
-    for (uint32_t k = symbol->first; k < symbol->first + symbol->count; ++k) {
-        VegaCurve c = vega_curve(s, k);
-        area += curve_area((c.x0 - left) * scale, (c.y0 - bottom) * scale, (c.x1 - left) * scale, (c.y1 - bottom) * scale,
-                           (c.x2 - left) * scale, (c.y2 - bottom) * scale);
+    for (uint32_t k = 0; k < count; ++k) {
+        const VegaCurve *c = &curves[k];
+        area += curve_area((c->x0 - left) * scale, (c->y0 - bottom) * scale, (c->x1 - left) * scale, (c->y1 - bottom) * scale,
+                           (c->x2 - left) * scale, (c->y2 - bottom) * scale);
     }
     area = fabs(area);
     return area > 1 ? 1 : area;
@@ -120,9 +174,12 @@ double vega_symbol_coverage(const VegaSymbols *s, const VegaSymbol *symbol, doub
 
 void vega_symbol_raster(const VegaSymbols *s, const VegaSymbol *symbol, double scale, double left, double top, int width,
                         int height, unsigned char *out) {
+    VegaCurve *curves = malloc((symbol->count ? symbol->count : 1) * sizeof(*curves));
+    uint32_t count = curves ? vega_symbol_curves(s, symbol, curves) : 0;
     for (int j = 0; j < height; ++j)
         for (int i = 0; i < width; ++i) {
-            double coverage = vega_symbol_coverage(s, symbol, scale, left + (i + 0.5) / scale, top - (j + 0.5) / scale);
+            double coverage = vega_coverage(curves, count, scale, left + (i + 0.5) / scale, top - (j + 0.5) / scale);
             out[(size_t)j * (size_t)width + (size_t)i] = (unsigned char)lround(coverage * 255);
         }
+    free(curves);
 }

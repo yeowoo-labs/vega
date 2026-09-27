@@ -949,7 +949,7 @@ def symbols(tool, work):
         assert refused.returncode != 0 and refused.stdout == '', (name, refused.stdout)
         return refused.stderr.strip()
 
-    why = [damaged('short', good[:-1]), damaged('magic', b'VEGASYM2' + good[8:])]
+    why = [damaged('short', good[:-1]), damaged('magic', b'VEGASYM9' + good[8:])]
     swapped = bytearray(good)
     swapped[records:records + 24], swapped[records + 24:records + 48] = good[records + 24:records + 48], good[records:records + 24]
     why.append(damaged('order', swapped))
@@ -962,6 +962,16 @@ def symbols(tool, work):
     counted = bytearray(good)
     counted[12:16] = (count + 1).to_bytes(4, 'little')
     why.append(damaged('count', counted))
+    # A symbol's first point starts a contour on the curve, and its last is
+    # on it, so an off point's neighbours never leave the symbol.
+    points = records + 24 * count
+    first, length = (int.from_bytes(good[records + k:records + k + 4], 'little') for k in (4, 8))
+    unmoved = bytearray(good)
+    unmoved[points + 4 * first + 2] &= 0xFE
+    why.append(damaged('unmoved', unmoved))
+    open_end = bytearray(good)
+    open_end[points + 4 * (first + length - 1)] |= 1
+    why.append(damaged('open', open_end))
     assert len(set(why)) == len(why), why
 
     report = {'icons': len(info['symbols'])}
@@ -980,13 +990,14 @@ def symbols(tool, work):
         except ImportError:
             return report
         face = TTFont(font)
-        outlines, cmap = face.getGlyphSet(), face.getBestCmap()
+        outlines, cmap, metrics = face.getGlyphSet(), face.getBestCmap(), face['hmtx']
         shown = json.loads(run(tool, 'info', glyphs).stdout)
-        k = shown['units'] / face['head'].unitsPerEm
+        assert shown['units'] == face['head'].unitsPerEm, shown['units']  # a TrueType font's points stay whole
         for symbol in shown['symbols']:
             pen = AreaPen()
             outlines[cmap[symbol['code']]].draw(pen)
-            assert abs(abs(pen.value) * k * k - abs(symbol['area'])) < 1, (chr(symbol['code']), pen.value, symbol)
+            assert abs(abs(pen.value) - abs(symbol['area'])) < 1, (chr(symbol['code']), pen.value, symbol)
+            assert symbol['advance'] == metrics[cmap[symbol['code']]][0], (chr(symbol['code']), symbol)
         report['exact_glyphs'] = len(shown['symbols'])
     return report
 
