@@ -639,9 +639,9 @@ def timing(vega, module):
     # The terminal, on the clock: start it, and a second and more later it shows that.
     pid, fd = pty.fork()
     if pid == 0:
+        # the size before the program starts: set after, its first frames could be drawn at the pty's default
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 8, 30, 0, 0))
         os.execv(str(vega), [str(vega), 'tui', str(module)])
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 8, 30, 0, 0))
-    os.kill(pid, 28)
     screen = b''
 
     def read_for(seconds):
@@ -769,10 +769,9 @@ def interactive(vega, module, store=None, replace=None):
     import fcntl, pty, select, struct, termios, time
     pid, fd = pty.fork()
     if pid == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))  # before it starts: no race
         os.execv(str(vega), [str(vega), 'tui', str(module)] + (['--store', str(store)] if store else []) +
                  (['--watch'] if replace else []))
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))
-    os.kill(pid, 28)  # SIGWINCH: take the size
 
     def read_for(seconds):
         data, end = b'', time.time() + seconds
