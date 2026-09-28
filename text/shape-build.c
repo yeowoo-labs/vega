@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L /* clock_gettime */
 /* Building shaping sections with HarfBuzz (text/shape-build.h): plans as
  * HarfBuzz's planner compiles them (hb-ot-shape.cc's features, hb-ot-map.cc's
  * masks and stages), what the section carries, and a check of it against
