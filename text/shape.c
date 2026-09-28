@@ -128,16 +128,17 @@ static uint32_t first_coverage(VegaTable t, int table, const VegaSubtable *st) {
     return offset16(t, at, at + 2);
 }
 
-/* A table's lookups, their subtables' types resolved through extensions. */
-static bool resolve_lookups(VegaShaping *s, int table, size_t *subtables, size_t *allocated) {
-    VegaTable t = table ? s->gpos : s->gsub;
+/* A table's lookups (table 0 GSUB, 1 GPOS), their subtables' types
+ * resolved through extensions. */
+static bool resolve_lookups(VegaShaping *s, VegaTable t, int table, VegaLookup **out, uint32_t *out_count,
+                            size_t *subtables, size_t *allocated) {
     uint32_t list = t.size ? offset16(t, 0, 8) : 0, count = list ? get16(t, list) : 0;
-    s->lookup_count[table] = count;
-    if (!(s->lookups[table] = calloc(count ? count : 1, sizeof(VegaLookup)))) return false;
+    *out_count = count;
+    if (!(*out = calloc(count ? count : 1, sizeof(VegaLookup)))) return false;
     uint16_t extension = table ? 9 : 7;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t at = offset16(t, list, list + 2 + 2 * i), n = at ? get16(t, at + 4) : 0;
-        VegaLookup *l = &s->lookups[table][i];
+        VegaLookup *l = &(*out)[i];
         l->type = (uint16_t)get16(t, at);
         l->flags = (uint16_t)get16(t, at + 2);
         l->props = l->flags | (l->flags & 0x10 ? get16(t, at + 6 + 2 * n) << 16 : 0);
@@ -222,8 +223,20 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
         s->mark_sets = minor >= 2 ? offset16(s->gdef, 0, 12) : 0;
     }
     size_t subtables = 0, allocated = 0;
-    if (!resolve_lookups(s, 0, &subtables, &allocated) || !resolve_lookups(s, 1, &subtables, &allocated))
+    uint32_t fallback = le32(bytes + 76);
+    if (fallback) {
+        if (!within(size, fallback, 12) || bytes[fallback] > 7 || !within(size, fallback + 12, le32(bytes + fallback + 8)))
+            REFUSE("fallback lookups");
+        s->fallback = (VegaTable){bytes + fallback + 12, le32(bytes + fallback + 8)};
+        memcpy(s->fallback_features, bytes + fallback + 1, 7);
+    }
+    if (!resolve_lookups(s, s->gsub, 0, &s->lookups[0], &s->lookup_count[0], &subtables, &allocated) ||
+        !resolve_lookups(s, s->gpos, 1, &s->lookups[1], &s->lookup_count[1], &subtables, &allocated) ||
+        !resolve_lookups(s, s->fallback, 0, &s->fallback_lookups, &s->fallback_count, &subtables, &allocated))
         REFUSE("out of memory");
+    if (fallback && s->fallback_count != bytes[fallback]) REFUSE("fallback lookups");
+    for (uint32_t i = 0; i < s->fallback_count; ++i)
+        if (s->fallback_features[i] > 6) REFUSE("fallback lookups");
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
         uint32_t ranges[2][2] = {{le32(p + 80), le32(p + 84)}, {le32(p + 88), le32(p + 92)}};
@@ -236,7 +249,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
             for (uint32_t k = 0; k < ranges[table][1]; ++k) {
                 const unsigned char *step = s->steps + (size_t)(ranges[table][0] + k) * VEGA_STEP_BYTES;
                 bool pause = le16(step) == VEGA_STEP_PAUSE;
-                if (pause ? table || !step[2] || step[2] > VEGA_PAUSE_RECORD_PREF : le16(step) >= s->lookup_count[table])
+                if (pause ? table || !step[2] || step[2] > VEGA_PAUSE_RECORD_STCH : le16(step) >= s->lookup_count[table])
                     REFUSE("plan %u: a lookup the font lacks", i);
             }
         }
@@ -250,6 +263,8 @@ void vega_shaping_close(VegaShaping *s) {
     for (int i = 0; i < 256; ++i) free(s->bmp[i]), s->bmp[i] = NULL;
     free(s->lookups[0]);
     free(s->lookups[1]);
+    free(s->fallback_lookups);
+    s->fallback_lookups = NULL;
     free(s->subtables);
     s->lookups[0] = s->lookups[1] = NULL;
     s->subtables = NULL;
@@ -326,7 +341,7 @@ struct VegaShaper {
 };
 
 enum { HAS_NON_ASCII = 1, HAS_DEFAULT_IGNORABLES = 2, HAS_SPACE_FALLBACK = 4, HAS_GPOS_ATTACHMENT = 8, HAS_CGJ = 16,
-       HAS_VARIATION_SELECTOR_FALLBACK = 32, HAS_BROKEN_SYLLABLE = 64 };
+       HAS_VARIATION_SELECTOR_FALLBACK = 32, HAS_BROKEN_SYLLABLE = 64, HAS_STCH = 128 };
 
 VegaShaper *vega_shaper_new(void) { return calloc(1, sizeof(VegaShaper)); }
 
@@ -1137,17 +1152,16 @@ static void setup_masks_fraction(VegaShaper *b, const Plan *plan) {
     }
 }
 
-enum { ISOL, FINA, FIN2, FIN3, MEDI, MED2, INIT, NONE };
+enum { ISOL, FINA, FIN2, FIN3, MEDI, MED2, INIT, NONE, STCH_FIXED, STCH_REPEATING };
 enum { JT_U, JT_L, JT_R, JT_D, JG_ALAPH, JG_DALATH_RISH, JT_T = 7 };
 
-static unsigned joining_type(uint32_t u) {
-    switch (vega_joining(u)) {
-    case VEGA_JOINING_L: return JT_L;
-    case VEGA_JOINING_R: return JT_R;
-    case VEGA_JOINING_D: case VEGA_JOINING_C: return JT_D;
-    case VEGA_JOINING_T: return JT_T;
-    default: return JT_U;
-    }
+/* HarfBuzz's joining type (hb-ot-shaper-arabic-table.hh); where its table
+ * has none, T for a non-spacing or enclosing mark or a format character. */
+static unsigned joining_type(const Info *info) {
+    unsigned type = vega_arabic_joining(info->codepoint);
+    if (type != 8) return type;
+    unsigned c = gen_cat(info);
+    return c == VEGA_MN || c == VEGA_ME || c == VEGA_CF ? JT_T : JT_U;
 }
 
 static void setup_masks_arabic(VegaShaper *b, const Plan *plan) {
@@ -1162,7 +1176,7 @@ static void setup_masks_arabic(VegaShaper *b, const Plan *plan) {
     size_t prev = (size_t)-1;
     unsigned state = 0;
     for (size_t i = 0; i < b->len; ++i) {
-        unsigned type = joining_type(b->info[i].codepoint);
+        unsigned type = joining_type(&b->info[i]);
         if (type == JT_T) {
             b->info[i].action = NONE;
             continue;
@@ -3626,10 +3640,132 @@ static void preprocess_thai(const VegaShaping *s, const Plan *plan, VegaShaper *
     if (plan->shaper_flags & VEGA_THAI_PUA) thai_pua_shaping(s, b);
 }
 
+/* Arabic fallback shaping (hb-ot-shaper-arabic-fallback.hh): the lookups
+ * the build tool made from the font's presentation forms, each under its
+ * feature's mask, applied as HarfBuzz applies a GSUB lookup outside a plan
+ * (both joiners skipped, no syllables). */
+static bool arabic_fallback(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
+    if (!(plan->shaper_flags & VEGA_ARABIC_FALLBACK)) return false;
+    static const int forms[4] = {VEGA_MASK_INIT, VEGA_MASK_MEDI, VEGA_MASK_FINA, VEGA_MASK_ISOL};
+    for (uint32_t i = 0; i < s->fallback_count; ++i) {
+        unsigned feature = s->fallback_features[i];
+        uint32_t mask = plan->masks[feature < 4 ? forms[feature] : VEGA_MASK_ARABIC_RLIG];
+        if (!mask) continue;
+        Apply c = {.s = s, .b = b, .table = 0, .t = s->fallback, .lookup_mask = mask, .auto_zwnj = true,
+                   .auto_zwj = true, .has_glyph_classes = s->glyph_classes != 0, .nesting_left = MAX_NESTING_LEVEL,
+                   .random_state = 1, .last_base = -1};
+        apply_string(&c, &s->fallback_lookups[i]);
+    }
+    return true;
+}
+
+/* Stretching (hb-ot-shaper-arabic.cc's apply_stch), after positioning: each
+ * run of stretch pieces fills the width of the word before it, its
+ * repeating pieces copied as often as fits (overlapping a little to fit
+ * closer), fixed pieces once. Measured first, then cut. */
+static bool arabic_word_category(unsigned c) {
+    switch (c) {
+    case VEGA_CN: case VEGA_CO: case VEGA_LM: case VEGA_LO: case VEGA_MC: case VEGA_ME: case VEGA_MN: case VEGA_ND:
+    case VEGA_NL: case VEGA_NO: case VEGA_SC: case VEGA_SK: case VEGA_SM: case VEGA_SO:
+        return true;
+    default:
+        return false;
+    }
+}
+static bool stretching(const Info *i) { return i->action == STCH_FIXED || i->action == STCH_REPEATING; }
+
+static void apply_stch(const VegaShaping *s, VegaShaper *b) {
+    if (!(b->scratch & HAS_STCH)) return;
+    bool rtl = b->direction == VEGA_SHAPE_RTL;
+    if (!rtl) reverse_range(b, 0, b->len, true);
+    size_t extra = 0;
+    for (int cut = 0; cut <= 1; ++cut) {
+        size_t count = b->len, new_len = count + extra, j = new_len;
+        Info *info = b->info;
+        Position *pos = b->pos;
+        for (size_t i = count; i; i--) {
+            if (!stretching(&info[i - 1])) {
+                if (cut) {
+                    --j;
+                    info[j] = info[i - 1];
+                    pos[j] = pos[i - 1];
+                }
+                continue;
+            }
+            int32_t w_total = 0, w_fixed = 0, w_repeating = 0;
+            int n_repeating = 0;
+            size_t end = i;
+            while (i && stretching(&info[i - 1])) {
+                i--;
+                int32_t width = advance_of(s, info[i].codepoint);
+                if (info[i].action == STCH_FIXED) w_fixed += width;
+                else w_repeating += width, n_repeating++;
+            }
+            size_t start = i, context = i;
+            while (context && !stretching(&info[context - 1]) &&
+                   (is_default_ignorable(&info[context - 1]) || arabic_word_category(gen_cat(&info[context - 1])))) {
+                context--;
+                w_total += pos[context].x_advance;
+            }
+            i++;
+            int n_copies = 0;
+            int32_t w_remaining = w_total - w_fixed;
+            if (w_remaining > w_repeating && w_repeating > 0) n_copies = w_remaining / w_repeating - 1;
+            int32_t overlap = 0, shortfall = w_remaining - w_repeating * (n_copies + 1);
+            if (shortfall > 0 && n_repeating > 0) {
+                ++n_copies;
+                int32_t excess = (n_copies + 1) * w_repeating - w_remaining;
+                if (excess > 0) {
+                    overlap = excess / (n_copies * n_repeating);
+                    w_remaining = 0;
+                }
+            }
+            if (!cut) {
+                extra += (size_t)n_copies * (size_t)n_repeating;
+                continue;
+            }
+            int32_t x_offset = w_remaining / 2;
+            for (size_t k = end; k > start; k--) {
+                int32_t width = advance_of(s, info[k - 1].codepoint);
+                unsigned repeat = 1 + (info[k - 1].action == STCH_REPEATING ? (unsigned)n_copies : 0);
+                pos[k - 1].x_advance = 0;
+                for (unsigned n = 0; n < repeat; n++) {
+                    if (rtl) {
+                        x_offset -= width;
+                        if (n > 0) x_offset += overlap;
+                    }
+                    pos[k - 1].x_offset = x_offset;
+                    --j;
+                    info[j] = info[k - 1];
+                    pos[j] = pos[k - 1];
+                    if (!rtl) {
+                        x_offset += width;
+                        if (n > 0) x_offset -= overlap;
+                    }
+                }
+            }
+        }
+        if (!cut) {
+            if (!ensure(b, count + extra)) break;
+        } else
+            b->len = new_len;
+    }
+    if (!rtl) reverse_range(b, 0, b->len, true);
+}
+
 /* The shaper's part of the work at a pause in GSUB; whether it changed the
  * buffer. */
 static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause) {
     switch (plan->shaper) {
+    case VEGA_SHAPER_ARABIC:
+        /* stch just applied: what it multiplied is stretched after positioning */
+        if (pause == VEGA_PAUSE_RECORD_STCH && (plan->shaper_flags & VEGA_ARABIC_STCH))
+            for (size_t i = 0; i < b->len; ++i)
+                if (b->info[i].gprops & MULTIPLIED) {
+                    b->info[i].action = lig_comp(&b->info[i]) % 2 ? STCH_REPEATING : STCH_FIXED;
+                    b->scratch |= HAS_STCH;
+                }
+        return pause == VEGA_PAUSE_ARABIC_FALLBACK && arabic_fallback(s, plan, b);
     case VEGA_SHAPER_INDIC: {
         Indic d = indic_of(s, plan);
         switch (pause) {
@@ -3842,6 +3978,9 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
             b->len = j;
         }
     }
+
+    if (plan.shaper == VEGA_SHAPER_ARABIC) apply_stch(s, b);
+    if (!b->successful) return -1;
 
     if (b->glyphs_allocated < b->len) {
         VegaShaped *glyphs = realloc(b->glyphs, b->len * sizeof(*glyphs));

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The tables HarfBuzz's syllabic shapers read, as C (text/syllabic-data.c).
+"""The tables HarfBuzz's complex shapers read, as C (text/syllabic-data.c).
 
     python3 text/syllabic.py HARFBUZZ_SRC > text/syllabic-data.c
     python3 text/syllabic.py HARFBUZZ_SRC --check
@@ -15,6 +15,10 @@ HARFBUZZ_SRC is HarfBuzz 10.2.0's src/ directory; what is read from it:
 - Each character's category for the Universal Shaping Engine: hb-ot-
   shaper-use-table.hh, whose arrays and lookup (gen-use-table.py's) are
   carried over as they are, the categories named in them resolved.
+
+- Arabic's: each character's joining type (with Syriac's Alaph and
+  Dalath-Rish groups), and the presentation forms and ligatures fallback
+  shaping builds lookups from (hb-ot-shaper-arabic-table.hh).
 
 - The syllable machines: hb-ot-shaper-*-machine.rl, the Ragel grammars.
   This compiles each to a DFA with Ragel's scanner semantics (the longest
@@ -242,6 +246,29 @@ def scan(table, accept, symbols):
     return found
 
 
+# ---- HarfBuzz's generated tables: a flat array (rows commented with the
+# code point they start at, a row's first cells left blank where a range
+# starts inside it) and a lookup of ranges into it
+
+def ranged_table(text, array, function, cell):
+    """Code point to cell for a table whose lookup function returns
+    array[u - first + offset] over ranges; cell() reads one cell's text."""
+    body = text[text.index(f'{array}[] =') :]
+    body = body[body.index('{') + 1:body.index('\n};')]
+    body = re.sub(r'/\*.*?\*/', ' ', body, flags=re.S)
+    body = re.sub(r'#define[^\n]*', ' ', body)
+    cells = cell(body)
+    offsets = {int(k, 16): int(v) for k, v in re.findall(rf'#define {array.split("_")[0]}_offset_0x([0-9a-f]+)u (\d+)', text)}
+    lookup = text[text.index(function):]
+    table = {}
+    for first, last, key in re.findall(r'hb_in_range<hb_codepoint_t> \(u, 0x([0-9A-F]+)u, 0x([0-9A-F]+)u\)\) return '
+                                       rf'{array}\[u - 0x[0-9A-F]+u \+ \w+_offset_0x([0-9a-f]+)u\]', lookup):
+        first, last, at = int(first, 16), int(last, 16), offsets[int(key, 16)]
+        for u in range(first, last + 1):
+            table[u] = cells[at + u - first]
+    return table, lookup
+
+
 # ---- The Indic table
 
 def indic_table(grammars):
@@ -258,12 +285,8 @@ def indic_table(grammars):
     def cell(s, m):
         return short['_OT_' + s], short['_POS_' + m]
 
-    cells = {}
-    table = text[text.index('static const uint16_t indic_table[]'):text.index('}; /* Table items:')]
-    for start, row in re.findall(r'/\* ([0-9A-F]{4,5}) \*/(.*)', table):
-        for k, (s, m) in enumerate(re.findall(r'_\((\w+),(\w+)\)', row)):
-            cells[int(start, 16) + k] = cell(s, m)
-    lookup = text[text.index('hb_indic_get_categories (hb_codepoint_t u)'):]
+    cells, lookup = ranged_table(text, 'indic_table', 'hb_indic_get_categories (hb_codepoint_t u)',
+                                 lambda body: [cell(s, m) for s, m in re.findall(r'_\((\w+),(\w+)\)', body)])
     for code, s, m in re.findall(r'u == 0x([0-9A-F]+)u\)\) return _\((\w+),(\w+)\);', lookup):
         cells[int(code, 16)] = cell(s, m)
     default = cell(*re.search(r'return _\((\w+),(\w+)\);\s*\}', lookup).groups())
@@ -295,6 +318,34 @@ def use_table(grammar):
     expression = re.search(r'return (u<.*?);\n', part).group(1).replace('hb_use_', 'use_')
     assert expression.endswith(':O')
     return arrays, expression[:-1] + str(grammar.symbols['O'])
+
+
+def arabic_tables():
+    """hb-ot-shaper-arabic-table.hh: joining type by code point (U 0, L 1,
+    R 2, D and C 3, Alaph 4, Dalath-Rish 5, T 7, X 8 elsewhere); the
+    presentation forms of U+0621..06D3 (init, medi, fina, isol); the
+    ligature sets, each as (first, ligature, components)."""
+    text = (HB / 'hb-ot-shaper-arabic-table.hh').read_text()
+    values = {'U': 0, 'L': 1, 'R': 2, 'D': 3, 'C': 3, 'A': 4, 'DR': 5, 'T': 7, 'X': 8}
+    joining, _ = ranged_table(text, 'joining_table', 'joining_type (hb_codepoint_t u)',
+                              lambda body: [values[n] for n in re.findall(r'[A-Z]+', body)])
+    shaping = [tuple(int(v, 16) for v in re.findall(r'0x([0-9A-F]{4})u', row))
+               for row in re.findall(r'\{(0x[^}]*)\}, /\* U\+', text[text.index('shaping_table[][4]'):])]
+    first = int(re.search(r'SHAPING_TABLE_FIRST\s+0x([0-9A-F]+)u', text).group(1), 16)
+    last = int(re.search(r'SHAPING_TABLE_LAST\s+0x([0-9A-F]+)u', text).group(1), 16)
+    assert len(shaping) == last - first + 1 and all(len(r) == 4 for r in shaping)
+    ligatures = {}
+    for name in ('ligature_table', 'ligature_mark_table', 'ligature_3_table'):
+        body = text[text.index(f'}} {name}[] =') :]
+        body = body[:body.index('\n};')]
+        sets = []
+        for first_u, entries in re.findall(r'\{ 0x([0-9A-F]+)u, \{(.*?)\}\},', body, re.S):
+            for components, ligature in re.findall(r'\{ \{([^}]*)\}, 0x([0-9A-F]+)u ?\}', entries):
+                sets.append((int(first_u, 16), int(ligature, 16),
+                             [int(c, 16) for c in re.findall(r'0x([0-9A-F]+)u', components)]))
+        assert sets, name
+        ligatures[name] = sets
+    return joining, (first, shaping), ligatures
 
 
 # ---- Checking against Ragel's machines (hb-ot-shaper-*-machine.hh)
@@ -475,6 +526,46 @@ def main():
         out.append('};')
     out.append('static unsigned use_b4(const uint8_t *a, unsigned i) { return (a[i >> 1] >> ((i & 1u) << 2)) & 15u; }')
     out.append(f'uint8_t vega_use_category(uint32_t u) {{ return (uint8_t)({expression}); }}')
+    out.append('')
+    joining, (first, shaping), ligatures = arabic_tables()
+    runs, flat = [], []
+    for a, b in runs_of(joining):
+        runs.append((a, b, len(flat)))
+        flat.extend(joining.get(code, 8) for code in range(a, b + 1))
+    out.append('/* Arabic joining types (hb-ot-shaper-arabic-table.hh, Unicode 16): U 0, L 1, R 2, D and C 3,')
+    out.append(' * Alaph 4, Dalath-Rish 5, T 7; 8 where the general category decides. */')
+    out.append(f'static const uint8_t joining_cells[{len(flat)}] = {{')
+    for k in range(0, len(flat), 32):
+        out.append('    ' + ', '.join(str(v) for v in flat[k:k + 32]) + ',')
+    out.append('};')
+    out.append(f'static const struct {{ uint32_t first, last, at; }} joining_runs[{len(runs)}] = {{')
+    for a, b, at in runs:
+        out.append(f'    {{0x{a:04X}, 0x{b:04X}, {at}}},')
+    out.append('};')
+    out.append('uint8_t vega_arabic_joining(uint32_t u) {')
+    out.append(f'    for (unsigned i = 0; i < {len(runs)} && u >= joining_runs[i].first; ++i)')
+    out.append('        if (u <= joining_runs[i].last) return joining_cells[joining_runs[i].at + u - joining_runs[i].first];')
+    out.append('    return 8;')
+    out.append('}')
+    out.append('')
+    out.append(f'/* Presentation forms of U+{first:04X}..U+{first + len(shaping) - 1:04X}: init, medi, fina, isol. */')
+    out.append(f'const uint16_t vega_arabic_forms[{len(shaping)}][4] = {{')
+    for row in shaping:
+        out.append('    {' + ', '.join(f'0x{v:04X}' for v in row) + '},')
+    out.append('};')
+    out.append('/* Ligatures fallback shaping forms: three components, two, and marks. */')
+    for name, cname in (('ligature_3_table', 'three'), ('ligature_table', 'two'), ('ligature_mark_table', 'marks')):
+        sets = ligatures[name]
+        out.append(f'static const VegaArabicLigature ligatures_{cname}[{len(sets)}] = {{')
+        for first_u, ligature, components in sets:
+            cs = components + [0] * (2 - len(components))
+            out.append(f'    {{0x{first_u:04X}, 0x{ligature:04X}, {{0x{cs[0]:04X}, 0x{cs[1]:04X}}}}},')
+        out.append('};')
+    out.append('const VegaArabicLigatures vega_arabic_ligatures[3] = {')
+    for name, cname, n in (('ligature_3_table', 'three', 3), ('ligature_table', 'two', 2),
+                           ('ligature_mark_table', 'marks', 2)):
+        out.append(f'    {{ligatures_{cname}, {len(ligatures[name])}, {n}}},')
+    out.append('};')
     out.append('')
     out.append('/* The categories syllabic.h names are the machines\' own. */')
     for name, prefix in (('indic', 'VEGA_OT_'), ('khmer', 'VEGA_OT_'), ('myanmar', 'VEGA_OT_'), ('use', 'VEGA_USE_')):

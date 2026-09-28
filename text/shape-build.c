@@ -334,7 +334,9 @@ static int categorize(uint32_t script, hb_tag_t gsub_script) {
     if (script == TAG("Hang")) return VEGA_SHAPER_HANGUL;
     if (script == TAG("Khmr")) return VEGA_SHAPER_KHMER;
     if (script == TAG("Thai") || script == TAG("Laoo")) return VEGA_SHAPER_THAI;
-    if (script == TAG("Syrc") || script == TAG("Qaag")) return -1;
+    /* Syriac is Arabic's, unless the font has only DFLT for it. */
+    if (script == TAG("Syrc")) return gsub_script != HB_OT_TAG_DEFAULT_SCRIPT ? VEGA_SHAPER_ARABIC : VEGA_SHAPER_DEFAULT;
+    if (script == TAG("Qaag")) return -1;
     if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script))
         return dflt ? VEGA_SHAPER_DEFAULT : (gsub_script & 0xFF) == '3' ? VEGA_SHAPER_USE : VEGA_SHAPER_INDIC;
     if (listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script))
@@ -466,7 +468,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     if (shaper == VEGA_SHAPER_ARABIC) {
         m->is_simple = false;
         enable_feature(m, TAG("stch"), F_NONE, 1);
-        add_gsub_pause(m, 0); /* record_stch */
+        add_gsub_pause(m, VEGA_PAUSE_RECORD_STCH);
         enable_feature(m, TAG("ccmp"), F_MANUAL_ZWJ, 1);
         enable_feature(m, TAG("locl"), F_MANUAL_ZWJ, 1);
         add_gsub_pause(m, 0);
@@ -476,7 +478,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
             add_gsub_pause(m, 0);
         }
         enable_feature(m, TAG("rlig"), F_MANUAL_ZWJ | F_HAS_FALLBACK, 1);
-        if (script == HB_SCRIPT_ARABIC) add_gsub_pause(m, 0); /* arabic_fallback_shape */
+        if (script == HB_SCRIPT_ARABIC) add_gsub_pause(m, VEGA_PAUSE_ARABIC_FALLBACK);
         enable_feature(m, TAG("calt"), F_MANUAL_ZWJ, 1);
         if (!has_feature(m, TAG("rclt"))) add_gsub_pause(m, 0);
         enable_feature(m, TAG("liga"), F_MANUAL_ZWJ, 1);
@@ -614,15 +616,15 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     bool zeroes = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC && shaper != VEGA_SHAPER_KHMER;
     bool script_marks = zeroes && shaper != VEGA_SHAPER_MYANMAR && shaper != VEGA_SHAPER_USE && shaper != VEGA_SHAPER_THAI;
     bool adjust = !apply_gpos && (!apply_kern || !kern_table.cross), fallback_marks = adjust && script_marks;
+    bool arabic_fallback = false;
     if (shaper == VEGA_SHAPER_ARABIC) {
-        if (one_mask(m, "stch")) FAIL("%s: the font stretches (stch)", name);
         bool fallback = script == HB_SCRIPT_ARABIC;
         for (int i = 0; i < 7; ++i) {
             const FeatureMap *f = find_feature(m, TAG(arabic_features[i]));
             bool syriac = arabic_features[i][3] == '2' || arabic_features[i][3] == '3';
             fallback = fallback && (syriac || (f && f->needs_fallback));
         }
-        if (fallback) FAIL("%s: the font lacks Arabic's forms (HarfBuzz would fall back)", name);
+        arabic_fallback = fallback;
     }
     hb_direction_t native = hb_script_get_horizontal_direction(script);
     uint32_t frac = one_mask(m, "frac"), numr = one_mask(m, "numr"), dnom = one_mask(m, "dnom");
@@ -641,6 +643,9 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     plan->masks[VEGA_MASK_DNOM] = dnom;
     if (shaper == VEGA_SHAPER_ARABIC || shaper == VEGA_SHAPER_USE)
         for (int i = 0; i < 7; ++i) plan->masks[VEGA_MASK_ISOL + i] = one_mask(m, arabic_features[i]);
+    if (shaper == VEGA_SHAPER_ARABIC) plan->masks[VEGA_MASK_ARABIC_RLIG] = one_mask(m, "rlig");
+    if (arabic_fallback) plan->shaper_flags |= VEGA_ARABIC_FALLBACK;
+    if (shaper == VEGA_SHAPER_ARABIC && one_mask(m, "stch")) plan->shaper_flags |= VEGA_ARABIC_STCH;
     if (shaper == VEGA_SHAPER_USE) plan->masks[VEGA_MASK_USE_RPHF] = one_mask(m, "rphf");
     if (shaper == VEGA_SHAPER_HANGUL) {
         plan->masks[VEGA_MASK_LJMO] = one_mask(m, "ljmo");
@@ -703,6 +708,194 @@ static void align4(Out *o) {
 static void set32(Out *o, size_t at, uint32_t v) {
     if (o->failed) return;
     for (int i = 0; i < 4; ++i) o->bytes[at + i] = (unsigned char)(v >> (8 * i));
+}
+
+/* ---- Arabic fallback shaping (hb-ot-shaper-arabic-fallback.hh): for a font
+ * with presentation forms but no Arabic features, lookups made from its
+ * character map, written as OpenType (the runtime applies them as any
+ * GSUB lookup): single substitutions to the init, medi, fina and isol
+ * forms, and rlig's ligatures of three, of two, and of marks. */
+
+typedef struct { unsigned char *bytes; size_t size, allocated; bool failed; } Bytes;
+static void be16(Bytes *b, uint32_t v) {
+    if (b->failed) return;
+    if (b->size + 2 > b->allocated) {
+        size_t a = b->allocated ? 2 * b->allocated : 256;
+        unsigned char *grown = realloc(b->bytes, a);
+        if (!grown) {
+            b->failed = true;
+            return;
+        }
+        b->bytes = grown;
+        b->allocated = a;
+    }
+    b->bytes[b->size++] = (unsigned char)(v >> 8);
+    b->bytes[b->size++] = (unsigned char)v;
+}
+static void be16_at(Bytes *b, size_t at, uint32_t v) {
+    if (b->failed) return;
+    b->bytes[at] = (unsigned char)(v >> 8);
+    b->bytes[at + 1] = (unsigned char)v;
+}
+
+static bool glyph_of(hb_font_t *font, uint32_t u, uint32_t *glyph) {
+    hb_codepoint_t g;
+    if (!u || !hb_font_get_nominal_glyph(font, u, &g)) return false;
+    *glyph = g;
+    return true;
+}
+
+/* Glyphs sorted stably, their partners carried along; false if two are
+ * the same (the font maps two characters to one glyph). */
+static bool sort_pairs(uint32_t *keys, uint32_t *values, size_t n) {
+    for (size_t i = 1; i < n; ++i)
+        for (size_t j = i; j > 0 && keys[j - 1] > keys[j]; --j) {
+            uint32_t k = keys[j], v = values[j];
+            keys[j] = keys[j - 1], values[j] = values[j - 1];
+            keys[j - 1] = k, values[j - 1] = v;
+        }
+    for (size_t i = 1; i < n; ++i)
+        if (keys[i] == keys[i - 1]) return false;
+    return true;
+}
+
+/* A lookup (type, flags, one subtable) at the end of b; the subtable's
+ * start, for its offsets. */
+static size_t start_lookup(Bytes *b, unsigned type, unsigned flags) {
+    size_t at = b->size;
+    be16(b, type);
+    be16(b, flags);
+    be16(b, 1);
+    be16(b, 8); /* the subtable, right after */
+    return at + 8;
+}
+static void coverage_of(Bytes *b, const uint32_t *glyphs, size_t n) {
+    be16(b, 1);
+    be16(b, (uint32_t)n);
+    for (size_t i = 0; i < n; ++i) be16(b, glyphs[i]);
+}
+
+/* The lookup for fallback feature k into b; false with nothing written
+ * when it would be empty, and *refused when the font cannot have it. */
+static bool fallback_lookup(hb_font_t *font, int k, Bytes *b, bool *refused) {
+    enum { FORMS = VEGA_ARABIC_FORMS_LAST - VEGA_ARABIC_FORMS_FIRST + 1 };
+    if (k < 4) {
+        uint32_t glyphs[FORMS], substitutes[FORMS];
+        size_t n = 0;
+        for (uint32_t u = VEGA_ARABIC_FORMS_FIRST; u <= VEGA_ARABIC_FORMS_LAST; ++u) {
+            uint32_t g, s;
+            if (!glyph_of(font, u, &g) || !glyph_of(font, vega_arabic_forms[u - VEGA_ARABIC_FORMS_FIRST][k], &s) || g == s)
+                continue;
+            glyphs[n] = g;
+            substitutes[n++] = s;
+        }
+        if (!n) return false;
+        if (!sort_pairs(glyphs, substitutes, n)) return !(*refused = true);
+        size_t sub = start_lookup(b, 1, 0x0008);
+        be16(b, 2);
+        be16(b, (uint32_t)(6 + 2 * n)); /* the coverage, after the substitutes */
+        be16(b, (uint32_t)n);
+        for (size_t i = 0; i < n; ++i) be16(b, substitutes[i]);
+        coverage_of(b, glyphs, n);
+        (void)sub;
+        return true;
+    }
+    const VegaArabicLigatures *table = &vega_arabic_ligatures[k - 4];
+    /* its sets: runs of one first character */
+    uint32_t firsts[64], sets[64], set_start[65];
+    size_t n_sets = 0;
+    for (unsigned i = 0; i < table->count; ++i)
+        if (!i || table->ligatures[i].first != table->ligatures[i - 1].first) {
+            if (n_sets == 64) return !(*refused = true);
+            set_start[n_sets++] = i;
+        }
+    set_start[n_sets] = table->count;
+    size_t n = 0;
+    for (size_t i = 0; i < n_sets; ++i)
+        if (glyph_of(font, table->ligatures[set_start[i]].first, &firsts[n])) sets[n++] = (uint32_t)i;
+    if (!sort_pairs(firsts, sets, n)) return !(*refused = true);
+    /* what each set keeps: ligatures whose glyph and components the font has */
+    unsigned total = 0;
+    for (size_t i = 0; i < n; ++i)
+        for (uint32_t l = set_start[sets[i]]; l < set_start[sets[i] + 1]; ++l) {
+            const VegaArabicLigature *lig = &table->ligatures[l];
+            uint32_t g;
+            bool ok = glyph_of(font, lig->ligature, &g);
+            for (unsigned c = 0; ok && c + 1 < table->length; ++c) ok = glyph_of(font, lig->components[c], &g);
+            total += ok;
+        }
+    if (!total) return false;
+    size_t sub = start_lookup(b, 4, k == 6 ? 0 : 0x0008);
+    be16(b, 1);
+    size_t coverage_at = b->size;
+    be16(b, 0);
+    be16(b, (uint32_t)n);
+    size_t offsets_at = b->size;
+    for (size_t i = 0; i < n; ++i) be16(b, 0);
+    for (size_t i = 0; i < n; ++i) {
+        be16_at(b, offsets_at + 2 * i, (uint32_t)(b->size - sub));
+        size_t set_at = b->size, count_at = b->size;
+        be16(b, 0);
+        unsigned count = 0;
+        size_t lig_offsets = b->size;
+        for (uint32_t l = set_start[sets[i]]; l < set_start[sets[i] + 1]; ++l) {
+            const VegaArabicLigature *lig = &table->ligatures[l];
+            uint32_t g;
+            bool ok = glyph_of(font, lig->ligature, &g);
+            for (unsigned c = 0; ok && c + 1 < table->length; ++c) ok = glyph_of(font, lig->components[c], &g);
+            if (ok) be16(b, 0), count++;
+        }
+        be16_at(b, count_at, count);
+        unsigned written = 0;
+        for (uint32_t l = set_start[sets[i]]; l < set_start[sets[i] + 1]; ++l) {
+            const VegaArabicLigature *lig = &table->ligatures[l];
+            uint32_t g, components[2];
+            bool ok = glyph_of(font, lig->ligature, &g);
+            for (unsigned c = 0; ok && c + 1 < table->length; ++c) ok = glyph_of(font, lig->components[c], &components[c]);
+            if (!ok) continue;
+            be16_at(b, lig_offsets + 2 * written++, (uint32_t)(b->size - set_at));
+            be16(b, g);
+            be16(b, table->length);
+            for (unsigned c = 0; c + 1 < table->length; ++c) be16(b, components[c]);
+        }
+    }
+    be16_at(b, coverage_at, (uint32_t)(b->size - sub));
+    coverage_of(b, firsts, n);
+    return true;
+}
+
+/* The fallback lookups as a GSUB table (empty script and feature lists),
+ * and what each lookup is for. */
+static bool fallback_table(hb_font_t *font, Bytes *gsub, uint8_t *features, unsigned *count, char *error,
+                           size_t error_size) {
+    Bytes lookups[7] = {{0}};
+    *count = 0;
+    bool refused = false;
+    for (int k = 0; k < 7 && !refused; ++k)
+        if (fallback_lookup(font, k, &lookups[*count], &refused)) features[(*count)++] = (uint8_t)k;
+    if (refused) {
+        snprintf(error, error_size, "Arab: the font maps two characters to one glyph among those fallback shaping uses");
+        for (int k = 0; k < 7; ++k) free(lookups[k].bytes);
+        return false;
+    }
+    be16(gsub, 1);
+    be16(gsub, 0);
+    be16(gsub, 10); /* scripts */
+    be16(gsub, 12); /* features */
+    be16(gsub, 14); /* lookups */
+    be16(gsub, 0);
+    be16(gsub, 0);
+    be16(gsub, *count);
+    size_t list = 14, offsets = gsub->size;
+    for (unsigned i = 0; i < *count; ++i) be16(gsub, 0);
+    for (unsigned i = 0; i < *count; ++i) {
+        be16_at(gsub, offsets + 2 * i, (uint32_t)(gsub->size - list));
+        for (size_t k = 0; k < lookups[i].size; k += 2) be16(gsub, (uint32_t)lookups[i].bytes[k] << 8 | lookups[i].bytes[k + 1]);
+    }
+    bool failed = gsub->failed || gsub->size > 0xFFFF;
+    for (int k = 0; k < 7; ++k) failed |= lookups[k].failed, free(lookups[k].bytes);
+    if (failed) snprintf(error, error_size, "Arab: fallback lookups: out of memory or over 64 KiB");
+    return !failed;
 }
 
 bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t script_count, const uint32_t *codes,
@@ -793,6 +986,25 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
             put16(&o, (uint32_t)((known ? e.width : 0) & 0xFFFF));
             put16(&o, (uint32_t)((known ? e.height : 0) & 0xFFFF));
         }
+    }
+    bool falls_back = false;
+    for (size_t i = 0; i < plan_count; ++i) falls_back |= plans[i].shaper_flags & VEGA_ARABIC_FALLBACK;
+    if (falls_back) {
+        Bytes gsub = {0};
+        uint8_t features[7] = {0};
+        unsigned count;
+        if (!fallback_table(font, &gsub, features, &count, error, error_size)) {
+            free(gsub.bytes);
+            goto fail;
+        }
+        align4(&o);
+        set32(&o, 76, (uint32_t)o.size);
+        unsigned char head[8] = {(unsigned char)count};
+        memcpy(head + 1, features, 7);
+        put(&o, head, 8);
+        put32(&o, (uint32_t)gsub.size);
+        put(&o, gsub.bytes, gsub.size);
+        free(gsub.bytes);
     }
     align4(&o);
     set32(&o, 48, (uint32_t)plan_count);

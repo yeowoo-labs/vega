@@ -51,4 +51,17 @@ typedef struct {
     unsigned broken;         /* the broken cluster's type, plus one */
 } VegaMachine;
 extern const VegaMachine vega_indic_machine, vega_khmer_machine, vega_myanmar_machine, vega_use_machine;
+
+/* Arabic's joining type (hb-ot-shaper-arabic-table.hh): U 0, L 1, R 2, D and
+ * C 3, Syriac's Alaph 4 and Dalath-Rish 5, T 7, and 8 where the general
+ * category decides (T for Mn, Me and Cf, else U). */
+uint8_t vega_arabic_joining(uint32_t u);
+/* For fallback shaping: the presentation forms (init, medi, fina, isol) of
+ * U+0621..06D3, and the ligatures of presentation forms, in HarfBuzz's
+ * order: those of three components, of two, of marks. */
+enum { VEGA_ARABIC_FORMS_FIRST = 0x0621, VEGA_ARABIC_FORMS_LAST = 0x06D3 };
+extern const uint16_t vega_arabic_forms[VEGA_ARABIC_FORMS_LAST - VEGA_ARABIC_FORMS_FIRST + 1][4];
+typedef struct { uint16_t first, ligature, components[2]; } VegaArabicLigature;
+typedef struct { const VegaArabicLigature *ligatures; unsigned count, length; } VegaArabicLigatures;
+extern const VegaArabicLigatures vega_arabic_ligatures[3];
 #endif

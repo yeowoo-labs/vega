@@ -31,7 +31,12 @@
  *                                          y_bearing, width, height; 0 when
  *                                          no plan positions marks without
  *                                          GPOS; x_bearing INT16_MIN: none),
- *   u32 0
+ *   u32 fallback_offset                   (Arabic fallback shaping, 0 when no
+ *                                          plan falls back: u8 lookups, u8
+ *                                          feature[7] each is for (init,
+ *                                          medi, fina, isol, rlig x3), u32
+ *                                          size, then a GSUB table of just
+ *                                          those lookups)
  * Offsets are from the section's start. A plan (VEGA_PLAN_BYTES):
  *   u32 script (ISO 15924 as a tag: 'Latn'), u8 direction, u8 native
  *   direction (of its script; 0 when it has none), u8 shaper, u8 flags,
@@ -67,18 +72,22 @@ enum { VEGA_MASK_RPHF = VEGA_MASK_SHAPER, VEGA_MASK_PREF, VEGA_MASK_BLWF, VEGA_M
 enum { VEGA_MASK_KHMER_PREF = VEGA_MASK_SHAPER, VEGA_MASK_KHMER_BLWF, VEGA_MASK_KHMER_ABVF, VEGA_MASK_KHMER_PSTF,
        VEGA_MASK_KHMER_CFAR };                                                /* Khmer */
 enum { VEGA_MASK_USE_RPHF = VEGA_MASK_INIT + 1 };         /* USE: that, and Arabic's for its joining forms */
+enum { VEGA_MASK_ARABIC_RLIG = VEGA_MASK_INIT + 1 };      /* Arabic, for fallback shaping */
 /* The stages a plan names: Indic's, whose features decide a consonant's
  * position by whether they would substitute it. */
 enum { VEGA_STAGE_RPHF, VEGA_STAGE_PREF, VEGA_STAGE_BLWF, VEGA_STAGE_PSTF, VEGA_STAGE_VATU };
 /* Shaper flags: Indic's font follows the old specification (deva, not
  * dev2); Thai's font has no Thai script of its own, so its marks take the
- * font's private-use glyphs where it has them. */
-enum { VEGA_INDIC_OLD_SPEC = 1, VEGA_THAI_PUA = 2 };
+ * font's private-use glyphs where it has them; Arabic's font lacks Arabic's
+ * forms, so lookups made from its presentation forms stand in; Arabic's
+ * font stretches (stch) what the stretching feature multiplied. */
+enum { VEGA_INDIC_OLD_SPEC = 1, VEGA_THAI_PUA = 2, VEGA_ARABIC_FALLBACK = 4, VEGA_ARABIC_STCH = 8 };
 /* Step flags; pauses, which the shaper tells apart. */
 enum { VEGA_STEP_AUTO_ZWNJ = 1, VEGA_STEP_AUTO_ZWJ = 2, VEGA_STEP_RANDOM = 4, VEGA_STEP_PER_SYLLABLE = 8 };
 enum { VEGA_STEP_PAUSE = 0xFFFF };
 enum { VEGA_PAUSE_SYLLABLES = 1, VEGA_PAUSE_INITIAL_REORDERING, VEGA_PAUSE_FINAL_REORDERING, VEGA_PAUSE_CLEAR_SYLLABLES,
-       VEGA_PAUSE_CLEAR_SUBSTITUTED, VEGA_PAUSE_RECORD_RPHF, VEGA_PAUSE_RECORD_PREF };
+       VEGA_PAUSE_CLEAR_SUBSTITUTED, VEGA_PAUSE_RECORD_RPHF, VEGA_PAUSE_RECORD_PREF, VEGA_PAUSE_ARABIC_FALLBACK,
+       VEGA_PAUSE_RECORD_STCH };
 
 typedef struct { const unsigned char *p; uint32_t size; } VegaTable;
 /* Which glyphs may be in a set, as three 64-bit patterns of glyph bits
@@ -103,6 +112,10 @@ typedef struct {
     uint32_t cmap_count, plan_count;
     const unsigned char *cmap, *advances, *plans, *steps, *extents;
     VegaTable gdef, gsub, gpos, kern;
+    VegaTable fallback;             /* Arabic fallback shaping's lookups, a GSUB table */
+    uint32_t fallback_count;
+    uint8_t fallback_features[7];   /* what each is for: init, medi, fina, isol, rlig x3 (0..6) */
+    VegaLookup *fallback_lookups;
     uint32_t glyph_classes, attach_classes, mark_sets; /* in GDEF; 0 when absent */
     VegaLookup *lookups[2];         /* GSUB, GPOS */
     uint32_t lookup_count[2];
