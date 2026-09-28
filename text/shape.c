@@ -4060,7 +4060,9 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
             info->gprops = gen_cat(info) != VEGA_MN || is_default_ignorable(info) ? BASE_GLYPH : MARK;
     }
     apply_table(s, &plan, b, 0);
-    if (!b->successful || !ensure(b, b->len)) return -1;
+    /* Past the buffer's bounds (a runaway GSUB), HarfBuzz goes on with the
+     * glyphs of the last pass that finished, every later pass doing
+     * nothing; so does this. */
     position(s, &plan, b);
 
     /* Hide what shows nothing: the space glyph, with nothing to advance. */
@@ -4101,7 +4103,6 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     }
 
     if (plan.shaper == VEGA_SHAPER_ARABIC) apply_stch(s, b);
-    if (!b->successful) return -1;
 
     if (b->glyphs_allocated < b->len) {
         VegaShaped *glyphs = realloc(b->glyphs, b->len * sizeof(*glyphs));

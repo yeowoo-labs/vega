@@ -15,6 +15,3 @@ in-house/arabic-fallback-shaping.tests:6
 
 # Myanmar as Zawgyi encodes it (Qaag; refused).
 in-house/myanmar-zawgyi.tests:*
-
-# No plan for the run.
-text-rendering-tests/GSUB-3.tests:1
