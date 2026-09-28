@@ -10,12 +10,11 @@
 typedef struct { unsigned char *bytes; size_t size; } VegaSection;
 
 /* A section for face: plans for each script (ISO 15924 tags) and both
- * directions, compiled as
- * HarfBuzz's planner compiles it. Refuses a script HarfBuzz shapes with a
- * shaper other than the default, Arabic and Hebrew ones, or a font that
- * needs what those do without GPOS (fallback positioning, 'kern' tables,
- * AAT). glyphs, when given, gets every glyph shaping can reach from codes
- * (for their outlines). */
+ * directions, compiled as HarfBuzz's planner compiles it. Refuses a script
+ * HarfBuzz shapes with a shaper other than the default, Arabic, Hebrew and
+ * Hangul ones, and a font with AAT tables (morx, kerx, trak) or a kern
+ * table of state machines. glyphs, when given, gets every glyph shaping can
+ * reach from codes (for their outlines). */
 bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t script_count, const uint32_t *codes,
                           size_t code_count, VegaSection *out, hb_set_t *glyphs, char *error, size_t error_size);
 

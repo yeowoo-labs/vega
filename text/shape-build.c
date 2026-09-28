@@ -254,8 +254,9 @@ static int categorize(uint32_t script, hb_tag_t gsub_script) {
     bool dflt = gsub_script == HB_OT_TAG_DEFAULT_SCRIPT || gsub_script == TAG("latn");
     if (script == TAG("Arab")) return VEGA_SHAPER_ARABIC;
     if (script == TAG("Hebr")) return VEGA_SHAPER_HEBREW;
-    if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Hang") ||
-        script == TAG("Khmr") || script == TAG("Qaag"))
+    if (script == TAG("Hang")) return VEGA_SHAPER_HANGUL;
+    if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Khmr") ||
+        script == TAG("Qaag"))
         return -1;
     if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script) ||
         listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script))
@@ -274,10 +275,52 @@ static bool has_table(hb_face_t *face, hb_tag_t tag) {
 typedef struct {
     uint32_t script;
     int direction, native, shaper, flags;
-    uint32_t global_mask, masks[VEGA_PLAN_MASKS];
+    uint32_t global_mask, kern_mask, masks[VEGA_PLAN_MASKS];
     LookupMap *lookups[2];
     unsigned lookup_count[2];
 } Plan;
+
+/* What HarfBuzz makes of the font's kern table (hb-ot-kern-table.hh): one
+ * with subtables that pass its checks (data), Apple's state machines among
+ * them (machine), cross-stream kerning (cross); and whether it has what
+ * Vega does not apply (other: a format but pairs, a version but 0 and 1). */
+typedef struct { bool data, machine, cross, other; } Kerning;
+
+static Kerning kerning_of(hb_face_t *face) {
+    Kerning k = {false, false, false, false};
+    hb_blob_t *blob = hb_face_reference_table(face, HB_TAG('k', 'e', 'r', 'n'));
+    unsigned length;
+    const unsigned char *p = (const unsigned char *)hb_blob_get_data(blob, &length);
+    #define U16(at) ((uint64_t)(at) + 2 <= length ? (uint32_t)p[at] << 8 | p[(at) + 1] : 0)
+    #define U32(at) ((uint64_t)(at) + 4 <= length ? U16(at) << 16 | U16((at) + 2) : 0)
+    uint32_t major = U16(0);
+    k.data = U32(0) != 0;
+    k.other = major > 1;
+    bool apple = major == 1, valid = length >= (apple ? 8u : 4u);
+    uint32_t count = apple ? U32(4) : U16(2), header = apple ? 8 : 6;
+    uint64_t at = apple ? 8 : 4;
+    for (uint32_t i = 0; k.data && !k.other && valid && i < count; ++i) {
+        /* each subtable within the table (the last one's pairs may run past
+         * the length it gives: HarfBuzz lets them, for fonts whose 16 bits
+         * overflowed) */
+        valid = at + header <= length;
+        if (!valid) break;
+        uint32_t size = apple ? U32(at) : U16(at + 2);
+        unsigned format = p[at + (apple ? 5 : 4)], coverage = p[at + (apple ? 4 : 5)];
+        valid = size >= header && at + size <= length;
+        uint64_t end = i + 1 < count ? at + size : length;
+        if (valid && format == 0) valid = at + header + 8 + 6 * (uint64_t)U16(at + header) <= end;
+        k.machine |= format == 1;
+        k.other |= format != 0;
+        k.cross |= apple ? coverage & 0x40 : coverage & 4;
+        at += size;
+    }
+    #undef U16
+    #undef U32
+    if (!valid) k = (Kerning){false, false, false, false}; /* HarfBuzz drops a table that fails its checks */
+    hb_blob_destroy(blob);
+    return k;
+}
 
 #define FAIL(...)                                    \
     do {                                             \
@@ -305,6 +348,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
                                             &m->language_index[t]);
     }
     int shaper = categorize(script_tag, m->chosen_script[0]);
+    Kerning kern_table = kerning_of(face);
     if (shaper < 0) FAIL("%s: HarfBuzz shapes it with a shaper Vega does not have", name);
     if (has_table(face, HB_TAG('m', 'o', 'r', 'x')) || has_table(face, HB_TAG('k', 'e', 'r', 'x')) ||
         has_table(face, HB_TAG('t', 'r', 'a', 'k')))
@@ -349,6 +393,12 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         enable_feature(m, TAG("clig"), F_MANUAL_ZWJ, 1);
         enable_feature(m, TAG("mset"), F_MANUAL_ZWJ, 1);
     }
+    if (shaper == VEGA_SHAPER_HANGUL) {
+        m->is_simple = false;
+        add_feature(m, TAG("ljmo"), F_NONE, 1);
+        add_feature(m, TAG("vjmo"), F_NONE, 1);
+        add_feature(m, TAG("tjmo"), F_NONE, 1);
+    }
     enable_feature(m, TAG("Buzz"), F_NONE, 1);
     enable_feature(m, TAG("BUZZ"), F_NONE, 1);
     static const char *const common[] = {"abvm", "blwm", "ccmp", "locl", "mark", "mkmk", "rlig"};
@@ -356,6 +406,8 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         add_feature(m, TAG(common[i]), F_GLOBAL | (i == 4 || i == 5 ? F_MANUAL_ZWNJ | F_MANUAL_ZWJ : 0), 1);
     static const char *const horizontal[] = {"calt", "clig", "curs", "dist", "kern", "liga", "rclt"};
     for (int i = 0; i < 7; ++i) add_feature(m, TAG(horizontal[i]), F_GLOBAL | (i == 4 ? F_HAS_FALLBACK : 0), 1);
+    /* Hangul turns calt off: fonts put jamo lookups there. */
+    if (shaper == VEGA_SHAPER_HANGUL) add_feature(m, TAG("calt"), F_GLOBAL, 0);
     if (!compile_map(m)) FAIL("out of memory");
 
     /* hb_ot_shape_planner_t::compile */
@@ -363,9 +415,12 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     bool has_gpos_kern = kern && kern->index[1] != NO_FEATURE;
     bool disable_gpos = shaper == VEGA_SHAPER_HEBREW && m->chosen_script[1] != TAG("hebr");
     bool apply_gpos = !disable_gpos && hb_ot_layout_has_positioning(face);
-    if ((!has_gpos_kern || !apply_gpos) && has_table(face, HB_TAG('k', 'e', 'r', 'n')))
-        FAIL("%s: HarfBuzz would kern with the font's kern table", name);
-    if (!apply_gpos) FAIL("%s: HarfBuzz would position without GPOS (fallback positioning)", name);
+    bool apply_kern = (!has_gpos_kern || !apply_gpos) && kern_table.data;
+    if (apply_kern && (kern_table.other || kern_table.cross))
+        FAIL("%s: the font's kern table has more than pairs (state machines, classes, cross-stream kerning)", name);
+    /* Hangul's shaper neither zeroes marks nor places them without GPOS. */
+    bool script_marks = shaper != VEGA_SHAPER_HANGUL;
+    bool adjust = !apply_gpos && (!apply_kern || !kern_table.cross), fallback_marks = adjust && script_marks;
     if (shaper == VEGA_SHAPER_ARABIC) {
         if (one_mask(m, "stch")) FAIL("%s: the font stretches (stch)", name);
         bool fallback = script == HB_SCRIPT_ARABIC;
@@ -380,14 +435,21 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     uint32_t frac = one_mask(m, "frac"), numr = one_mask(m, "numr"), dnom = one_mask(m, "dnom");
     *plan = (Plan){script_tag, direction, native == HB_DIRECTION_LTR ? VEGA_SHAPE_LTR : native == HB_DIRECTION_RTL ? VEGA_SHAPE_RTL : 0,
                    shaper,
-                   VEGA_PLAN_GPOS | VEGA_PLAN_ZERO_MARKS | (hb_ot_layout_has_glyph_classes(face) ? 0 : VEGA_PLAN_GUESS_CLASSES) |
-                       (one_mask(m, "mark") ? VEGA_PLAN_GPOS_MARK : 0) | (frac || (numr && dnom) ? VEGA_PLAN_FRACTIONS : 0),
-                   m->global_mask, {0}, {m->lookups[0], m->lookups[1]}, {m->lookup_count[0], m->lookup_count[1]}};
+                   (apply_gpos ? VEGA_PLAN_GPOS : 0) | (script_marks ? VEGA_PLAN_ZERO_MARKS : 0) |
+                       (hb_ot_layout_has_glyph_classes(face) ? 0 : VEGA_PLAN_GUESS_CLASSES) |
+                       (one_mask(m, "mark") ? VEGA_PLAN_GPOS_MARK : 0) | (frac || (numr && dnom) ? VEGA_PLAN_FRACTIONS : 0) |
+                       (apply_kern ? VEGA_PLAN_KERN : 0) | (fallback_marks ? VEGA_PLAN_FALLBACK_MARKS : 0) |
+                       (adjust ? VEGA_PLAN_ADJUST_ZEROING : 0),
+                   m->global_mask, kern ? kern->one_mask : 0, {0}, {m->lookups[0], m->lookups[1]},
+                   {m->lookup_count[0], m->lookup_count[1]}};
     for (int i = 0; i < 7; ++i) plan->masks[VEGA_MASK_ISOL + i] = one_mask(m, arabic_features[i]);
     plan->masks[VEGA_MASK_RTLM] = one_mask(m, "rtlm");
     plan->masks[VEGA_MASK_FRAC] = frac;
     plan->masks[VEGA_MASK_NUMR] = numr;
     plan->masks[VEGA_MASK_DNOM] = dnom;
+    plan->masks[VEGA_MASK_LJMO] = one_mask(m, "ljmo");
+    plan->masks[VEGA_MASK_VJMO] = one_mask(m, "vjmo");
+    plan->masks[VEGA_MASK_TJMO] = one_mask(m, "tjmo");
     free(m);
     return true;
 fail:
@@ -463,7 +525,7 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
     put32(&o, 0);
     put16(&o, hb_face_get_upem(face));
     put16(&o, glyph_count);
-    for (int i = 0; i < 13; ++i) put32(&o, 0);
+    for (int i = 0; i < 17; ++i) put32(&o, 0);
     set32(&o, 12, cmap_count);
     set32(&o, 16, (uint32_t)o.size);
     for (hb_codepoint_t u = HB_SET_VALUE_INVALID; hb_set_next(unicodes, &u);) {
@@ -491,6 +553,38 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
         put(&o, data, length);
         hb_blob_destroy(tables[k]);
     }
+    /* The kern table as it is, for the plans that kern with it; and the
+     * glyphs' ink boxes, for those that place marks without GPOS. */
+    bool kerns = false, boxes = false;
+    for (size_t i = 0; i < plan_count; ++i) {
+        kerns |= plans[i].flags & VEGA_PLAN_KERN;
+        boxes |= plans[i].flags & VEGA_PLAN_FALLBACK_MARKS;
+    }
+    if (kerns) {
+        hb_blob_t *kern = hb_face_reference_table(face, HB_TAG('k', 'e', 'r', 'n'));
+        unsigned length;
+        const char *data = hb_blob_get_data(kern, &length);
+        align4(&o);
+        set32(&o, 64, (uint32_t)o.size);
+        set32(&o, 68, length);
+        put(&o, data, length);
+        hb_blob_destroy(kern);
+    }
+    if (boxes) {
+        align4(&o);
+        set32(&o, 72, (uint32_t)o.size);
+        for (unsigned g = 0; g < glyph_count; ++g) {
+            hb_glyph_extents_t e;
+            bool known = hb_font_get_glyph_extents(font, g, &e);
+            if (known && (e.x_bearing < -32767 || e.x_bearing > 32767 || e.y_bearing < -32768 || e.y_bearing > 32767 ||
+                          e.width < -32768 || e.width > 32767 || e.height < -32768 || e.height > 32767))
+                FAIL("glyph %u: an ink box outside 16 bits", g);
+            put16(&o, known ? (uint32_t)(e.x_bearing & 0xFFFF) : 0x8000);
+            put16(&o, (uint32_t)((known ? e.y_bearing : 0) & 0xFFFF));
+            put16(&o, (uint32_t)((known ? e.width : 0) & 0xFFFF));
+            put16(&o, (uint32_t)((known ? e.height : 0) & 0xFFFF));
+        }
+    }
     align4(&o);
     set32(&o, 48, (uint32_t)plan_count);
     set32(&o, 52, (uint32_t)o.size);
@@ -502,6 +596,7 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
                                   (unsigned char)p->flags};
         put(&o, small, 4);
         put32(&o, p->global_mask);
+        put32(&o, p->kern_mask);
         for (int k = 0; k < VEGA_PLAN_MASKS; ++k) put32(&o, p->masks[k]);
         for (int t = 0; t < 2; ++t) {
             put32(&o, step);
@@ -604,6 +699,40 @@ static void pool_add(Pool *p, uint32_t code) {
 }
 static uint32_t pick(Random *r, const Pool *p) { return p->items[below(r, (uint32_t)p->count)]; }
 
+/* A jamo of one part of a Hangul syllable: half the time one that composes
+ * (whether the font has it or not), half the time any the font has. */
+static uint32_t jamo(Random *r, const Pool *p, uint32_t first, uint32_t count) {
+    return p->count && below(r, 2) ? pick(r, p) : first + below(r, count);
+}
+
+/* A Hangul syllable the ways text spells one (hb-ot-shaper-hangul.cc): jamo
+ * in the orders that compose (L V, L V T, LV T), a syllable whole, jamo in
+ * any order; now and then a tone mark after. jamo holds the font's L, V
+ * and T. */
+static size_t hangul_syllable(Random *r, const Pool *jamo_pools, uint32_t *text, size_t n) {
+    const Pool *l = &jamo_pools[0], *v = &jamo_pools[1], *t = &jamo_pools[2];
+    switch (below(r, 5)) {
+    case 0:
+    case 1:
+        text[n++] = jamo(r, l, 0x1100, 19);
+        text[n++] = jamo(r, v, 0x1161, 21);
+        if (below(r, 2)) text[n++] = jamo(r, t, 0x11A8, 27);
+        break;
+    case 2:
+        text[n++] = 0xAC00 + 28 * below(r, 19 * 21);
+        text[n++] = jamo(r, t, 0x11A8, 27);
+        break;
+    case 3: text[n++] = 0xAC00 + below(r, 11172); break;
+    default:
+        for (unsigned k = 1 + below(r, 3); k--;) {
+            unsigned part = below(r, 3);
+            text[n++] = jamo(r, &jamo_pools[part], part == 0 ? 0x1100 : part == 1 ? 0x1161 : 0x11A8, part == 0 ? 19 : part == 1 ? 21 : 27);
+        }
+    }
+    if (!below(r, 8)) text[n++] = 0x302E + below(r, 2);
+    return n;
+}
+
 static void describe(FILE *report, const char *who, const VegaShaped *g, unsigned count) {
     fprintf(report, "  %-8s", who);
     for (unsigned i = 0; i < count; ++i)
@@ -618,7 +747,8 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     /* Letters of the script, marks it can take (its own and inherited
      * ones), the rest of its characters and Common's (spaces, digits,
      * punctuation), and those whose glyphs some substitution starts from. */
-    Pool letters = {0}, marks = {0}, others = {0}, hot = {0};
+    Pool letters = {0}, marks = {0}, others = {0}, hot = {0}, jamo_pools[3] = {{0}};
+    bool hangul = script == HB_TAG('H', 'a', 'n', 'g');
     hb_set_t *inputs = hb_set_create();
     uint32_t common = HB_TAG('Z', 'y', 'y', 'y'), inherited = HB_TAG('Z', 'i', 'n', 'h');
     for (unsigned t = 0; t < s->lookup_count[0]; ++t)
@@ -629,6 +759,9 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
         hb_codepoint_t glyph;
         if (!hb_font_get_nominal_glyph(font, code, &glyph) || c == VEGA_CC || c == VEGA_CS || c == VEGA_CO) continue;
         bool mark = c == VEGA_MN || c == VEGA_MC || c == VEGA_ME;
+        if (hangul && ((code >= 0x1100 && code <= 0x115F) || (code >= 0xA960 && code <= 0xA97C))) pool_add(&jamo_pools[0], code);
+        if (hangul && ((code >= 0x1160 && code <= 0x11A7) || (code >= 0xD7B0 && code <= 0xD7C6))) pool_add(&jamo_pools[1], code);
+        if (hangul && ((code >= 0x11A8 && code <= 0x11FF) || (code >= 0xD7CB && code <= 0xD7FB))) pool_add(&jamo_pools[2], code);
         if (mark && (of == script || of == inherited)) pool_add(&marks, code);
         else if (!mark && of == script && c >= VEGA_LU && c <= VEGA_LO) pool_add(&letters, code);
         else if (!mark && (of == script || of == common) && c != VEGA_ZL && c != VEGA_ZP) pool_add(&others, code);
@@ -656,6 +789,10 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
                 }
                 unsigned length = 1 + below(&random, 8);
                 for (unsigned k = 0; k < length && n < 200; ++k) {
+                    if (hangul && below(&random, 2)) {
+                        n = hangul_syllable(&random, jamo_pools, text, n);
+                        continue;
+                    }
                     text[n++] = hot.count && below(&random, 3) == 0 ? pick(&random, &hot) : pick(&random, &letters);
                     if (marks.count && below(&random, 100) < mark_rate) {
                         text[n++] = pick(&random, &marks);
@@ -720,4 +857,5 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     free(marks.items);
     free(others.items);
     free(hot.items);
+    for (int k = 0; k < 3; ++k) free(jamo_pools[k].items);
 }

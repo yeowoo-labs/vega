@@ -201,6 +201,11 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
         if (!within(size, at, n)) REFUSE("layout table %d", k);
         *tables[k] = (VegaTable){n ? bytes + at : NULL, n};
     }
+    uint32_t kern = le32(bytes + 64), kern_size = le32(bytes + 68), extents = le32(bytes + 72);
+    if (!within(size, kern, kern_size)) REFUSE("kern table");
+    s->kern = (VegaTable){kern_size ? bytes + kern : NULL, kern_size};
+    if (extents && !within(size, extents, 8 * (uint64_t)s->glyph_count)) REFUSE("extents");
+    s->extents = extents ? bytes + extents : NULL;
     s->plan_count = le32(bytes + 48);
     uint32_t plans = le32(bytes + 52), step_count = le32(bytes + 56), steps = le32(bytes + 60);
     if (!within(size, plans, (uint64_t)s->plan_count * VEGA_PLAN_BYTES)) REFUSE("plans");
@@ -218,9 +223,10 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
         REFUSE("out of memory");
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
-        uint32_t ranges[2][2] = {{le32(p + 56), le32(p + 60)}, {le32(p + 64), le32(p + 68)}};
-        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_HEBREW)
+        uint32_t ranges[2][2] = {{le32(p + 72), le32(p + 76)}, {le32(p + 80), le32(p + 84)}};
+        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_HANGUL)
             REFUSE("plan %u", i);
+        if ((p[7] & VEGA_PLAN_FALLBACK_MARKS) && !s->extents) REFUSE("plan %u: marks placed without extents", i);
         for (int table = 0; table < 2; ++table) {
             if (ranges[table][0] > step_count || ranges[table][1] > step_count - ranges[table][0])
                 REFUSE("plan %u: steps", i);
@@ -382,6 +388,21 @@ static void output_glyph(VegaShaper *b, uint32_t glyph) {
     if (b->idx == b->len && !b->out_len) return;
     b->out[b->out_len] = b->idx < b->len ? b->info[b->idx] : b->out[b->out_len - 1];
     b->out[b->out_len++].codepoint = glyph;
+}
+
+/* num_in glyphs become num_out, each a copy of the first with its own
+ * codepoint; their clusters merge. */
+static void merge_clusters(VegaShaper *b, size_t start, size_t end);
+static void replace_glyphs(VegaShaper *b, size_t num_in, size_t num_out, const uint32_t *glyphs) {
+    if (!ensure(b, b->out_len + num_out)) return;
+    merge_clusters(b, b->idx, b->idx + num_in);
+    Info original = b->idx < b->len ? b->info[b->idx] : b->out[b->out_len - 1];
+    for (size_t i = 0; i < num_out; ++i) {
+        b->out[b->out_len + i] = original;
+        b->out[b->out_len + i].codepoint = glyphs[i];
+    }
+    b->idx += num_in;
+    b->out_len += num_out;
 }
 
 static void sync(VegaShaper *b) {
@@ -654,7 +675,7 @@ static void form_clusters(VegaShaper *b) {
 typedef struct {
     uint32_t script;
     int direction, native, shaper, flags;
-    uint32_t global_mask, masks[VEGA_PLAN_MASKS];
+    uint32_t global_mask, kern_mask, masks[VEGA_PLAN_MASKS];
     const unsigned char *gsub, *gpos;
     uint32_t gsub_count, gpos_count;
 } Plan;
@@ -667,10 +688,10 @@ static bool find_plan(const VegaShaping *s, uint32_t script, int direction, Plan
             if (le32(p) == (pass ? 0x5A797979u : script) && p[4] == direction) found = p;
         }
     if (!found) return false;
-    *plan = (Plan){le32(found), found[4], found[5], found[6], found[7], le32(found + 8), {0},
-                   s->steps + (size_t)le32(found + 56) * VEGA_STEP_BYTES,
-                   s->steps + (size_t)le32(found + 64) * VEGA_STEP_BYTES, le32(found + 60), le32(found + 68)};
-    for (int k = 0; k < VEGA_PLAN_MASKS; ++k) plan->masks[k] = le32(found + 12 + 4 * k);
+    *plan = (Plan){le32(found), found[4], found[5], found[6], found[7], le32(found + 8), le32(found + 12), {0},
+                   s->steps + (size_t)le32(found + 72) * VEGA_STEP_BYTES,
+                   s->steps + (size_t)le32(found + 80) * VEGA_STEP_BYTES, le32(found + 76), le32(found + 84)};
+    for (int k = 0; k < VEGA_PLAN_MASKS; ++k) plan->masks[k] = le32(found + 16 + 4 * k);
     return true;
 }
 
@@ -952,8 +973,10 @@ static void reorder_marks_hebrew(VegaShaper *b, size_t start, size_t end) {
 static void normalize(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     if (!b->len) return;
     Normalizer c = {s, plan, b};
-    /* The shapers' preference is "auto": composed diacritics. */
-    const bool might_short_circuit = true, always_short_circuit = false;
+    /* The shapers' preference is "auto" (composed diacritics); Hangul's is
+     * none: what the font has stays, and nothing is composed again. */
+    const bool none = plan->shaper == VEGA_SHAPER_HANGUL;
+    const bool might_short_circuit = true, always_short_circuit = none;
     bool all_simple = true;
     clear_output(b);
     size_t count = b->len;
@@ -997,7 +1020,7 @@ static void normalize(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
                 (!info_cc(&b->info[i + 1]) || info_cc(&b->info[i - 1]) <= info_cc(&b->info[i + 1])))
                 b->info[i].uprops &= (uint16_t)~UPROPS_HIDDEN;
 
-    if (!all_simple && b->successful) {
+    if (!all_simple && b->successful && !none) {
         clear_output(b);
         count = b->len;
         size_t starter = 0;
@@ -1088,6 +1111,118 @@ static void setup_masks_arabic(VegaShaper *b, const Plan *plan) {
     }
     for (size_t i = 0; i < b->len; ++i)
         if (b->info[i].action < NONE) b->info[i].mask |= plan->masks[VEGA_MASK_ISOL + b->info[i].action];
+}
+
+/* ---- Hangul (hb-ot-shaper-hangul.cc): a syllable the font has whole is
+ * composed; one it lacks is taken apart into jamo, which the ljmo, vjmo and
+ * tjmo features then shape; a tone mark goes before its syllable. */
+
+enum { LJMO = 1, VJMO = 2, TJMO = 3 };
+static bool combining_l(uint32_t u) { return u >= LBASE && u < LBASE + LCOUNT; }
+static bool combining_v(uint32_t u) { return u >= VBASE && u < VBASE + VCOUNT; }
+static bool combining_t(uint32_t u) { return u > TBASE && u < TBASE + TCOUNT; }
+static bool jamo_l(uint32_t u) { return (u >= 0x1100 && u <= 0x115F) || (u >= 0xA960 && u <= 0xA97C); }
+static bool jamo_v(uint32_t u) { return (u >= 0x1160 && u <= 0x11A7) || (u >= 0xD7B0 && u <= 0xD7C6); }
+static bool jamo_t(uint32_t u) { return (u >= 0x11A8 && u <= 0x11FF) || (u >= 0xD7CB && u <= 0xD7FB); }
+static bool zero_width(const VegaShaping *s, uint32_t u) {
+    uint32_t glyph;
+    return nominal(s, u, &glyph) && advance_of(s, glyph) == 0;
+}
+
+static void preprocess_hangul(const VegaShaping *s, VegaShaper *b) {
+    clear_output(b);
+    size_t start = 0, end = 0; /* the last syllable, when start < end */
+    uint32_t glyph;
+    while (b->idx < b->len && b->successful) {
+        uint32_t u = b->info[b->idx].codepoint;
+        if (u == 0x302E || u == 0x302F) {
+            if (start < end && end == b->out_len) {
+                /* a tone mark goes before its syllable, unless it overstrikes */
+                next_glyph(b);
+                if (!zero_width(s, u)) {
+                    merge_out_clusters(b, start, end + 1);
+                    Info tone = b->out[end];
+                    memmove(&b->out[start + 1], &b->out[start], (end - start) * sizeof(Info));
+                    b->out[start] = tone;
+                }
+            } else if (nominal(s, 0x25CC, &glyph)) {
+                uint32_t chars[2] = {u, 0x25CC};
+                if (zero_width(s, u)) chars[0] = 0x25CC, chars[1] = u;
+                replace_glyphs(b, 1, 2, chars);
+            } else
+                next_glyph(b);
+            start = end = b->out_len;
+            continue;
+        }
+        start = b->out_len;
+        if (jamo_l(u) && b->idx + 1 < b->len) {
+            uint32_t l = u, v = b->info[b->idx + 1].codepoint;
+            if (jamo_v(v)) {
+                uint32_t t = 0, tindex = 0;
+                if (b->idx + 2 < b->len) {
+                    t = b->info[b->idx + 2].codepoint;
+                    if (jamo_t(t)) tindex = t - TBASE;
+                    else t = 0;
+                }
+                if (combining_l(l) && combining_v(v) && (!t || combining_t(t))) {
+                    uint32_t syllable = SBASE + (l - LBASE) * NCOUNT + (v - VBASE) * TCOUNT + tindex;
+                    if (nominal(s, syllable, &glyph)) {
+                        replace_glyphs(b, t ? 3 : 2, 1, &syllable);
+                        end = start + 1;
+                        continue;
+                    }
+                }
+                b->info[b->idx].action = LJMO;
+                next_glyph(b);
+                b->info[b->idx].action = VJMO;
+                next_glyph(b);
+                if (t) {
+                    b->info[b->idx].action = TJMO;
+                    next_glyph(b);
+                    end = start + 3;
+                } else
+                    end = start + 2;
+                merge_out_clusters(b, start, end);
+                continue;
+            }
+        } else if (u - SBASE < SCOUNT) {
+            bool has = nominal(s, u, &glyph);
+            uint32_t lindex = (u - SBASE) / NCOUNT, nindex = (u - SBASE) % NCOUNT, vindex = nindex / TCOUNT,
+                     tindex = nindex % TCOUNT;
+            if (!tindex && b->idx + 1 < b->len && combining_t(b->info[b->idx + 1].codepoint)) {
+                uint32_t whole = u + (b->info[b->idx + 1].codepoint - TBASE);
+                if (nominal(s, whole, &glyph)) {
+                    replace_glyphs(b, 2, 1, &whole);
+                    end = start + 1;
+                    continue;
+                }
+            }
+            if (!has || (!tindex && b->idx + 1 < b->len && jamo_t(b->info[b->idx + 1].codepoint))) {
+                uint32_t parts[3] = {LBASE + lindex, VBASE + vindex, TBASE + tindex};
+                if (nominal(s, parts[0], &glyph) && nominal(s, parts[1], &glyph) && (!tindex || nominal(s, parts[2], &glyph))) {
+                    size_t n = tindex ? 3 : 2;
+                    replace_glyphs(b, 1, n, parts);
+                    if (has && !tindex) { /* the T that did not combine is part of it */
+                        next_glyph(b);
+                        ++n;
+                    }
+                    end = start + n;
+                    b->out[start].action = LJMO;
+                    b->out[start + 1].action = VJMO;
+                    if (start + 2 < end) b->out[start + 2].action = TJMO;
+                    merge_out_clusters(b, start, end);
+                    continue;
+                }
+            }
+            if (has) {
+                end = start + 1;
+                next_glyph(b);
+                continue;
+            }
+        }
+        next_glyph(b);
+    }
+    sync(b);
 }
 
 /* ---- Applying lookups (hb-ot-layout-gsubgpos.hh) */
@@ -1986,6 +2121,268 @@ static void apply_table(const VegaShaping *s, VegaShaper *b, int table, const un
     }
 }
 
+/* ---- The kern table (hb-ot-kern-table.hh, hb-kern.hh): OpenType's (version
+ * 0) and Apple's (1.0), their pair subtables (format 0), each a pass over
+ * the glyphs with marks skipped, the kerning split between the pair. (The
+ * build tool refuses the other formats, and cross-stream kerning, which no
+ * font installed here has.) */
+
+static uint32_t get8(VegaTable t, uint32_t at) { return at < t.size ? t.p[at] : 0; }
+
+static int32_t kern_pair(VegaTable t, uint32_t pairs, uint32_t left, uint32_t right) {
+    /* hb_bsearch's probes, so a table out of order answers as it does */
+    int low = 0, high = (int)get16(t, pairs) - 1;
+    uint32_t key = left << 16 | right;
+    while (low <= high) {
+        int middle = (int)(((unsigned)low + (unsigned)high) / 2);
+        uint32_t at = pairs + 8 + 6 * (uint32_t)middle, pair = get16(t, at) << 16 | get16(t, at + 2);
+        if (key < pair) high = middle - 1;
+        else if (key > pair) low = middle + 1;
+        else return gets16(t, at + 4);
+    }
+    return 0;
+}
+
+static void kern_table(const VegaShaping *s, VegaShaper *b, const Plan *plan) {
+    VegaTable t = s->kern;
+    uint32_t major = get16(t, 0);
+    if (major > 1 || !plan->kern_mask) return;
+    bool apple = major == 1;
+    uint32_t count = apple ? get32(t, 4) : get16(t, 2), at = apple ? 8 : 4;
+    for (uint32_t k = 0; k < count && at < t.size; ++k) {
+        uint32_t length = apple ? get32(t, at) : get16(t, at + 2);
+        unsigned format = get8(t, at + (apple ? 5 : 4)), coverage = get8(t, at + (apple ? 4 : 5));
+        bool horizontal = apple ? !(coverage & 0x80) : coverage & 1;
+        uint32_t pairs = at + (apple ? 8 : 6);
+        at += length ? length : t.size;
+        if ((apple && (coverage & 0x20)) || !horizontal || format != 0) continue;
+        bool reverse = b->direction == VEGA_SHAPE_RTL;
+        if (reverse) reverse_range(b, 0, b->len, true);
+        Apply c = {s, b, 1, s->gpos, plan->kern_mask, 0x08, true, true, false, s->glyph_classes != 0, MAX_NESTING_LEVEL, 1,
+                   -1, 0, {{0, 0, 0}}};
+        for (size_t idx = 0; idx < b->len;) {
+            if (!(b->info[idx].mask & plan->kern_mask)) {
+                idx++;
+                continue;
+            }
+            Skippy it;
+            skippy_init(&it, &c, false, idx);
+            if (!skippy_next(&it, NULL)) {
+                idx++;
+                continue;
+            }
+            size_t i = idx, j = it.idx;
+            int32_t kern = kern_pair(t, pairs, b->info[i].codepoint, b->info[j].codepoint);
+            if (kern) {
+                int32_t first = kern >> 1, second = kern - first;
+                b->pos[i].x_advance += first;
+                b->pos[j].x_advance += second;
+                b->pos[j].x_offset += second;
+            }
+            idx = j;
+        }
+        if (reverse) reverse_range(b, 0, b->len, true);
+    }
+}
+
+/* ---- Marks without GPOS (hb-ot-shape-fallback.cc): each mark placed around
+ * its base by its combining class and the glyphs' ink boxes. */
+
+typedef struct { int32_t x_bearing, y_bearing, width, height; } Extents;
+
+static bool extents_of(const VegaShaping *s, uint32_t glyph, Extents *e) {
+    if (!s->extents || glyph >= s->glyph_count) return false;
+    const unsigned char *p = s->extents + 8 * (size_t)glyph;
+    int16_t x = (int16_t)le16(p);
+    if (x == INT16_MIN) return false;
+    *e = (Extents){x, (int16_t)le16(p + 2), (int16_t)le16(p + 4), (int16_t)le16(p + 6)};
+    return true;
+}
+
+enum { CC_ATTACHED_BELOW_LEFT = 200, CC_ATTACHED_BELOW = 202, CC_ATTACHED_ABOVE = 214, CC_ATTACHED_ABOVE_RIGHT = 216,
+       CC_BELOW_LEFT = 218, CC_BELOW = 220, CC_BELOW_RIGHT = 222, CC_ABOVE_LEFT = 228, CC_ABOVE = 230,
+       CC_ABOVE_RIGHT = 232, CC_DOUBLE_BELOW = 233, CC_DOUBLE_ABOVE = 234 };
+
+/* Where the classes put marks, for those HarfBuzz reorders by other classes. */
+static unsigned recategorize(uint32_t u, unsigned klass) {
+    if (klass >= 200) return klass;
+    if ((u & ~0xFFu) == 0x0E00) {
+        if (!klass) {
+            switch (u) {
+            case 0x0E31: case 0x0E34: case 0x0E35: case 0x0E36: case 0x0E37: case 0x0E47: case 0x0E4C: case 0x0E4D:
+            case 0x0E4E: klass = CC_ABOVE_RIGHT; break;
+            case 0x0EB1: case 0x0EB4: case 0x0EB5: case 0x0EB6: case 0x0EB7: case 0x0EBB: case 0x0ECC: case 0x0ECD:
+                klass = CC_ABOVE; break;
+            case 0x0EBC: klass = CC_BELOW; break;
+            }
+        } else if (u == 0x0E3A)
+            klass = CC_BELOW_RIGHT;
+    }
+    switch (klass) {
+    case 22: case 15: case 16: case 17: case 23: case 18: case 19: case 20: case 21: case 24: case 25:
+        return CC_BELOW;                           /* Hebrew points below, meteg */
+    case 13: return CC_ATTACHED_ABOVE;             /* rafe */
+    case 10: return CC_ABOVE_RIGHT;                /* shin dot */
+    case 11: case 14: return CC_ABOVE_LEFT;        /* sin dot, holam */
+    case 26: return CC_ABOVE;                      /* point varika */
+    case 12: return klass;                         /* dagesh */
+    case 28: case 29: case 31: case 32: case 27: case 34: case 35: case 36:
+        return CC_ABOVE;                           /* Arabic and Syriac above */
+    case 30: case 33: return CC_BELOW;             /* kasratan, kasra */
+    case 3: return CC_BELOW_RIGHT;                 /* Thai sara u, uu */
+    case 107: return CC_ABOVE_RIGHT;               /* Thai mai */
+    case 118: return CC_BELOW;                     /* Lao sign u, uu */
+    case 122: return CC_ABOVE;                     /* Lao mai */
+    case 129: return CC_BELOW;                     /* Tibetan sign aa */
+    case 132: return CC_ABOVE;                     /* sign i */
+    case 131: return CC_BELOW;                     /* sign u */
+    default: return klass;
+    }
+}
+
+static void position_mark(const VegaShaping *s, int direction, uint32_t glyph, Position *pos, Extents *base,
+                          unsigned klass) {
+    Extents mark;
+    if (!extents_of(s, glyph, &mark)) return;
+    int32_t y_gap = s->upem / 16;
+    pos->x_offset = pos->y_offset = 0;
+    switch (klass) {
+    case CC_DOUBLE_BELOW:
+    case CC_DOUBLE_ABOVE:
+        if (direction == VEGA_SHAPE_LTR) pos->x_offset += base->x_bearing + base->width - mark.width / 2 - mark.x_bearing;
+        else pos->x_offset += base->x_bearing - mark.width / 2 - mark.x_bearing;
+        break;
+    case CC_ATTACHED_BELOW_LEFT: case CC_BELOW_LEFT: case CC_ABOVE_LEFT:
+        pos->x_offset += base->x_bearing - mark.x_bearing;
+        break;
+    case CC_ATTACHED_ABOVE_RIGHT: case CC_BELOW_RIGHT: case CC_ABOVE_RIGHT:
+        pos->x_offset += base->x_bearing + base->width - mark.width - mark.x_bearing;
+        break;
+    default:
+        pos->x_offset += base->x_bearing + (base->width - mark.width) / 2 - mark.x_bearing;
+        break;
+    }
+    switch (klass) {
+    case CC_DOUBLE_BELOW: case CC_BELOW_LEFT: case CC_BELOW: case CC_BELOW_RIGHT:
+        base->height -= y_gap;
+        /* fall through */
+    case CC_ATTACHED_BELOW_LEFT: case CC_ATTACHED_BELOW:
+        pos->y_offset = base->y_bearing + base->height - mark.y_bearing;
+        if ((y_gap > 0) == (pos->y_offset > 0)) { /* below marks never go up */
+            base->height -= pos->y_offset;
+            pos->y_offset = 0;
+        }
+        base->height += mark.height;
+        break;
+    case CC_DOUBLE_ABOVE: case CC_ABOVE_LEFT: case CC_ABOVE: case CC_ABOVE_RIGHT:
+        base->y_bearing += y_gap;
+        base->height -= y_gap;
+        /* fall through */
+    case CC_ATTACHED_ABOVE: case CC_ATTACHED_ABOVE_RIGHT: {
+        pos->y_offset = base->y_bearing - (mark.y_bearing + mark.height);
+        if ((y_gap > 0) != (pos->y_offset > 0)) { /* nor above marks too far down */
+            int32_t correction = -pos->y_offset / 2;
+            base->y_bearing += correction;
+            base->height -= correction;
+            pos->y_offset += correction;
+        }
+        base->y_bearing -= mark.height;
+        base->height += mark.height;
+        break;
+    }
+    default: break;
+    }
+}
+
+static void zero_mark_advances(VegaShaper *b, size_t start, size_t end, bool adjust) {
+    for (size_t i = start; i < end; ++i)
+        if (gen_cat(&b->info[i]) == VEGA_MN) {
+            if (adjust) {
+                b->pos[i].x_offset -= b->pos[i].x_advance;
+                b->pos[i].y_offset -= b->pos[i].y_advance;
+            }
+            b->pos[i].x_advance = b->pos[i].y_advance = 0;
+        }
+}
+
+static void position_around_base(const VegaShaping *s, const Plan *plan, VegaShaper *b, size_t base, size_t end,
+                                 bool adjust) {
+    Extents base_extents;
+    if (!extents_of(s, b->info[base].codepoint, &base_extents)) {
+        zero_mark_advances(b, base + 1, end, adjust);
+        return;
+    }
+    base_extents.y_bearing += b->pos[base].y_offset;
+    base_extents.x_bearing = 0;
+    base_extents.width = advance_of(s, b->info[base].codepoint);
+    unsigned id = lig_id(&b->info[base]);
+    int components = lig_num_comps(&b->info[base]);
+    int32_t x_offset = 0, y_offset = 0;
+    bool forward = b->direction == VEGA_SHAPE_LTR;
+    if (forward) {
+        x_offset -= b->pos[base].x_advance;
+        y_offset -= b->pos[base].y_advance;
+    }
+    Extents component = base_extents, cluster = base_extents;
+    int last_component = -1;
+    unsigned last_class = 255;
+    for (size_t i = base + 1; i < end; ++i) {
+        unsigned klass = info_cc(&b->info[i]);
+        if (klass) {
+            if (components > 1) {
+                unsigned this_id = lig_id(&b->info[i]);
+                int this_component = lig_comp(&b->info[i]) - 1;
+                if (!id || id != this_id || this_component >= components) this_component = components - 1;
+                if (last_component != this_component) {
+                    last_component = this_component;
+                    last_class = 255;
+                    component = base_extents;
+                    if (plan->direction == VEGA_SHAPE_LTR)
+                        component.x_bearing += this_component * component.width / components;
+                    else
+                        component.x_bearing += (components - 1 - this_component) * component.width / components;
+                    component.width /= components;
+                }
+            }
+            if (last_class != klass) {
+                last_class = klass;
+                cluster = component;
+            }
+            position_mark(s, b->direction, b->info[i].codepoint, &b->pos[i], &cluster, klass);
+            b->pos[i].x_advance = b->pos[i].y_advance = 0;
+            b->pos[i].x_offset += x_offset;
+            b->pos[i].y_offset += y_offset;
+        } else if (forward) {
+            x_offset -= b->pos[i].x_advance;
+            y_offset -= b->pos[i].y_advance;
+        } else {
+            x_offset += b->pos[i].x_advance;
+            y_offset += b->pos[i].y_advance;
+        }
+    }
+}
+
+static void position_cluster(const VegaShaping *s, const Plan *plan, VegaShaper *b, size_t start, size_t end, bool adjust) {
+    if (end - start < 2) return;
+    for (size_t i = start; i < end; ++i)
+        if (!is_unicode_mark(&b->info[i])) {
+            size_t j = i + 1;
+            while (j < end && is_unicode_mark(&b->info[j])) j++;
+            position_around_base(s, plan, b, i, j, adjust);
+            i = j - 1;
+        }
+}
+
+static void fallback_marks(const VegaShaping *s, const Plan *plan, VegaShaper *b, bool adjust) {
+    size_t start = 0;
+    for (size_t i = 1; i < b->len; ++i)
+        if (!is_unicode_mark(&b->info[i])) {
+            position_cluster(s, plan, b, start, i, adjust);
+            start = i;
+        }
+    position_cluster(s, plan, b, start, b->len, adjust);
+}
+
 /* ---- Positions */
 
 static void fallback_spaces(const VegaShaping *s, VegaShaper *b) {
@@ -2049,16 +2446,25 @@ static void position(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     memset(b->pos, 0, b->len * sizeof(Position));
     for (size_t i = 0; i < b->len; ++i) b->pos[i].x_advance = advance_of(s, b->info[i].codepoint);
     if (b->scratch & HAS_SPACE_FALLBACK) fallback_spaces(s, b);
+    bool adjust = (plan->flags & VEGA_PLAN_ADJUST_ZEROING) && b->direction == VEGA_SHAPE_LTR;
     if (plan->flags & VEGA_PLAN_GPOS) apply_table(s, b, 1, plan->gpos, plan->gpos_count);
+    if (plan->flags & VEGA_PLAN_KERN) kern_table(s, b, plan);
     if (plan->flags & VEGA_PLAN_ZERO_MARKS)
         for (size_t i = 0; i < b->len; ++i)
-            if (b->info[i].gprops & MARK) b->pos[i].x_advance = b->pos[i].y_advance = 0;
+            if (b->info[i].gprops & MARK) {
+                if (adjust) {
+                    b->pos[i].x_offset -= b->pos[i].x_advance;
+                    b->pos[i].y_offset -= b->pos[i].y_advance;
+                }
+                b->pos[i].x_advance = b->pos[i].y_advance = 0;
+            }
     if (b->scratch & HAS_DEFAULT_IGNORABLES)
         for (size_t i = 0; i < b->len; ++i)
             if (is_default_ignorable(&b->info[i]))
                 b->pos[i].x_advance = b->pos[i].y_advance = b->pos[i].x_offset = b->pos[i].y_offset = 0;
     if (b->scratch & HAS_GPOS_ATTACHMENT)
         for (size_t i = 0; i < b->len; ++i) propagate_attachment_offsets(b->pos, b->len, i, b->direction, MAX_NESTING_LEVEL);
+    if (plan->flags & VEGA_PLAN_FALLBACK_MARKS) fallback_marks(s, plan, b, adjust);
     if (b->direction == VEGA_SHAPE_RTL) reverse_range(b, 0, b->len, true);
 }
 
@@ -2082,6 +2488,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     set_unicode_props(b);
     form_clusters(b);
     ensure_native_direction(b, &plan);
+    if (plan.shaper == VEGA_SHAPER_HANGUL) preprocess_hangul(s, b);
 
     /* Mirror what the font mirrors; mark the rest for rtlm. */
     if (direction == VEGA_SHAPE_RTL)
@@ -2093,6 +2500,13 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     normalize(s, &plan, b);
     setup_masks_fraction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_ARABIC) setup_masks_arabic(b, &plan);
+    if (plan.shaper == VEGA_SHAPER_HANGUL)
+        for (size_t i = 0; i < b->len; ++i)
+            if (b->info[i].action >= LJMO && b->info[i].action <= TJMO)
+                b->info[i].mask |= plan.masks[VEGA_MASK_LJMO + b->info[i].action - LJMO];
+    if (plan.flags & VEGA_PLAN_FALLBACK_MARKS)
+        for (size_t i = 0; i < b->len; ++i)
+            if (gen_cat(&b->info[i]) == VEGA_MN) set_info_cc(&b->info[i], recategorize(b->info[i].codepoint, info_cc(&b->info[i])));
     for (size_t i = 0; i < b->len; ++i) {
         Info *info = &b->info[i];
         info->codepoint = info->glyph_index;

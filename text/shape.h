@@ -24,22 +24,33 @@
  *   u32 advances_offset                   (glyph_count u16),
  *   u32 offset, u32 size of GDEF, of GSUB and of GPOS (0 0 when absent),
  *   u32 plan_count, u32 plans_offset      (VEGA_PLAN_BYTES each),
- *   u32 step_count, u32 steps_offset      (8 bytes each)
+ *   u32 step_count, u32 steps_offset      (8 bytes each),
+ *   u32 offset, u32 size of the kern table (0 0 when absent),
+ *   u32 extents_offset                    (glyph_count of i16 x_bearing,
+ *                                          y_bearing, width, height; 0 when
+ *                                          no plan positions marks without
+ *                                          GPOS; x_bearing INT16_MIN: none),
+ *   u32 0
  * Offsets are from the section's start. A plan:
  *   u32 script (ISO 15924 as a tag: 'Latn'), u8 direction, u8 native
  *   direction (of its script; 0 when it has none), u8 shaper, u8 flags,
- *   u32 global mask, u32 masks[VEGA_PLAN_MASKS], u32 first GSUB step,
- *   u32 GSUB steps, u32 first GPOS step, u32 GPOS steps.
+ *   u32 global mask, u32 kern mask, u32 masks[VEGA_PLAN_MASKS], u32 first
+ *   GSUB step, u32 GSUB steps, u32 first GPOS step, u32 GPOS steps.
  * A step, a lookup to run: u16 lookup index, u8 flags, u8 0, u32 mask. */
-enum { VEGA_SHAPING_HEADER = 64, VEGA_PLAN_BYTES = 72, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 11 };
+enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 88, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 14 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
-enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW };
-/* Plan flags. */
+enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL };
+/* Plan flags: GPOS runs; mark advances are zeroed after it (by GDEF); glyph
+ * classes come from Unicode (the font has none); the font positions marks
+ * (a 'mark' feature); automatic fractions; the kern table kerns; marks are
+ * placed around their base without GPOS, and zeroing a mark's advance keeps
+ * it where it was. */
 enum { VEGA_PLAN_GPOS = 1, VEGA_PLAN_ZERO_MARKS = 2, VEGA_PLAN_GUESS_CLASSES = 4, VEGA_PLAN_GPOS_MARK = 8,
-       VEGA_PLAN_FRACTIONS = 16 };
+       VEGA_PLAN_FRACTIONS = 16, VEGA_PLAN_KERN = 32, VEGA_PLAN_FALLBACK_MARKS = 64, VEGA_PLAN_ADJUST_ZEROING = 128 };
 /* The masks a plan names, for the features set glyph by glyph. */
 enum { VEGA_MASK_ISOL, VEGA_MASK_FINA, VEGA_MASK_FIN2, VEGA_MASK_FIN3, VEGA_MASK_MEDI, VEGA_MASK_MED2,
-       VEGA_MASK_INIT, VEGA_MASK_RTLM, VEGA_MASK_FRAC, VEGA_MASK_NUMR, VEGA_MASK_DNOM };
+       VEGA_MASK_INIT, VEGA_MASK_RTLM, VEGA_MASK_FRAC, VEGA_MASK_NUMR, VEGA_MASK_DNOM, VEGA_MASK_LJMO, VEGA_MASK_VJMO,
+       VEGA_MASK_TJMO };
 /* Step flags. */
 enum { VEGA_STEP_AUTO_ZWNJ = 1, VEGA_STEP_AUTO_ZWJ = 2, VEGA_STEP_RANDOM = 4, VEGA_STEP_PER_SYLLABLE = 8 };
 
@@ -64,8 +75,8 @@ typedef struct {
     size_t size;
     uint16_t upem, glyph_count;
     uint32_t cmap_count, plan_count;
-    const unsigned char *cmap, *advances, *plans, *steps;
-    VegaTable gdef, gsub, gpos;
+    const unsigned char *cmap, *advances, *plans, *steps, *extents;
+    VegaTable gdef, gsub, gpos, kern;
     uint32_t glyph_classes, attach_classes, mark_sets; /* in GDEF; 0 when absent */
     VegaLookup *lookups[2];         /* GSUB, GPOS */
     uint32_t lookup_count[2];
