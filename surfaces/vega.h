@@ -139,6 +139,28 @@ void vega_pixels(const VegaGrid *, VegaFace *, uint32_t *out, size_t stride);
 /* width x height of out in the background's colour. */
 void vega_pixels_clear(uint32_t *out, size_t stride, unsigned width, unsigned height);
 
+/* Accessibility on Linux desktops (access.c): the screen as AT-SPI2 objects
+ * on the accessibility bus, for screen readers. The surface that hosts it
+ * says whether the user is typing and what, presses keys for assistive
+ * technology, and hears when that changed the app. */
+typedef struct {
+    void *context;
+    bool (*typing)(void *);
+    const char *(*typed)(void *, size_t *length);
+    bool (*press)(void *, const char *key);
+    void (*changed)(void *);
+} VegaAccessHost;
+typedef struct VegaAccess VegaAccess;
+/* Join the accessibility bus; NULL (with why) when there is none. */
+VegaAccess *vega_access_open(PureApp *, const VegaScreen *, const VegaAccessHost *, char *error, size_t error_size);
+int vega_access_fd(const VegaAccess *);
+/* Answer what assistive technology asked (the fd is readable); false when
+ * the bus is gone. */
+bool vega_access_read(VegaAccess *);
+/* After the app changed: the focus that moved, as events. */
+void vega_access_changed(VegaAccess *);
+void vega_access_close(VegaAccess *);
+
 /* A display through KMS: the first connected connector (or, with writeback,
  * a writeback connector: the frames come back to memory, so no screen is
  * needed to check them), its preferred mode or width x height. */

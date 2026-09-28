@@ -1160,6 +1160,145 @@ def live_display(vega, module, work):
     return {'events': len(events), 'lines': len(got)}
 
 
+def accessibility(vega, module, work):
+    """The display on an accessibility bus of its own (a private session bus
+    with at-spi-bus-launcher in it), walked as a screen reader walks it, with
+    gdbus: the registry lists the app; its tree has the title as a heading,
+    the field as a label, the list as a list box of items that know their
+    place, the entry and the keys as buttons; one object at a time is
+    focused (the entry while typing, then the list's focused row); keys,
+    a row selected through Selection and a key's button pressed through
+    Action move the focus, and the display says so in events."""
+    import re, shutil, signal, struct, time
+    launcher = Path('/usr/libexec/at-spi-bus-launcher')
+    card, face = Path('/dev/dri/card1'), work / 'ui.vsym'
+    if not (shutil.which('dbus-daemon') and shutil.which('gdbus') and launcher.exists() and card.exists() and face.exists()):
+        return None
+    out = subprocess.run(['dbus-daemon', '--session', '--fork', '--print-address=1', '--print-pid=1', '--nopidfile'],
+                         capture_output=True, text=True, check=True).stdout.split('\n')
+    session, daemon = out[0], int(out[1])
+    env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=session)
+    helper = subprocess.Popen([launcher, '--launch-immediately'], env=env, start_new_session=True,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shown, monitor, keys = None, None, None
+    try:
+        for _ in range(100):
+            found = subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus', '--object-path', '/org/a11y/bus',
+                                    '--method', 'org.a11y.Bus.GetAddress'], capture_output=True, text=True, env=env)
+            if found.returncode == 0:
+                break
+            time.sleep(0.05)
+        a11y = re.search(r"'([^']*)'", found.stdout).group(1)
+        store = work / 'access-store'
+        assert run(vega, 'cli', module, '--store', store, stdin='text 61\ntext 62\ntext 63\n').returncode == 0
+        fifo = work / 'access-keys'
+        os.mkfifo(fifo)
+        shown = subprocess.Popen([str(vega), 'display', str(module), '--store', str(store), '--symbols', str(face), '--size', '18',
+                                  '--card', str(card), '--writeback', '640x480', '--out', str(work / 'access'),
+                                  '--input', str(fifo), '--access'],
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        keys = open(fifo, 'wb')
+
+        def call(dest, path, method, *args):
+            result = subprocess.run(['gdbus', 'call', '--address', a11y, '--dest', dest, '--object-path', path, '--method', method,
+                                     *map(str, args)], capture_output=True, text=True, env=env)
+            if result.returncode:
+                shown.poll()
+                why = shown.stderr.read() if shown.returncode is not None else 'still running'
+                raise AssertionError((path, method, result.stderr, shown.returncode, why))
+            return result.stdout.strip()
+
+        name = None
+        for _ in range(100):
+            apps = re.findall(r"'(:[0-9.]+)', (?:objectpath )?'([^']*)'",
+                              call('org.a11y.atspi.Registry', '/org/a11y/atspi/accessible/root',
+                                   'org.a11y.atspi.Accessible.GetChildren'))
+            if apps:
+                name, root = apps[-1]
+                break
+            time.sleep(0.05)
+        assert name, 'the registry never listed the display'
+
+        def item(path):
+            role = re.search(r"'([^']*)'", call(name, path, 'org.a11y.atspi.Accessible.GetRoleName')).group(1)
+            label = re.search(r"<'(.*)'>", call(name, path, 'org.freedesktop.DBus.Properties.Get', 'org.a11y.atspi.Accessible',
+                                                'Name')).group(1)
+            bits = [int(b) for b in re.findall(r'\d+', call(name, path, 'org.a11y.atspi.Accessible.GetState')
+                                                .replace('uint32', ''))[:2]]
+            states = {s for s, bit in (('focused', 12), ('selected', 23), ('editable', 7)) if bits[bit // 32] >> (bit % 32) & 1}
+            kids = re.findall(r"'(/[^']*)'", call(name, path, 'org.a11y.atspi.Accessible.GetChildren'))
+            return role, label, states, kids
+
+        def tree(path, into):
+            role, label, states, kids = item(path)
+            into.append((path, role, label, states))
+            for kid in kids:
+                tree(kid, into)
+            return into
+
+        def focused(nodes):
+            return [(role, label) for path, role, label, states in nodes if 'focused' in states]
+
+        nodes = tree(root, [])
+        roles = [(role, label) for path, role, label, states in nodes]
+        assert roles[:3] == [('application', 'To do'), ('frame', 'To do'), ('heading', 'To do')], roles
+        assert ('label', 'left: 3 of 3') in roles and ('list box', 'tasks_list') in roles and ('entry', 'add') in roles, roles
+        items = [(label, states) for path, role, label, states in nodes if role == 'list item']
+        assert [label for label, _ in items] == ['a', 'b', 'c'] and 'selected' in items[2][1], items
+        buttons = {label: path for path, role, label, states in nodes if role == 'push button'}
+        assert 'up (ArrowUp)' in buttons and 'toggle (Space)' in buttons, buttons
+        assert focused(nodes) == [('entry', 'add')], focused(nodes)  # typing, as the surface starts
+        rows = [path for path, role, label, states in nodes if role == 'list item']
+        places = call(name, rows[1], 'org.a11y.atspi.Accessible.GetAttributes')
+        assert "'posinset': '2'" in places and "'setsize': '3'" in places, places
+
+        monitor = subprocess.Popen(['gdbus', 'monitor', '--address', a11y, '--dest', name], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        time.sleep(0.3)
+
+        def press(code):
+            keys.write(struct.pack('llHHi', 0, 0, 1, code, 1) + struct.pack('llHHi', 0, 0, 0, 0, 0) +
+                       struct.pack('llHHi', 0, 0, 1, code, 0) + struct.pack('llHHi', 0, 0, 0, 0, 0))
+            keys.flush()
+
+        def until(what, test):
+            for _ in range(100):
+                nodes = tree(root, [])
+                if test(nodes):
+                    return nodes
+                time.sleep(0.05)
+            raise AssertionError(f'{what}: {focused(nodes)}')
+
+        press(15)  # Tab: keys go to the list
+        until('Tab gives the list the focus', lambda n: focused(n) == [('list item', 'c')])
+        press(103)  # ArrowUp
+        until('ArrowUp moves it', lambda n: focused(n) == [('list item', 'b')])
+        assert call(name, [p for p, r, l, s in nodes if r == 'list box'][0], 'org.a11y.atspi.Selection.SelectChild', 0) == '(true,)'
+        until('a row selected through Selection is focused', lambda n: focused(n) == [('list item', 'a')])
+        assert call(name, buttons['toggle (Space)'], 'org.a11y.atspi.Action.DoAction', 0) == '(true,)'
+        nodes = until('the toggle key pressed through Action marks it done',
+                      lambda n: focused(n) == [('list item', 'a, done')])
+        keys.close()
+        keys = None
+        out, err = shown.communicate(timeout=20)
+        assert shown.returncode == 0, err
+        monitor.terminate()
+        said = monitor.communicate(timeout=10)[0]
+        events = re.findall(r"(/org/vega/[^:]*): org\.a11y\.atspi\.Event\.Object\.(\w+) \('(\w*)', (-?\d+)", said)
+        moves = [(path.rsplit('/', 1)[-1], detail, int(value)) for path, member, detail, value in events
+                 if member == 'StateChanged' and detail == 'focused' and int(value)]
+        assert [row for row, _, _ in moves] == ['2', '1', '0'], events
+        return {'objects': len(nodes), 'events': len(events)}
+    finally:
+        if keys:
+            keys.close()
+        for process in (shown, monitor):
+            if process and process.poll() is None:
+                process.kill()
+        os.killpg(helper.pid, signal.SIGTERM)
+        os.kill(daemon, signal.SIGTERM)
+
+
 def hangul(vega, module):
     """Hangul typed on the keyboard (두벌식, surfaces/hangul.c): letter keys
     compose syllables in the entry line after the 한/영 key, and Enter commits
@@ -1463,6 +1602,7 @@ def main():
             report['symbols'] = symbols(args.symbols.resolve(), work)
             report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
             report['display'] = display(vega, modules['todo'], work)
+            report['accessibility'] = accessibility(vega, modules['todo'], work)
             report['live_display'] = live_display(vega, modules['todo'], work)
             report['node_display'] = node_display(vega, args.serve.resolve(), modules['todo'], work)
             report['messenger'] = messenger(vega, args.serve.resolve(), modules['messenger'], work)

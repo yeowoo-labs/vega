@@ -595,6 +595,26 @@ static bool show_frame(const VegaGrid *grid, char path[512], unsigned long *diff
 static volatile sig_atomic_t stopping;
 static void on_stop(int signal) { (void)signal; stopping = 1; }
 
+/* Accessibility (--access): what the surface tells it, and does for it. */
+static bool accessible;
+static bool access_typing(void *context) { (void)context; return typing; }
+static const char *access_typed(void *context, size_t *length) {
+    (void)context;
+    *length = entry_length;
+    return entry;
+}
+static bool access_press(void *context, const char *key) {
+    (void)context;
+    int input;
+    return press(key, &input);
+}
+static bool access_acted; /* assistive technology changed the app: draw again */
+static void access_changed(void *context) {
+    (void)context;
+    access_acted = true;
+}
+static const VegaAccessHost access_host = {NULL, access_typing, access_typed, access_press, access_changed};
+
 static void show_pointer(uint32_t *out, size_t stride, int x, int y, unsigned width, unsigned height) {
     /* The cell under a mouse pointer, outlined. */
     int left = x / face.cell_width * face.cell_width, top = y / face.cell_height * face.cell_height;
@@ -631,14 +651,28 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
     unsigned long differing = 0;
     bool open_input = true, printed = false;
     int status = 0;
+    VegaAccess *access = NULL;
+    if (accessible) {
+        char error[256];
+        if (!(access = vega_access_open(&app, &screen, &access_host, error, sizeof(error))))
+            fprintf(stderr, "vega: no accessibility: %s\n", error);
+    }
+    /* A frame is drawn when something may have changed it: first, then
+     * after input, ticks, a node's save, or what assistive technology did
+     * (not for what it only asked). */
+    bool dirty = true;
     while (!stopping && !(node && node->stopping(node->host))) {
         bool ticked = false;
         long due = node ? -1 : vega_timers_run(&timers, &app, vega_now(), &ticked);
         PureSnapshot *snapshot = node ? node->read(node->host, &app) : NULL;
+        dirty = dirty || ticked || snapshot || access_acted;
+        access_acted = false;
         char line[VEGA_TEXT + 4];
-        if (!node || snapshot) vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
+        if (dirty && (!node || snapshot)) vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
         if (snapshot) node->release(node->host, snapshot);
-        if (!display) { /* a node's pixels: each frame into a file */
+        if (!dirty) {
+            /* nothing to draw */
+        } else if (!display) { /* a node's pixels: each frame into a file */
             if (!write_frame(&grid, path)) { fprintf(stderr, "vega: cannot write %s\n", path); status = 1; break; }
         } else {
             unsigned width, height;
@@ -652,20 +686,23 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
             if (pointer) show_pointer(out, stride, x, y, width, height);
             if (!show_frame(&grid, path, &differing, false)) { fputs("vega: the display did not take the frame\n", stderr); status = 1; break; }
         }
+        dirty = false;
+        if (access) vega_access_changed(access);
         if (!open_input && !printed && recorded) {
             print_last(&grid, path, differing);
             printed = true;
         }
         if (!open_input && !node) break;
-        struct pollfd waits[33];
+        struct pollfd waits[34];
         unsigned count = open_input ? vega_input_fds(input, waits, 32) : 0;
         if (node) waits[count++] = (struct pollfd){node->changes, POLLIN, 0}; /* the node saved: draw again */
+        if (access) waits[count++] = (struct pollfd){vega_access_fd(access), POLLIN, 0}; /* a screen reader asks */
         int timeout = screen.ticks && !node ? 16 : -1;
         if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
         if (poll(waits, count, timeout) <= 0) {
             if (node) continue;
             app.now = vega_now();
-            if (screen.ticks) pure_app_frame(&app);
+            if (screen.ticks) pure_app_frame(&app), dirty = true;
             continue;
         }
         if (!node) app.now = vega_now();
@@ -676,9 +713,18 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
                 if (read(node->changes, &saves, sizeof(saves)) < 0) { /* cleared already */ }
                 continue;
             }
+            if (access && waits[i].fd == vega_access_fd(access)) {
+                if (!vega_access_read(access)) {
+                    fputs("vega: the accessibility bus went away\n", stderr);
+                    vega_access_close(access);
+                    access = NULL;
+                }
+                continue;
+            }
             VegaEvent events[64];
             bool ended;
             unsigned n = vega_input_read(input, waits[i].fd, events, 64, &ended);
+            if (n || ended) dirty = true;
             for (unsigned k = 0; k < n; ++k) {
                 const VegaEvent *e = &events[k];
                 unsigned line = e->y >= 0 ? (unsigned)(e->y / face.cell_height) : 0;
@@ -691,6 +737,7 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         }
     }
     if (recorded && !printed) print_last(&grid, path, differing);
+    vega_access_close(access);
     drawn = NULL;
     vega_grid_free(&grid);
     return status;
@@ -937,6 +984,11 @@ int main(int argc, char **argv) {
             --i;
             continue;
         }
+        if (!strcmp(argv[i], "--access") && !strcmp(argv[1], "display")) {
+            accessible = true;
+            --i;
+            continue;
+        }
         if (i + 1 >= argc) usage = true;
         else if (!strcmp(argv[i], "--store")) store = argv[i + 1];
         else if (!strcmp(argv[i], "--listen") && !strcmp(argv[1], "web")) listen_on = argv[i + 1];
@@ -964,7 +1016,7 @@ int main(int argc, char **argv) {
               "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
               "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
               "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] [--card PATH]\n"
-              "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [< script]\n"
+              "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [--access] [< script]\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }

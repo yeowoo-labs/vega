@@ -13,7 +13,7 @@ LIBPURE = $(PURE)/build/libpure.a
 # format, drawn by CPU or GPU), text/ (Unicode's algorithms over tables
 # text/unicode.py generates from the UCD: python3 text/unicode.py > text/unicode-data.c).
 SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/display.c \
-           surfaces/input.c surfaces/hangul.c surfaces/main.c
+           surfaces/input.c surfaces/hangul.c surfaces/dbus.c surfaces/access.c surfaces/main.c
 
 .PHONY: all check FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so
@@ -24,7 +24,7 @@ $(BUILD):
 $(LIBPURE): FORCE
 	$(MAKE) -C $(PURE) build/libpure.a
 
-$(BUILD)/vega: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $(LIBPURE) | $(BUILD)
+$(BUILD)/vega: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(LIBPURE) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
 
 # The same host as a surface a Pure node maps (pure-serve --surface, Pure's
@@ -34,7 +34,7 @@ $(BUILD)/vega: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $
 # when Pure's headers change: a node refuses a surface built for another
 # layout of its app and module.
 PURE_HEADERS = $(wildcard $(PURE)/core/*.h) $(PURE)/serve/surface.h
-$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/symbols.h $(PURE_HEADERS) | $(BUILD)
+$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(PURE_HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -fPIC -shared -fvisibility=hidden -ffunction-sections \
 		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c \
 		$(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@

@@ -175,3 +175,35 @@ advance, 오프셋 가운데 하나라도 다른 실행이 있으면 파일을 �
 
 집합 안의 자리는 DevTools 트리에 없어서, Chromium이 플랫폼 접근성 API로 넘기는 속성으로 본다.
 
+## 접근성: 리눅스 데스크톱(AT-SPI2)
+
+디스플레이 표면(`vega display --access`)은 접근성 버스에 AT-SPI2 객체로 나타난다. Orca 같은 화면 낭독기가 읽는 표준이다.
+GTK나 ATK, libdbus 없이 D-Bus를 명세의 전송 형식 그대로 말한다([surfaces/dbus.c](../../surfaces/dbus.c)). 유닉스 소켓, EXTERNAL
+인증, 리틀 엔디언의 고정 머리와 머리 필드, 정렬된 본문, 메서드 호출과 응답과 신호다.
+
+[surfaces/access.c](../../surfaces/access.c)는 세션 버스에 접근성 버스의 주소를 묻고, 그 버스에서 레지스트리에 자신을 끼운다
+(`Socket.Embed`). 객체는 말하기 표면이 말하는 순서를 따른다. application 아래 frame(제목)이 있고, 그 아래에 다음이 온다.
+
+- heading
+- 필드마다 label("이름: 값")
+- 목록마다 list box. 행마다 list item이 있다. 포커스된 행은 selected이고, 키가 움직이는 목록이면 focused다. 행은 전체에서의
+  자리(`posinset`, `setsize`)를 속성으로 가진다.
+- 표마다 table. 칸들을 가진 행으로 이루어진다.
+- entry
+- 키들의 tool bar와 push button
+
+대답은 물을 때마다 앱에서 구하므로 낡을 것이 없다. focused는 한 객체만 가진다. 글을 치는 동안은 entry, 아니면 키가 움직이는 목록의
+포커스된 행이다. 보조 기술은 앱을 움직일 수도 있다. 키의 단추를 누르면(Action) 그 키가 눌리고, 행을 고르면(Selection) 그 행이
+포커스된다. 앱이 바뀌면 옮겨 간 포커스를 사건(`Object:StateChanged` focused·selected, `SelectionChanged`)으로 알린다.
+화면 낭독기가 묻기만 할 때는 다시 그리지 않는다. 전에는 깨어날 때마다 그렸고, 질문이 몰리면 되돌려 쓰기(writeback) 프레임을
+놓쳤다.
+
+확인은 `tests/check.py`의 `accessibility`가 한다. 개인 세션 버스를 띄우고 그 안에서 `at-spi-bus-launcher`를 돌린다. 그리고
+화면 낭독기처럼 gdbus로 다음을 본다.
+
+- 레지스트리가 앱을 나열한다.
+- 트리의 역할과 이름이 맞다(제목 heading, 필드 label, 목록 list box와 a·b·c 항목과 자리, entry, 키 단추).
+- 처음에는 entry만 focused다.
+- Tab 뒤에는 c, 위 화살표 뒤에는 b가 focused다. Selection으로 고르면 a, Action으로 토글 키를 누르면 "a, done"이다.
+- 모니터한 사건에서 포커스가 c, b, a 순서로 옮겨 간다.
+
