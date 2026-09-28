@@ -568,7 +568,8 @@ static bool default_ignorable(uint32_t ch) {
 static bool variation_selector(uint32_t ch) { return (ch >= 0xFE00 && ch <= 0xFE0F) || (ch >= 0xE0100 && ch <= 0xE01EF); }
 
 /* Canonical_Combining_Class as HarfBuzz reorders by: Hebrew's fixed
- * positions in the SBL order, Arabic's shadda before the other marks. */
+ * positions in the SBL order, Arabic's shadda before the other marks,
+ * Telugu's length marks before the virama (hb-unicode.hh). */
 static unsigned modified_combining_class(uint32_t u) {
     if (u == 0x1A60 || u == 0x0FC6) return 254;
     if (u == 0x0F39) return 127;
@@ -577,7 +578,8 @@ static unsigned modified_combining_class(uint32_t u) {
     unsigned c = vega_combining_class(u);
     if (c >= 10 && c <= 36) return hebrew_arabic[c - 10];
     switch (c) {
-    case 84: case 91: return 0;
+    case 84: return 4;
+    case 91: return 5;
     case 103: return 3;
     case 130: return 132;
     case 132: return 131;
