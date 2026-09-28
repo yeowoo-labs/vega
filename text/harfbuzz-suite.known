@@ -13,9 +13,6 @@ in-house/arabic-fallback-shaping.tests:4
 in-house/arabic-fallback-shaping.tests:5
 in-house/arabic-fallback-shaping.tests:6
 
-# A kern table of class pairs (format 2; refused).
-in-house/kern-format2.tests:*
-
 # Myanmar as Zawgyi encodes it (Qaag; refused).
 in-house/myanmar-zawgyi.tests:*
 

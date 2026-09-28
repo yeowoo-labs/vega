@@ -90,6 +90,8 @@ check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/tes
 	if [ -f $(SHAPED_FONT) ]; then $(BUILD)/vega-symbols build --font $(SHAPED_FONT) --codes $(SHAPED_CODES) \
 		--shape Latn,Grek,Cyrl,Hebr,Arab,Zyyy --runs 5000 -o $(BUILD)/shaped.vsym && \
 		$(BUILD)/test-layout $(BUILD)/shaped.vsym; else echo "no $(SHAPED_FONT): shaping tests skipped"; fi
+	if [ -f $(SHAPED_FONT) ] && python3 -c 'import fontTools' 2>/dev/null; then \
+		python3 text/test-kern.py $(BUILD)/vega-symbols $(SHAPED_FONT); else echo "no fontTools: kern class tests skipped"; fi
 	$(MAKE) -C $(AUP) build/aup
 	$(MAKE) -C $(PURE) build/pure-serve
 	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve

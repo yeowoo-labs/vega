@@ -172,6 +172,8 @@ static bool resolve_lookups(VegaShaping *s, VegaTable t, int table, VegaLookup *
     return true;
 }
 
+static bool kern_sets(VegaShaping *s);
+
 bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, char *error, size_t error_size) {
     *s = (VegaShaping){0};
     if (size < VEGA_SHAPING_HEADER || memcmp(bytes, "VSHP", 4) || le32(bytes + 4) != size)
@@ -215,6 +217,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
     uint32_t kern = le32(bytes + 64), kern_size = le32(bytes + 68), extents = le32(bytes + 72);
     if (!within(size, kern, kern_size)) REFUSE("kern table");
     s->kern = (VegaTable){kern_size ? bytes + kern : NULL, kern_size};
+    if (kern_size && !kern_sets(s)) REFUSE("out of memory");
     if (extents && !within(size, extents, 8 * (uint64_t)s->glyph_count)) REFUSE("extents");
     s->extents = extents ? bytes + extents : NULL;
     s->plan_count = le32(bytes + 48);
@@ -278,6 +281,8 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
 
 void vega_shaping_close(VegaShaping *s) {
     for (int i = 0; i < 256; ++i) free(s->bmp[i]), s->bmp[i] = NULL;
+    free(s->kern_sets);
+    s->kern_sets = NULL;
     free(s->lookups[0]);
     free(s->lookups[1]);
     free(s->fallback_lookups);
@@ -2259,11 +2264,12 @@ static void apply_table(const VegaShaping *s, const Plan *plan, VegaShaper *b, i
     }
 }
 
-/* ---- The kern table (hb-ot-kern-table.hh, hb-kern.hh): OpenType's (version
- * 0) and Apple's (1.0), their pair subtables (format 0), each a pass over
- * the glyphs with marks skipped, the kerning split between the pair. (The
- * build tool refuses the other formats, and cross-stream kerning, which no
- * font installed here has.) */
+/* ---- The kern table (hb-ot-kern-table.hh, hb-aat-layout-kerx-table.hh,
+ * hb-kern.hh): OpenType's (version 0) and Apple's (1.0), their subtables of
+ * pairs (format 0) and of classes (2 and 3), each a pass over the glyphs
+ * with marks skipped, the kerning split between the pair. (The build tool
+ * refuses state machines, format 1, and cross-stream kerning; HarfBuzz
+ * passes over other formats, and so does this.) */
 
 static uint32_t get8(VegaTable t, uint32_t at) { return at < t.size ? t.p[at] : 0; }
 
@@ -2281,19 +2287,93 @@ static int32_t kern_pair(VegaTable t, uint32_t pairs, uint32_t left, uint32_t ri
     return 0;
 }
 
+/* A glyph's value in a format 2 class table (a first glyph, a count, the
+ * values: offsets into the kerning array); 0 outside it. */
+static uint32_t kern_class(VegaTable t, uint32_t table, uint32_t glyph) {
+    uint32_t i = glyph - get16(t, table);
+    return i < get16(t, table + 2) ? get16(t, table + 4 + 2 * i) : 0;
+}
+
+/* What subtable st (of format 0, 2 or 3; its header header bytes) gives
+ * left then right; what it reads must lie before end (the subtable's end,
+ * or the table's for the last one). */
+static int32_t kerning(VegaTable t, unsigned format, uint32_t st, uint32_t header, uint32_t end, const VegaDigest *sets,
+                       uint32_t left, uint32_t right) {
+    if (format == 0) return kern_pair(t, st + header, left, right);
+    if (format == 2) {
+        /* only glyphs the tables' digests may have (a digest's false
+         * positive takes class 0, as in HarfBuzz) */
+        if (!digest_may_have(&sets[0], left) || !digest_may_have(&sets[1], right)) return 0;
+        uint32_t array = get16(t, st + header + 6), l = kern_class(t, st + get16(t, st + header + 2), left),
+                 r = kern_class(t, st + get16(t, st + header + 4), right);
+        if (l + r < array) return 0;
+        uint64_t v = st + (uint64_t)array + ((l + r - array) & ~1u);
+        return v + 2 <= end ? gets16(t, (uint32_t)v) : 0;
+    }
+    /* format 3: glyph count, value count, left and right class counts,
+     * flags; the values; the left and right classes; the index */
+    uint32_t glyphs = get16(t, st + header), values = get8(t, st + header + 2), lefts = get8(t, st + header + 3),
+             rights = get8(t, st + header + 4), value_at = st + header + 6, class_at = value_at + 2 * values;
+    uint32_t l = left < glyphs ? get8(t, class_at + left) : 0, r = right < glyphs ? get8(t, class_at + glyphs + right) : 0;
+    if (l >= lefts || r >= rights) return 0;
+    uint32_t index = get8(t, class_at + 2 * glyphs + l * rights + r);
+    return index < values ? gets16(t, value_at + 2 * index) : 0;
+}
+
+/* Walk the kern table's subtables: each one's start, header size, where
+ * its reading ends, format and coverage; false when it has no more. */
+typedef struct { uint32_t at, count, k; bool apple; } KernWalk;
+static bool kern_walk(VegaTable t, KernWalk *w, uint32_t *st, uint32_t *header, uint32_t *end, unsigned *format,
+                      unsigned *coverage) {
+    if (w->k >= w->count || w->at >= t.size) return false;
+    uint32_t length = w->apple ? get32(t, w->at) : get16(t, w->at + 2);
+    *format = get8(t, w->at + (w->apple ? 5 : 4));
+    *coverage = get8(t, w->at + (w->apple ? 4 : 5));
+    *st = w->at;
+    *header = w->apple ? 8 : 6;
+    *end = w->k + 1 < w->count && length < t.size - w->at ? w->at + length : t.size;
+    w->at += length ? length : t.size;
+    w->k++;
+    return true;
+}
+static KernWalk kern_start(VegaTable t) {
+    bool apple = get16(t, 0) == 1;
+    return (KernWalk){apple ? 8 : 4, apple ? get32(t, 4) : get16(t, 2), 0, apple};
+}
+
+/* The digests of each format 2 subtable's class tables' glyphs (those not
+ * valued 1), as HarfBuzz's kern accelerator makes them. */
+static bool kern_sets(VegaShaping *s) {
+    VegaTable t = s->kern;
+    if (get16(t, 0) > 1) return true;
+    KernWalk w = kern_start(t);
+    s->kern_subtables = 0;
+    if (!(s->kern_sets = calloc(2 * (size_t)(w.count ? w.count : 1), sizeof(VegaDigest)))) return false;
+    uint32_t st, header, end;
+    unsigned format, coverage;
+    while (kern_walk(t, &w, &st, &header, &end, &format, &coverage)) {
+        VegaDigest *sets = &s->kern_sets[2 * s->kern_subtables++];
+        if (format != 2) continue;
+        for (int side = 0; side < 2; ++side) {
+            uint32_t table = st + get16(t, st + header + 2 + 2 * (uint32_t)side), first = get16(t, table);
+            for (uint32_t i = 0, n = get16(t, table + 2); i < n; ++i)
+                if (get16(t, table + 4 + 2 * i) != 1) digest_add_range(&sets[side], first + i, first + i);
+        }
+    }
+    return true;
+}
+
 static void kern_table(const VegaShaping *s, VegaShaper *b, const Plan *plan) {
     VegaTable t = s->kern;
-    uint32_t major = get16(t, 0);
-    if (major > 1 || !plan->kern_mask) return;
-    bool apple = major == 1;
-    uint32_t count = apple ? get32(t, 4) : get16(t, 2), at = apple ? 8 : 4;
-    for (uint32_t k = 0; k < count && at < t.size; ++k) {
-        uint32_t length = apple ? get32(t, at) : get16(t, at + 2);
-        unsigned format = get8(t, at + (apple ? 5 : 4)), coverage = get8(t, at + (apple ? 4 : 5));
+    if (get16(t, 0) > 1 || !plan->kern_mask) return;
+    KernWalk w = kern_start(t);
+    bool apple = w.apple;
+    uint32_t st, header, end;
+    unsigned format, coverage;
+    while (kern_walk(t, &w, &st, &header, &end, &format, &coverage)) {
+        const VegaDigest *sets = &s->kern_sets[2 * (w.k - 1)];
         bool horizontal = apple ? !(coverage & 0x80) : coverage & 1;
-        uint32_t pairs = at + (apple ? 8 : 6);
-        at += length ? length : t.size;
-        if ((apple && (coverage & 0x20)) || !horizontal || format != 0) continue;
+        if ((apple && (coverage & 0x20)) || !horizontal || (format != 0 && format != 2 && format != 3)) continue;
         bool reverse = b->direction == VEGA_SHAPE_RTL;
         if (reverse) reverse_range(b, 0, b->len, true);
         Apply c = {.s = s, .b = b, .table = 1, .t = s->gpos, .lookup_mask = plan->kern_mask, .lookup_props = 0x08,
@@ -2311,7 +2391,7 @@ static void kern_table(const VegaShaping *s, VegaShaper *b, const Plan *plan) {
                 continue;
             }
             size_t i = idx, j = it.idx;
-            int32_t kern = kern_pair(t, pairs, b->info[i].codepoint, b->info[j].codepoint);
+            int32_t kern = kerning(t, format, st, header, end, sets, b->info[i].codepoint, b->info[j].codepoint);
             if (kern) {
                 int32_t first = kern >> 1, second = kern - first;
                 b->pos[i].x_advance += first;

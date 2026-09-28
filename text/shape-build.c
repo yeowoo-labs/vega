@@ -375,7 +375,10 @@ static Stage stage_of(const Map *m, const char *tag) {
 /* What HarfBuzz makes of the font's kern table (hb-ot-kern-table.hh): one
  * with subtables that pass its checks (data), Apple's state machines among
  * them (machine), cross-stream kerning (cross); and whether it has what
- * Vega does not apply (other: a format but pairs, a version but 0 and 1). */
+ * Vega does not apply (other: a state machine, a version but 0 and 1).
+ * Its checks: each subtable within the table, and what a format reads
+ * within the subtable (the last one: within the table, as HarfBuzz lets a
+ * last subtable run past a length whose 16 bits overflowed). */
 typedef struct { bool data, machine, cross, other; } Kerning;
 
 static Kerning kerning_of(hb_face_t *face) {
@@ -402,8 +405,27 @@ static Kerning kerning_of(hb_face_t *face) {
         valid = size >= header && at + size <= length;
         uint64_t end = i + 1 < count ? at + size : length;
         if (valid && format == 0) valid = at + header + 8 + 6 * (uint64_t)U16(at + header) <= end;
+        if (valid && format == 2) {
+            /* the row width, the offsets of the left and right class
+             * tables and of the kerning array; each class table a first
+             * glyph, a count and that many values */
+            valid = at + header + 8 <= end;
+            for (int side = 0; valid && side < 2; ++side) {
+                uint64_t table = at + U16(at + header + 2 + 2 * side);
+                valid = table + 4 <= end && table + 4 + 2 * (uint64_t)U16(table + 2) <= end;
+            }
+            valid = valid && at + U16(at + header + 6) <= end;
+        }
+        if (valid && format == 3) {
+            /* glyph count, value count, left and right class counts, flags;
+             * the values, the classes, the index */
+            valid = at + header + 6 <= end;
+            if (valid)
+                valid = at + header + 6 + 2 * (uint64_t)p[at + header + 2] + 2 * (uint64_t)U16(at + header) +
+                            (uint64_t)p[at + header + 3] * p[at + header + 4] <= end;
+        }
         k.machine |= format == 1;
-        k.other |= format != 0;
+        k.other |= format == 1;
         k.cross |= apple ? coverage & 0x40 : coverage & 4;
         at += size;
     }
@@ -610,7 +632,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     bool apply_gpos = !disable_gpos && hb_ot_layout_has_positioning(face);
     bool apply_kern = (!has_gpos_kern || !apply_gpos) && kern_table.data;
     if (apply_kern && (kern_table.other || kern_table.cross))
-        FAIL("%s: the font's kern table has more than pairs (state machines, classes, cross-stream kerning)", name);
+        FAIL("%s: the font's kern table has a state machine or cross-stream kerning", name);
     /* Hangul's, Indic's and Khmer's shapers zero no marks (Myanmar's does,
      * before GPOS); none of these places marks without GPOS. */
     bool zeroes = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC && shaper != VEGA_SHAPER_KHMER;

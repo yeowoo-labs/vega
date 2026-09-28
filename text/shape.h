@@ -121,6 +121,8 @@ typedef struct {
     const unsigned char *sequences; /* variation sequences */
     uint32_t sequence_count;
     VegaTable gdef, gsub, gpos, kern;
+    VegaDigest *kern_sets;          /* each kern subtable's left and right glyphs (format 2's), as HarfBuzz digests them */
+    uint32_t kern_subtables;
     VegaTable fallback;             /* Arabic fallback shaping's lookups, a GSUB table */
     uint32_t fallback_count;
     uint8_t fallback_features[7];   /* what each is for: init, medi, fina, isol, rlig x3 (0..6) */
