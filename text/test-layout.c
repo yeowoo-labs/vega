@@ -88,6 +88,7 @@ int main(int argc, char **argv) {
                                        '1', '2', '3', 0x0661, 0x0662, 0x200E, 0x200F, 0x2028, 0x2014, 0x00A0};
     VegaShaper *shaper = vega_shaper_new();
     VegaLayout layout = {0};
+    VegaFonts fonts = {{&shaping}, 1, NULL, NULL};
     size_t lines = 0, glyphs = 0, characters = 0;
     double seconds = 0;
     static uint32_t codes[2048];
@@ -115,7 +116,7 @@ int main(int argc, char **argv) {
         int32_t width = below(5) == 0 ? 0 : (int32_t)(shaping.upem * (1 + below(30)));
         struct timespec a, b;
         clock_gettime(CLOCK_MONOTONIC, &a);
-        if (!vega_layout(&layout, shaper, &shaping, codes, n, direction, width)) {
+        if (!vega_layout(&layout, shaper, &fonts, codes, n, direction, width)) {
             fail(k, "no layout");
             continue;
         }

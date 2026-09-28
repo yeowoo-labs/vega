@@ -584,7 +584,7 @@ static bool cased_or_other_letter_or_space(unsigned c) {
 
 /* HarfBuzz's Default_Ignorable: Unicode's, less the Hangul fillers and a
  * few others that fonts draw. */
-static bool default_ignorable(uint32_t ch) {
+bool vega_default_ignorable(uint32_t ch) {
     uint32_t plane = ch >> 16;
     if (!plane) {
         switch (ch >> 8) {
@@ -651,7 +651,7 @@ static void init_unicode_props(Info *info, uint32_t *scratch) {
     unsigned gen = vega_category(u), props = gen;
     if (u >= 0x80) {
         *scratch |= HAS_NON_ASCII;
-        if (default_ignorable(u)) {
+        if (vega_default_ignorable(u)) {
             *scratch |= HAS_DEFAULT_IGNORABLES;
             props |= UPROPS_IGNORABLE;
             if (u == 0x200C) props |= UPROPS_ZWNJ;

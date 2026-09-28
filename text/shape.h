@@ -128,6 +128,9 @@ bool vega_shaping_open(VegaShaping *, const unsigned char *bytes, size_t size, c
 void vega_shaping_close(VegaShaping *);
 /* The font's glyph for a character, or 0. */
 uint32_t vega_shaping_glyph(const VegaShaping *, uint32_t code);
+/* Default_Ignorable_Code_Point as HarfBuzz 10.2 has it: what shaping hides
+ * (a zero-width space in its place, or nothing). */
+bool vega_default_ignorable(uint32_t code);
 
 /* A shaped glyph, as HarfBuzz gives it: in visual order (left to right),
  * cluster the index of the first character it came from; each glyph is

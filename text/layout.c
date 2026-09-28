@@ -1,10 +1,11 @@
 /* Paragraphs set into lines (text/layout.h). The parts are the ones Unicode
- * and HarfBuzz check (bidi.c, linebreak.c, shape.c); this puts them
- * together as UAX #9 section 3.4 and UAX #14 describe:
+ * and HarfBuzz check (bidi.c, linebreak.c, grapheme.c, shape.c); this puts
+ * them together as UAX #9 section 3.4 and UAX #14 describe:
  *   1. levels for the paragraph (P2 to I2), each removed character at the
  *      level of the one before it;
  *   2. a script for each character, Common and Inherited ones taking the
- *      one before them (at the start, the first after);
+ *      one before them (at the start, the first after); and a font for each
+ *      grapheme cluster (UAX #29), so no cluster is split between fonts;
  *   3. break opportunities, and one shaping of the paragraph to measure it;
  *   4. lines: the last opportunity where what shows still fits (spaces at a
  *      line's end hang past it), or the first when none does;
@@ -16,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { size_t start, end; uint8_t level; VegaScript script; } Run;
+typedef struct { size_t start, end; uint8_t level; VegaScript script; uint8_t font; } Run;
 
 static bool grow(void **array, size_t *allocated, size_t need, size_t size) {
     if (need <= *allocated) return true;
@@ -37,47 +38,86 @@ static bool removed(VegaBidiClass c) {
            c == VEGA_BIDI_PDF;
 }
 
-/* Shape [r->start, r->end) and add its glyphs at *pen. */
-static bool shape_run(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const uint32_t *codes, const Run *r,
+/* v in the units of a font of upem `from` as the first font's (`to`), rounded. */
+static int32_t scaled(int64_t v, uint32_t from, uint32_t to) {
+    if (from == to || !from) return (int32_t)v;
+    int64_t t = v * to;
+    return (int32_t)((t >= 0 ? t + from / 2 : t - from / 2) / from);
+}
+
+/* Shape [r->start, r->end) and add its glyphs at *pen: in the first font's
+ * units, the run's own pen scaled (so rounding does not add up). */
+static bool shape_run(VegaLayout *l, VegaShaper *shaper, const VegaFonts *fonts, const uint32_t *codes, const Run *r,
                       int32_t *pen) {
+    const VegaShaping *s = fonts->fonts[r->font];
     const VegaShaped *g;
     long n = vega_shape(shaper, s, codes + r->start, r->end - r->start, vega_script_code(r->script),
                         r->level & 1 ? VEGA_SHAPE_RTL : VEGA_SHAPE_LTR, &g);
     if (n < 0 || !grow((void **)&l->glyphs, &l->glyphs_allocated, l->glyph_count + (size_t)n, sizeof(VegaPlaced)))
         return false;
+    uint32_t from = s->upem, to = fonts->fonts[0]->upem;
+    int64_t at = 0;
     for (long k = 0; k < n; ++k) {
-        l->glyphs[l->glyph_count++] = (VegaPlaced){g[k].glyph, (uint32_t)(r->start + g[k].cluster), *pen + g[k].x_offset,
-                                                   g[k].y_offset, g[k].x_advance};
-        *pen += g[k].x_advance;
+        int32_t x = scaled(at, from, to);
+        l->glyphs[l->glyph_count++] = (VegaPlaced){g[k].glyph, (uint32_t)(r->start + g[k].cluster),
+                                                   *pen + scaled(at + g[k].x_offset, from, to),
+                                                   scaled(g[k].y_offset, from, to),
+                                                   scaled(at + g[k].x_advance, from, to) - x, r->font};
+        at += g[k].x_advance;
     }
+    *pen += scaled(at, from, to);
     return true;
 }
 
-/* Runs of one level and one script in [start, end). */
-static size_t itemize(const uint8_t *levels, const VegaScript *scripts, size_t start, size_t end, Run *out) {
+/* Runs of one level, one script and one font in [start, end). */
+static size_t itemize(const uint8_t *levels, const VegaScript *scripts, const uint8_t *fonts, size_t start, size_t end,
+                      Run *out) {
     size_t n = 0;
     for (size_t i = start; i < end; ++i) {
-        if (n && out[n - 1].level == levels[i] && out[n - 1].script == scripts[i]) out[n - 1].end = i + 1;
-        else out[n++] = (Run){i, i + 1, levels[i], scripts[i]};
+        if (n && out[n - 1].level == levels[i] && out[n - 1].script == scripts[i] && out[n - 1].font == fonts[i])
+            out[n - 1].end = i + 1;
+        else out[n++] = (Run){i, i + 1, levels[i], scripts[i], fonts[i]};
     }
     return n;
 }
 
-static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const uint32_t *codes,
-                     const VegaBidiClass *classes, const uint8_t *levels, uint8_t *line_levels, const VegaScript *scripts,
-                     Run *runs, size_t *order, int paragraph, size_t start, size_t end, int32_t *pen_out,
-                     int32_t *hang_out);
+static bool has(const VegaFonts *fonts, unsigned font, uint32_t code) {
+    if (vega_default_ignorable(code)) return true;
+    return fonts->has ? fonts->has(fonts->context, font, code) : vega_shaping_glyph(fonts->fonts[font], code) != 0;
+}
 
-bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const uint32_t *codes, size_t count,
+/* The font for the cluster codes[0, count), after one in previous. */
+static unsigned font_for(const VegaFonts *fonts, const uint32_t *codes, size_t count, unsigned previous) {
+    bool common = true;
+    for (size_t i = 0; i < count && common; ++i) common = vega_script(codes[i]) <= VEGA_SCRIPT_INHERITED;
+    for (unsigned k = common ? 0 : 1; k <= fonts->count; ++k) {
+        unsigned f = k ? k - 1 : previous;
+        bool all = true;
+        for (size_t i = 0; i < count && all; ++i) all = has(fonts, f, codes[i]);
+        if (all) return f;
+    }
+    for (unsigned f = 0; f < fonts->count; ++f)
+        if (has(fonts, f, codes[0])) return f;
+    return common ? previous : 0;
+}
+
+static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaFonts *fonts, const uint32_t *codes,
+                     const VegaBidiClass *classes, const uint8_t *levels, uint8_t *line_levels, const VegaScript *scripts,
+                     const uint8_t *font_of, Run *runs, size_t *order, int paragraph, size_t start, size_t end,
+                     int32_t *pen_out, int32_t *hang_out);
+
+bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaFonts *fonts, const uint32_t *codes, size_t count,
                  int direction, int32_t width) {
     l->line_count = l->glyph_count = 0;
     l->width = 0;
     l->level = direction == VEGA_BIDI_RTL;
     if (!count) return true;
+    if (!fonts->count || fonts->count > VEGA_LAYOUT_FONTS) return false;
     /* The work, in one block: classes, levels (the paragraph's, and a
-     * line's), scripts, breaks, each character's advance, runs and their
-     * order, and each line's end widths. */
-    size_t need = count * (sizeof(VegaBidiClass) + 2 + sizeof(VegaScript) + 1 + sizeof(int32_t) + sizeof(Run) +
+     * line's), scripts, breaks, fonts, grapheme boundaries, each
+     * character's advance, runs and their order, and each line's end
+     * widths. */
+    size_t need = count * (sizeof(VegaBidiClass) + 2 + sizeof(VegaScript) + 1 + 2 + sizeof(int32_t) + sizeof(Run) +
                            sizeof(size_t) + 2 * sizeof(int32_t)) + 64;
     if (!grow(&l->work, &l->work_size, need, 1)) return false;
     VegaBidiClass *classes = l->work;
@@ -86,6 +126,7 @@ bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const 
     size_t *order = (size_t *)(runs + count);
     uint8_t *levels = (uint8_t *)(order + count), *line_levels = levels + count, *breaks = line_levels + count;
     VegaScript *scripts = breaks + count + 1;
+    uint8_t *font_of = scripts + count, *clusters = font_of + count;
 
     /* 1. Levels. */
     for (size_t i = 0; i < count; ++i) classes[i] = vega_bidi_class(codes[i]);
@@ -108,14 +149,25 @@ bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const 
         if (script > VEGA_SCRIPT_INHERITED) last = script;
         scripts[i] = script > VEGA_SCRIPT_INHERITED ? script : last ? last : first;
     }
+    memset(font_of, 0, count);
+    if (fonts->count > 1) {
+        vega_graphemes(codes, count, clusters);
+        for (size_t i = 0, font = 0; i < count;) {
+            size_t end = i + 1;
+            while (end < count && !clusters[end]) ++end;
+            font = font_for(fonts, codes + i, end - i, (unsigned)font);
+            memset(font_of + i, (int)font, end - i);
+            i = end;
+        }
+    }
     /* 3. Opportunities, and what each character takes. */
     if (!vega_line_breaks(codes, count, breaks)) return false;
     memset(advance, 0, count * sizeof(*advance));
-    size_t run_count = itemize(levels, scripts, 0, count, runs);
+    size_t run_count = itemize(levels, scripts, font_of, 0, count, runs);
     for (size_t r = 0; r < run_count; ++r) {
         size_t before = l->glyph_count;
         int32_t pen = 0;
-        if (!shape_run(l, shaper, s, codes, &runs[r], &pen)) return false;
+        if (!shape_run(l, shaper, fonts, codes, &runs[r], &pen)) return false;
         for (size_t k = before; k < l->glyph_count; ++k) advance[l->glyphs[k].cluster] += l->glyphs[k].advance;
         l->glyph_count = before;
     }
@@ -143,8 +195,8 @@ bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const 
         size_t first = l->glyph_count;
         int32_t pen, hang;
         for (;;) {
-            if (!set_line(l, shaper, s, codes, classes, levels, line_levels, scripts, runs, order, paragraph, start, end,
-                          &pen, &hang))
+            if (!set_line(l, shaper, fonts, codes, classes, levels, line_levels, scripts, font_of, runs, order, paragraph,
+                          start, end, &pen, &hang))
                 return false;
             /* Shaped as a line, it may be wider than measured (a letter
              * at its end takes its final form): then end at the opportunity
@@ -177,10 +229,10 @@ bool vega_layout(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const 
 
 /* Lay out [start, end) as one line: its glyphs added to the layout, how
  * far they go (pen) and how much of that is spaces hanging at its end. */
-static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, const uint32_t *codes,
+static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaFonts *fonts, const uint32_t *codes,
                      const VegaBidiClass *classes, const uint8_t *levels, uint8_t *line_levels, const VegaScript *scripts,
-                     Run *runs, size_t *order, int paragraph, size_t start, size_t end, int32_t *pen_out,
-                     int32_t *hang_out) {
+                     const uint8_t *font_of, Run *runs, size_t *order, int paragraph, size_t start, size_t end,
+                     int32_t *pen_out, int32_t *hang_out) {
     /* L1 at the line's end: separators, and the whitespace and isolate
      * controls before them or at the end, go to the paragraph's level. */
     memcpy(line_levels + start, levels + start, end - start);
@@ -192,7 +244,7 @@ static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, co
         } else
             trailing = 0;
     }
-    size_t n = itemize(line_levels, scripts, start, end, runs);
+    size_t n = itemize(line_levels, scripts, font_of, start, end, runs);
     /* L2 over the runs: from the highest level to the lowest odd one,
      * reverse each stretch of runs at that level or higher. */
     uint8_t highest = 0, lowest_odd = 0xff;
@@ -219,7 +271,7 @@ static bool set_line(VegaLayout *l, VegaShaper *shaper, const VegaShaping *s, co
     size_t first = l->glyph_count;
     int32_t pen = 0;
     for (size_t r = 0; r < n; ++r)
-        if (!shape_run(l, shaper, s, codes, &runs[order[r]], &pen)) return false;
+        if (!shape_run(l, shaper, fonts, codes, &runs[order[r]], &pen)) return false;
     /* The spaces at its end hang: they are not in its width. */
     size_t shown = end;
     while (shown > start && classes[shown - 1] == VEGA_BIDI_WS) --shown;

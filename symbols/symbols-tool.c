@@ -1178,11 +1178,12 @@ static int paragraph(int argc, char **argv) {
     VegaShaper *shaper = vega_shaper_new();
     VegaGlyphs *glyphs = vega_glyphs_open(&s, (float)(pixels / s.units));
     VegaLayout layouts[16] = {0};
+    VegaFonts fonts = {{&shaping}, 1, NULL, NULL};
     int paragraphs = argc - 6 < 16 ? argc - 6 : 16, height = 2 * margin;
     for (int k = 0; k < paragraphs; ++k) {
         uint32_t codes[4096];
         size_t count = decode_utf8(argv[6 + k], codes, 4096);
-        if (!vega_layout(&layouts[k], shaper, &shaping, codes, count, VEGA_BIDI_AUTO, (int32_t)(width / per_unit)))
+        if (!vega_layout(&layouts[k], shaper, &fonts, codes, count, VEGA_BIDI_AUTO, (int32_t)(width / per_unit)))
             fail("cannot lay out");
         height += (int)layouts[k].line_count * line_height + line_height / 2;
     }
