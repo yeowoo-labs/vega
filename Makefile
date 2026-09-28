@@ -10,7 +10,8 @@ LIBPURE = $(PURE)/build/libpure.a
 
 # Parts: lib/ (the aup library: the interface vocabulary), surfaces/ (the vega
 # host: TUI, CLI, NUI sentences, web), symbols/ (glyphs and icons as one
-# format, drawn by CPU or GPU).
+# format, drawn by CPU or GPU), text/ (Unicode's algorithms over tables
+# text/unicode.py generates from the UCD: python3 text/unicode.py > text/unicode-data.c).
 SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/display.c \
            surfaces/input.c surfaces/hangul.c surfaces/main.c
 
@@ -48,7 +49,14 @@ $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbo
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) symbols/symbols-tool.c $(SYMBOLS) $(LDFLAGS) \
 		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
-check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so
+TEXT = text/bidi.c text/unicode-data.c
+$(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
+
+# Unicode's conformance tests, where the UCD is installed (Debian: unicode-data).
+UCD ?= /usr/share/unicode
+check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text
+	if [ -f $(UCD)/BidiTest.txt ]; then $(BUILD)/test-text $(UCD); else echo "no UCD at $(UCD): text tests skipped"; fi
 	$(MAKE) -C $(AUP) build/aup
 	$(MAKE) -C $(PURE) build/pure-serve
 	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve
