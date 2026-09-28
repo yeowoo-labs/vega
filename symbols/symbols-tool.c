@@ -4,6 +4,7 @@
  *   vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,... [--shape Latn,Arab,...]]... [--svg CODE=ICON.svg ...]
  *                      [--units N] [--runs N] -o OUT.vsym
  *   vega-symbols shape-check FONT.ttf OUT.vsym [--face N] [--runs N] [--seed N]
+ *   vega-symbols shape-cases FONT.ttf [--face N] < CASES
  *   vega-symbols compare FONT.ttf OUT.vsym --sizes 12,16,32,64
  *   vega-symbols info OUT.vsym
  *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm
@@ -1150,6 +1151,128 @@ static int shape_one(int argc, char **argv) {
     return 0;
 }
 
+/* Shape the cases given with a section compiled for them and with
+ * HarfBuzz: vega-symbols shape-cases FONT.ttf [--face N] < CASES, a case a
+ * line: ID SCRIPT DIRECTION CODES (an ISO 15924 code or -, ltr, rtl or -,
+ * hex code points joined by commas). What is - HarfBuzz guesses from the
+ * codes (hb_buffer_guess_segment_properties; Common when it finds no
+ * script). A line out per case: ID same; ID differs, then both glyph
+ * lists; ID failed (no plan); or, when the font's shaping cannot be
+ * compiled, ID refused and why. For HarfBuzz's own test suite
+ * (text/harfbuzz-suite.py). */
+typedef struct { char id[160]; uint32_t script, *codes; int direction; size_t count; } Case;
+
+static void print_glyphs(const char *who, const VegaShaped *g, size_t count) {
+    printf("  %-8s", who);
+    for (size_t i = 0; i < count; ++i)
+        printf(" %u@%u(%d,%d+%d,%d)", g[i].glyph, g[i].cluster, g[i].x_advance, g[i].y_advance, g[i].x_offset,
+               g[i].y_offset);
+    printf("\n");
+}
+
+static int shape_cases(int argc, char **argv) {
+    if (argc != 3 && !(argc == 5 && !strcmp(argv[3], "--face")))
+        fail("usage: vega-symbols shape-cases FONT.ttf [--face N] < CASES");
+    hb_blob_t *blob = hb_blob_create_from_file_or_fail(argv[2]);
+    if (!blob) fail("cannot read the font");
+    hb_face_t *face = hb_face_create(blob, argc == 5 ? (unsigned)strtoul(argv[4], NULL, 10) : 0);
+    hb_font_t *font = hb_font_create(face);
+    hb_buffer_t *buffer = hb_buffer_create();
+    Case *cases = NULL;
+    size_t count = 0, allocated = 0, script_count = 0;
+    uint32_t scripts[256];
+    char line[65536];
+    while (fgets(line, sizeof(line), stdin)) {
+        char id[160], script[16], direction[16], *codes = malloc(sizeof(line));
+        if (!codes || sscanf(line, "%159s %15s %15s %65535s", id, script, direction, codes) != 4) {
+            free(codes);
+            continue;
+        }
+        if (count == allocated) {
+            allocated = allocated ? 2 * allocated : 64;
+            cases = realloc(cases, allocated * sizeof(*cases));
+            if (!cases) fail("out of memory");
+        }
+        Case *c = &cases[count++];
+        *c = (Case){.count = 0};
+        snprintf(c->id, sizeof(c->id), "%s", id);
+        c->codes = malloc((strlen(codes) / 2 + 2) * sizeof(*c->codes));
+        if (!c->codes) fail("out of memory");
+        for (char *p = codes; *p;) {
+            c->codes[c->count++] = (uint32_t)strtoul(p, &p, 16);
+            if (*p == ',') ++p;
+            else if (*p) break;
+        }
+        free(codes);
+        /* What is not given, as HarfBuzz guesses it. */
+        hb_buffer_clear_contents(buffer);
+        hb_buffer_add_codepoints(buffer, c->codes, (int)c->count, 0, (int)c->count);
+        if (strcmp(script, "-")) hb_buffer_set_script(buffer, hb_script_from_string(script, -1));
+        if (!strcmp(direction, "ltr")) hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
+        if (!strcmp(direction, "rtl")) hb_buffer_set_direction(buffer, HB_DIRECTION_RTL);
+        hb_buffer_guess_segment_properties(buffer);
+        hb_script_t guessed = hb_buffer_get_script(buffer);
+        if (guessed == HB_SCRIPT_INVALID || guessed == HB_SCRIPT_UNKNOWN) guessed = HB_SCRIPT_COMMON;
+        c->script = hb_script_to_iso15924_tag(guessed);
+        c->direction = hb_buffer_get_direction(buffer) == HB_DIRECTION_RTL ? VEGA_SHAPE_RTL : VEGA_SHAPE_LTR;
+        bool listed = false;
+        for (size_t k = 0; k < script_count && !listed; ++k) listed = scripts[k] == c->script;
+        if (!listed && script_count < 256) scripts[script_count++] = c->script;
+    }
+    VegaSection section = {0};
+    VegaShaping shaping;
+    char error[256];
+    bool compiled = vega_shaping_compile(face, scripts, script_count, NULL, 0, &section, NULL, error, sizeof(error)) &&
+                    vega_shaping_open(&shaping, section.bytes, section.size, error, sizeof(error));
+    VegaShaper *shaper = vega_shaper_new();
+    for (size_t i = 0; i < count; ++i) {
+        Case *c = &cases[i];
+        if (!compiled) {
+            printf("%s refused %s\n", c->id, error);
+            continue;
+        }
+        const VegaShaped *ours;
+        long n = vega_shape(shaper, &shaping, c->codes, c->count, c->script, c->direction, &ours);
+        hb_buffer_clear_contents(buffer);
+        hb_buffer_add_codepoints(buffer, c->codes, (int)c->count, 0, (int)c->count);
+        hb_buffer_set_direction(buffer, c->direction == VEGA_SHAPE_RTL ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+        hb_buffer_set_script(buffer, hb_script_from_iso15924_tag(c->script));
+        hb_shape(font, buffer, NULL, 0);
+        unsigned m;
+        hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &m);
+        hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buffer, &m);
+        bool same = n == (long)m;
+        for (unsigned k = 0; same && k < m; ++k)
+            same = ours[k].glyph == info[k].codepoint && ours[k].cluster == info[k].cluster &&
+                   ours[k].x_advance == pos[k].x_advance && ours[k].y_advance == pos[k].y_advance &&
+                   ours[k].x_offset == pos[k].x_offset && ours[k].y_offset == pos[k].y_offset;
+        if (n < 0) printf("%s failed %c%c%c%c\n", c->id, (char)(c->script >> 24), (char)(c->script >> 16),
+                          (char)(c->script >> 8), (char)c->script);
+        else if (same) printf("%s same\n", c->id);
+        else {
+            printf("%s differs %c%c%c%c %s\n", c->id, (char)(c->script >> 24), (char)(c->script >> 16),
+                   (char)(c->script >> 8), (char)c->script, c->direction == VEGA_SHAPE_RTL ? "rtl" : "ltr");
+            print_glyphs("vega", ours, (size_t)n);
+            VegaShaped *theirs = malloc((m + 1) * sizeof(*theirs));
+            for (unsigned k = 0; theirs && k < m; ++k)
+                theirs[k] = (VegaShaped){info[k].codepoint, info[k].cluster, pos[k].x_advance, pos[k].y_advance,
+                                         pos[k].x_offset, pos[k].y_offset};
+            if (theirs) print_glyphs("harfbuzz", theirs, m);
+            free(theirs);
+        }
+    }
+    if (compiled) vega_shaping_close(&shaping);
+    vega_shaper_free(shaper);
+    free(section.bytes);
+    for (size_t i = 0; i < count; ++i) free(cases[i].codes);
+    free(cases);
+    hb_buffer_destroy(buffer);
+    hb_font_destroy(font);
+    hb_face_destroy(face);
+    hb_blob_destroy(blob);
+    return 0;
+}
+
 /* UTF-8 (valid) to code points; how many. */
 static size_t decode_utf8(const char *text, uint32_t *out, size_t room) {
     size_t n = 0;
@@ -1242,10 +1365,11 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "shape")) return shape_one(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "build")) return build(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "shape-check")) return shape_check(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "shape-cases")) return shape_cases(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "compare")) return compare(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "info")) return info(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "render")) return render(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "gpu")) return gpu(argc, argv);
-    fail("vega-symbols build|shape-check|compare|info|render|gpu ...");
+    fail("vega-symbols build|shape-check|shape-cases|shape|paragraph|compare|info|render|gpu ...");
     return 2;
 }

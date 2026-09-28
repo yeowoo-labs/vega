@@ -1,0 +1,40 @@
+# Cases of HarfBuzz's test suite (text/harfbuzz-suite.py) known to shape
+# otherwise in Vega: a case ID or a pattern of them, then why.
+
+# AAT (morx, kerx, trak): Apple's shaping tables; Vega shapes with
+# OpenType's alone and refuses a font that has them.
+text-rendering-tests/MORX-*        # AAT
+in-house/aat-*                     # AAT
+
+# The character map made from what HarfBuzz lists (hb_face_collect_unicodes),
+# not from how it maps: a format 13 map it lists cut short, a symbol map
+# whose Latin and Arabic it maps to the private use area.
+in-house/emoji-clusters.tests:*    # cmap format 13
+text-rendering-tests/CMAP-3.tests:1    # cmap
+text-rendering-tests/CMAP-3.tests:11   # cmap
+in-house/arabic-fallback-shaping.tests:7   # symbol cmap, Arabic PUA
+in-house/arabic-fallback-shaping.tests:8   # symbol cmap, Arabic PUA
+in-house/arabic-fallback-shaping.tests:9   # symbol cmap, Arabic PUA
+in-house/arabic-fallback-shaping.tests:10  # symbol cmap, Arabic PUA
+in-house/arabic-fallback-shaping.tests:11  # symbol cmap, Arabic PUA
+
+# Variation selectors (cmap format 14).
+text-rendering-tests/CMAP-1.tests:2    # cmap format 14
+text-rendering-tests/CMAP-1.tests:3    # cmap format 14
+text-rendering-tests/CMAP-2.tests:2    # cmap format 14
+
+# Arabic fallback shaping where two characters share a glyph (refused).
+in-house/arabic-fallback-shaping.tests:2
+in-house/arabic-fallback-shaping.tests:3
+in-house/arabic-fallback-shaping.tests:4
+in-house/arabic-fallback-shaping.tests:5
+in-house/arabic-fallback-shaping.tests:6
+
+# A kern table of class pairs (format 2; refused).
+in-house/kern-format2.tests:*
+
+# Myanmar as Zawgyi encodes it (Qaag; refused).
+in-house/myanmar-zawgyi.tests:*
+
+# No plan for the run.
+text-rendering-tests/GSUB-3.tests:1

@@ -15,7 +15,7 @@ LIBPURE = $(PURE)/build/libpure.a
 SURFACES = surfaces/screen.c surfaces/draw.c surfaces/width.c surfaces/web.c surfaces/pixels.c surfaces/display.c \
            surfaces/input.c surfaces/hangul.c surfaces/dbus.c surfaces/access.c surfaces/main.c
 
-.PHONY: all check FORCE
+.PHONY: all check check-harfbuzz FORCE
 all: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so
 
 $(BUILD):
@@ -76,7 +76,16 @@ $(BUILD)/test-layout: text/test-layout.c $(LAYOUT) text/layout.h text/shape.h te
 UCD ?= /usr/share/unicode
 SHAPED_FONT ?= /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 SHAPED_CODES = 0x20-0x7e,0xa0-0x24f,0x300-0x36f,0x370-0x3ff,0x400-0x4ff,0x591-0x5f4,0x600-0x6ff,0x2000-0x206f
-check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text $(BUILD)/test-layout
+# HarfBuzz's own shaping tests, where a HarfBuzz release's source is
+# (HARFBUZZ_SRC: the same version the build links): each case shaped by
+# Vega and by HarfBuzz must agree, but for those text/harfbuzz-suite.known
+# lists.
+HARFBUZZ_SRC ?=
+check-harfbuzz: $(BUILD)/vega-symbols
+	if [ -d "$(HARFBUZZ_SRC)/test/shape/data" ]; then python3 text/harfbuzz-suite.py $(HARFBUZZ_SRC) $(BUILD)/vega-symbols; \
+	else echo "no HarfBuzz source at HARFBUZZ_SRC: its test suite skipped"; fi
+
+check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text $(BUILD)/test-layout check-harfbuzz
 	if [ -f $(UCD)/BidiTest.txt ]; then $(BUILD)/test-text $(UCD); else echo "no UCD at $(UCD): text tests skipped"; fi
 	if [ -f $(SHAPED_FONT) ]; then $(BUILD)/vega-symbols build --font $(SHAPED_FONT) --codes $(SHAPED_CODES) \
 		--shape Latn,Grek,Cyrl,Hebr,Arab,Zyyy --runs 5000 -o $(BUILD)/shaped.vsym && \
