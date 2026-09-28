@@ -898,6 +898,16 @@ static bool fallback_table(hb_font_t *font, Bytes *gsub, uint8_t *features, unsi
     return !failed;
 }
 
+static int by_sequence(const void *a, const void *b) {
+    const unsigned char *x = a, *y = b;
+    for (int k = 0; k < 8; k += 4) {
+        uint32_t p = (uint32_t)x[k] | (uint32_t)x[k + 1] << 8 | (uint32_t)x[k + 2] << 16 | (uint32_t)x[k + 3] << 24;
+        uint32_t q = (uint32_t)y[k] | (uint32_t)y[k + 1] << 8 | (uint32_t)y[k + 2] << 16 | (uint32_t)y[k + 3] << 24;
+        if (p != q) return p < q ? -1 : 1;
+    }
+    return 0;
+}
+
 bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t script_count, const uint32_t *codes,
                           size_t code_count, VegaSection *out, hb_set_t *glyphs, char *error, size_t error_size) {
     Plan *plans = calloc(2 * script_count + 1, sizeof(*plans));
@@ -956,11 +966,35 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
     put32(&o, 0);
     put16(&o, hb_face_get_upem(face));
     put16(&o, glyph_count);
-    for (int i = 0; i < 17; ++i) put32(&o, 0);
+    for (int i = 0; i < 19; ++i) put32(&o, 0);
     set32(&o, 12, group_count);
     set32(&o, 16, (uint32_t)o.size);
     for (uint32_t i = 0; i < 3 * group_count; ++i) put32(&o, groups[i]);
     free(groups);
+    /* Variation sequences (cmap format 14): each selector's bases, and the
+     * glyph HarfBuzz gives the pair (a default one's is the base's own). */
+    hb_set_t *selectors = hb_set_create(), *bases = hb_set_create();
+    hb_face_collect_variation_selectors(face, selectors);
+    uint32_t sequence_count = 0;
+    size_t sequences_at = o.size;
+    for (hb_codepoint_t v = HB_SET_VALUE_INVALID; hb_set_next(selectors, &v);) {
+        hb_set_clear(bases);
+        hb_face_collect_variation_unicodes(face, v, bases);
+        for (hb_codepoint_t u = HB_SET_VALUE_INVALID; hb_set_next(bases, &u);) {
+            hb_codepoint_t g;
+            if (!hb_font_get_variation_glyph(font, u, v, &g)) continue;
+            put32(&o, u);
+            put32(&o, v);
+            put32(&o, g);
+            sequence_count++;
+        }
+    }
+    hb_set_destroy(selectors);
+    hb_set_destroy(bases);
+    /* By base, then selector (they came by selector). */
+    if (!o.failed) qsort(o.bytes + sequences_at, sequence_count, 12, by_sequence);
+    set32(&o, 80, sequence_count);
+    set32(&o, 84, (uint32_t)sequences_at);
     set32(&o, 20, (uint32_t)o.size);
     for (unsigned g = 0; g < glyph_count; ++g) {
         hb_position_t advance = hb_font_get_glyph_h_advance(font, g);
@@ -1297,6 +1331,25 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     }
     hb_set_destroy(inputs);
     if (!letters.count) letters = others, others = (Pool){0};
+    /* Variation sequences the font maps whose base is among the codes: a
+     * base, then its selector (bases[k] and selectors[k]). */
+    Pool bases = {0}, selectors = {0};
+    hb_set_t *given = hb_set_create(), *vs = hb_set_create(), *us = hb_set_create();
+    for (size_t i = 0; i < code_count; ++i) hb_set_add(given, codes[i]);
+    hb_face_collect_variation_selectors(hb_font_get_face(font), vs);
+    for (hb_codepoint_t v = HB_SET_VALUE_INVALID; hb_set_next(vs, &v);) {
+        hb_set_clear(us);
+        hb_face_collect_variation_unicodes(hb_font_get_face(font), v, us);
+        for (hb_codepoint_t u = HB_SET_VALUE_INVALID; hb_set_next(us, &u);)
+            if (hb_set_has(given, u)) {
+                pool_add(&bases, u);
+                pool_add(&selectors, v);
+            }
+    }
+    size_t sequences = bases.count < selectors.count ? bases.count : selectors.count;
+    hb_set_destroy(given);
+    hb_set_destroy(vs);
+    hb_set_destroy(us);
     VegaShaper *shaper = vega_shaper_new();
     hb_buffer_t *buffer = hb_buffer_create();
     Random random = {seed * 0x9E3779B97F4A7C15ULL + script + 1};
@@ -1324,7 +1377,15 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
                         n = indic_syllable(&random, indic, text, n);
                         continue;
                     }
+                    if (sequences && !below(&random, 8)) {
+                        size_t k = below(&random, (uint32_t)sequences);
+                        text[n++] = bases.items[k];
+                        text[n++] = selectors.items[k];
+                        continue;
+                    }
                     text[n++] = hot.count && below(&random, 3) == 0 ? pick(&random, &hot) : pick(&random, &letters);
+                    /* a selector the font may not map after it */
+                    if (!below(&random, 60)) text[n++] = 0xFE00 + below(&random, 16);
                     if (marks.count && below(&random, 100) < mark_rate) {
                         text[n++] = pick(&random, &marks);
                         if (!below(&random, 5)) text[n++] = pick(&random, &marks);
@@ -1385,6 +1446,8 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     hb_buffer_destroy(buffer);
     vega_shaper_free(shaper);
     free(letters.items);
+    free(bases.items);
+    free(selectors.items);
     free(marks.items);
     free(others.items);
     free(hot.items);

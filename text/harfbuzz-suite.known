@@ -6,11 +6,6 @@
 text-rendering-tests/MORX-*        # AAT
 in-house/aat-*                     # AAT
 
-# Variation selectors (cmap format 14).
-text-rendering-tests/CMAP-1.tests:2    # cmap format 14
-text-rendering-tests/CMAP-1.tests:3    # cmap format 14
-text-rendering-tests/CMAP-2.tests:2    # cmap format 14
-
 # Arabic fallback shaping where two characters share a glyph (refused).
 in-house/arabic-fallback-shaping.tests:2
 in-house/arabic-fallback-shaping.tests:3

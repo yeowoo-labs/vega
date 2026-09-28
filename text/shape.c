@@ -229,6 +229,16 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
         s->attach_classes = offset16(s->gdef, 0, 10);
         s->mark_sets = minor >= 2 ? offset16(s->gdef, 0, 12) : 0;
     }
+    s->sequence_count = le32(bytes + 80);
+    uint32_t sequences = le32(bytes + 84);
+    if (!within(size, sequences, (uint64_t)s->sequence_count * 12)) REFUSE("variation sequences");
+    s->sequences = bytes + sequences;
+    for (uint32_t i = 0; i < s->sequence_count; ++i) {
+        const unsigned char *q = s->sequences + 12 * (size_t)i;
+        if ((i && (le32(q) < le32(q - 12) || (le32(q) == le32(q - 12) && le32(q + 4) <= le32(q - 8)))) ||
+            le32(q + 8) >= s->glyph_count)
+            REFUSE("variation sequence %u", i);
+    }
     size_t subtables = 0, allocated = 0;
     uint32_t fallback = le32(bytes + 76);
     if (fallback) {
@@ -857,6 +867,23 @@ static bool compose(const Normalizer *c, uint32_t a, uint32_t b, uint32_t *ab) {
 
 static bool nominal(const VegaShaping *s, uint32_t u, uint32_t *glyph) { return (*glyph = vega_shaping_glyph(s, u)) != 0; }
 
+/* The glyph the font gives base followed by selector (cmap format 14). */
+static bool variation_glyph(const VegaShaping *s, uint32_t base, uint32_t selector, uint32_t *glyph) {
+    uint32_t low = 0, high = s->sequence_count;
+    while (low < high) {
+        uint32_t middle = (low + high) / 2;
+        const unsigned char *q = s->sequences + 12 * (size_t)middle;
+        uint32_t b = le32(q), v = le32(q + 4);
+        if (b < base || (b == base && v < selector)) low = middle + 1;
+        else if (b > base || v > selector) high = middle;
+        else {
+            *glyph = le32(q + 8);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void output_char(VegaShaper *b, uint32_t unichar, uint32_t glyph) {
     b->info[b->idx].glyph_index = glyph;
     size_t before = b->out_len;
@@ -951,21 +978,27 @@ static void decompose_current_character(const Normalizer *c, bool shortest) {
     next_char(b, 0);
 }
 
-/* A variation selector's cluster: normalization gives up on it. (Variation
- * sequences the font maps, cmap format 14, are not carried: each character
- * passes on alone, the selector hidden.) */
+/* A variation selector's cluster: normalization gives up on it. A
+ * sequence the font maps (cmap format 14) becomes its glyph; otherwise
+ * each character passes on alone, the selector hidden. */
 static void handle_variation_selector_cluster(const Normalizer *c, size_t end) {
     VegaShaper *b = c->b;
     uint32_t glyph;
     while (b->idx + 1 < end && b->successful) {
         if (variation_selector(b->info[b->idx + 1].codepoint)) {
-            b->info[b->idx].glyph_index = nominal(c->s, b->info[b->idx].codepoint, &glyph) ? glyph : 0;
-            next_glyph(b);
-            b->scratch |= HAS_VARIATION_SELECTOR_FALLBACK;
-            Info *vs = &b->info[b->idx];
-            vs->uprops = (uint16_t)((vs->uprops & ~0x1Fu & 0xFF) | VEGA_CF | UPROPS_VS);
-            vs->glyph_index = nominal(c->s, vs->codepoint, &glyph) ? glyph : 0;
-            next_glyph(b);
+            if (variation_glyph(c->s, b->info[b->idx].codepoint, b->info[b->idx + 1].codepoint, &glyph)) {
+                b->info[b->idx].glyph_index = glyph;
+                uint32_t unicode = b->info[b->idx].codepoint;
+                replace_glyphs(b, 2, 1, &unicode);
+            } else {
+                b->info[b->idx].glyph_index = nominal(c->s, b->info[b->idx].codepoint, &glyph) ? glyph : 0;
+                next_glyph(b);
+                b->scratch |= HAS_VARIATION_SELECTOR_FALLBACK;
+                Info *vs = &b->info[b->idx];
+                vs->uprops = (uint16_t)((vs->uprops & ~0x1Fu & 0xFF) | VEGA_CF | UPROPS_VS);
+                vs->glyph_index = nominal(c->s, vs->codepoint, &glyph) ? glyph : 0;
+                next_glyph(b);
+            }
             while (b->idx < end && b->successful && variation_selector(b->info[b->idx].codepoint)) {
                 b->info[b->idx].glyph_index = nominal(c->s, b->info[b->idx].codepoint, &glyph) ? glyph : 0;
                 next_glyph(b);

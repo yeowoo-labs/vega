@@ -41,6 +41,9 @@
  *                                          medi, fina, isol, rlig x3), u32
  *                                          size, then a GSUB table of just
  *                                          those lookups)
+ *   u32 sequence_count, u32 offset        (variation sequences, cmap format
+ *                                          14: u32 base, u32 selector, u32
+ *                                          glyph; by base, then selector)
  * Offsets are from the section's start. A plan (VEGA_PLAN_BYTES):
  *   u32 script (ISO 15924 as a tag: 'Latn'), u8 direction, u8 native
  *   direction (of its script; 0 when it has none), u8 shaper, u8 flags,
@@ -53,7 +56,7 @@
  * A step, a lookup to run: u16 lookup index, u8 flags, u8 0, u32 mask; or
  * a pause, where the shaper does its part: u16 VEGA_STEP_PAUSE, u8 which
  * (VEGA_PAUSE_...), u8 0, u32 0. */
-enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 16,
+enum { VEGA_SHAPING_HEADER = 88, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 16,
        VEGA_PLAN_STAGES = 5 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
 enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC,
@@ -115,6 +118,8 @@ typedef struct {
     uint16_t upem, glyph_count;
     uint32_t cmap_groups, plan_count;
     const unsigned char *cmap, *advances, *plans, *steps, *extents;
+    const unsigned char *sequences; /* variation sequences */
+    uint32_t sequence_count;
     VegaTable gdef, gsub, gpos, kern;
     VegaTable fallback;             /* Arabic fallback shaping's lookups, a GSUB table */
     uint32_t fallback_count;
