@@ -120,6 +120,69 @@ static bool add_lookups(Map *m, int table, unsigned feature_index, uint32_t mask
     return true;
 }
 
+/* hb_qsort as HarfBuzz builds it (hb-algs.hh's sort_r_simple, Isaac
+ * Turner's quicksort), by lookup index: which of two entries of one lookup
+ * comes first decides whose per-syllable and random flags the merge keeps,
+ * so the order must be its own, unstable as it is. */
+static void swap_lookups(LookupMap *a, LookupMap *b) {
+    LookupMap t = *a;
+    *a = *b;
+    *b = t;
+}
+static int cmp_lookups(const LookupMap *a, const LookupMap *b) { return (a->index > b->index) - (a->index < b->index); }
+static void swap_blocks(LookupMap *p, size_t na, size_t nb) {
+    if (!na || !nb) return;
+    if (na > nb)
+        for (size_t i = 0; i < nb; ++i) swap_lookups(&p[i], &p[na + i]);
+    else
+        for (size_t i = 0; i < na; ++i) swap_lookups(&p[i], &p[nb + i]);
+}
+static void sort_lookups(LookupMap *b, size_t nel) {
+    if (nel < 10) {
+        for (size_t i = 1; i < nel; ++i)
+            for (size_t j = i; j > 0 && cmp_lookups(&b[j - 1], &b[j]) > 0; --j) swap_lookups(&b[j - 1], &b[j]);
+        return;
+    }
+    LookupMap *end = b + nel, *last = b + nel - 1, *t;
+    /* the median of the second, middle and second-last is the pivot, moved last */
+    LookupMap *l[3] = {b + 1, b + nel / 2, last - 1};
+    if (cmp_lookups(l[0], l[1]) > 0) t = l[0], l[0] = l[1], l[1] = t;
+    if (cmp_lookups(l[1], l[2]) > 0) {
+        t = l[1], l[1] = l[2], l[2] = t;
+        if (cmp_lookups(l[0], l[1]) > 0) t = l[0], l[0] = l[1], l[1] = t;
+    }
+    if (l[1] != last) swap_lookups(l[1], last);
+    LookupMap *pivot = last, *pl = b, *ple = b, *pr = last, *pre = last;
+    while (pl < pr) {
+        for (; pl < pr; pl++) {
+            int c = cmp_lookups(pl, pivot);
+            if (c > 0) break;
+            if (c == 0) {
+                if (ple < pl) swap_lookups(ple, pl);
+                ple++;
+            }
+        }
+        if (pl >= pr) break;
+        while (pl < pr) {
+            pr--;
+            int c = cmp_lookups(pr, pivot);
+            if (c == 0) {
+                pre--;
+                if (pr < pre) swap_lookups(pr, pre);
+            } else if (c < 0) {
+                if (pl < pr) swap_lookups(pl, pr);
+                pl++;
+                break;
+            }
+        }
+    }
+    pl = pr;
+    swap_blocks(b, (size_t)(ple - b), (size_t)(pl - ple));
+    swap_blocks(pr, (size_t)(pre - pr), (size_t)(end - pre));
+    sort_lookups(b, (size_t)(pl - ple));
+    sort_lookups(end - (pre - pr), (size_t)(pre - pr));
+}
+
 static bool compile_map(Map *m) {
     unsigned required_index[2], required_stage[2] = {0, 0};
     hb_tag_t required_tag[2];
@@ -210,12 +273,7 @@ static bool compile_map(Map *m) {
             LookupMap *l = m->lookups[t];
             unsigned n = m->lookup_count[t];
             if (last + 1 < n) {
-                for (unsigned i = last + 1; i < n; ++i) /* stable, by index */
-                    for (unsigned k = i; k > last && l[k - 1].index > l[k].index; --k) {
-                        LookupMap swap = l[k];
-                        l[k] = l[k - 1];
-                        l[k - 1] = swap;
-                    }
+                sort_lookups(l + last, n - last);
                 unsigned j = last;
                 for (unsigned i = j + 1; i < n; ++i)
                     if (l[i].index != l[j].index) l[++j] = l[i];
