@@ -90,9 +90,9 @@ def run(name, command, results, **kwargs):
     print(f'== {name}', file=sys.stderr)
     done = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, **kwargs)
     sys.stderr.write(done.stderr[-4000:])
-    reports = [json.loads(line) for line in done.stdout.splitlines() if line.startswith('{')]
+    reports = [json.loads(line) for line in done.stdout.splitlines() if line.startswith('{"')]
     results[name] = {'passed': done.returncode == 0, **({'report': reports} if reports else {})}
-    if done.returncode:
+    if done.returncode and not name.endswith('.py'):
         sys.stderr.write(done.stdout[-4000:])
     return done
 
@@ -114,13 +114,17 @@ def main():
 
     results = {}
     generated = ['text/unicode-data.c', 'text/syllabic-data.c']
-    with open(ROOT / 'text' / 'unicode-data.c', 'w') as out:
-        results['unicode.py'] = {'passed': subprocess.run([sys.executable, 'text/unicode.py', str(database)],
-                                                          stdout=out, cwd=ROOT).returncode == 0}
-    with open(ROOT / 'text' / 'syllabic-data.c', 'w') as out:
-        results['syllabic.py'] = {'passed': subprocess.run([sys.executable, 'text/syllabic.py', str(source / 'src')],
-                                                           stdout=out, cwd=ROOT).returncode == 0}
+    for name, target, given in (('unicode.py', 'unicode-data.c', database), ('syllabic.py', 'syllabic-data.c',
+                                                                              source / 'src')):
+        # a generator that fails leaves its file as it was
+        made = run(name, [sys.executable, f'text/{name}', str(given)], results)
+        if not made.returncode:
+            (ROOT / 'text' / target).write_text(made.stdout)
     run('syllabic.py --check', [sys.executable, 'text/syllabic.py', str(source / 'src'), '--check'], results)
+    if not all(r['passed'] for r in results.values()):
+        # the generators do not follow this version yet: what to port first
+        print(json.dumps({'harfbuzz': version, 'unicode': unicode, 'checks': results}))
+        return 1
 
     build = UPSTREAM / 'build'
     flags = [f'BUILD={build}', f'HARFBUZZ_CFLAGS=-I{source / "src"}',
