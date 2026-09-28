@@ -6,18 +6,6 @@
 text-rendering-tests/MORX-*        # AAT
 in-house/aat-*                     # AAT
 
-# The character map made from what HarfBuzz lists (hb_face_collect_unicodes),
-# not from how it maps: a format 13 map it lists cut short, a symbol map
-# whose Latin and Arabic it maps to the private use area.
-in-house/emoji-clusters.tests:*    # cmap format 13
-text-rendering-tests/CMAP-3.tests:1    # cmap
-text-rendering-tests/CMAP-3.tests:11   # cmap
-in-house/arabic-fallback-shaping.tests:7   # symbol cmap, Arabic PUA
-in-house/arabic-fallback-shaping.tests:8   # symbol cmap, Arabic PUA
-in-house/arabic-fallback-shaping.tests:9   # symbol cmap, Arabic PUA
-in-house/arabic-fallback-shaping.tests:10  # symbol cmap, Arabic PUA
-in-house/arabic-fallback-shaping.tests:11  # symbol cmap, Arabic PUA
-
 # Variation selectors (cmap format 14).
 text-rendering-tests/CMAP-1.tests:2    # cmap format 14
 text-rendering-tests/CMAP-1.tests:3    # cmap format 14

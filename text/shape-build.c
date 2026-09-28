@@ -914,11 +914,40 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
         }
     unsigned glyph_count = hb_face_get_glyph_count(face);
     if (glyph_count > 65535) FAIL("more than 65535 glyphs");
-    hb_face_collect_unicodes(face, unicodes);
-    uint32_t cmap_count = 0;
-    for (hb_codepoint_t u = HB_SET_VALUE_INVALID; hb_set_next(unicodes, &u);) {
+    /* The character map as HarfBuzz maps, not as it lists (a format 13 map
+     * it lists cut short, a symbol map it maps into the private use area):
+     * every code point asked, in groups of codes going to consecutive
+     * glyphs, or all to one. */
+    uint32_t *groups = NULL, group_count = 0, allocated = 0;
+    for (hb_codepoint_t u = 0; u <= 0x10FFFF; ++u) {
         hb_codepoint_t g;
-        if (hb_font_get_nominal_glyph(font, u, &g) && g) cmap_count++;
+        if (!hb_font_get_nominal_glyph(font, u, &g) || !g) continue;
+        hb_set_add(unicodes, u);
+        if (group_count) {
+            uint32_t *last = groups + 3 * (group_count - 1), glyph = last[2] & 0x7FFFFFFF;
+            bool single = last[0] == last[1], same = last[2] >> 31;
+            if (last[1] + 1 == u && ((single || !same) && g == glyph + (u - last[0]))) {
+                last[1] = u;
+                continue;
+            }
+            if (last[1] + 1 == u && (single || same) && g == glyph) {
+                last[1] = u;
+                last[2] = glyph | 0x80000000u;
+                continue;
+            }
+        }
+        if (group_count == allocated) {
+            allocated = allocated ? 2 * allocated : 256;
+            uint32_t *grown = realloc(groups, 3 * (size_t)allocated * sizeof(*groups));
+            if (!grown) {
+                free(groups);
+                FAIL("out of memory");
+            }
+            groups = grown;
+        }
+        uint32_t *next = groups + 3 * group_count++;
+        next[0] = next[1] = u;
+        next[2] = g;
     }
     hb_blob_t *tables[3] = {hb_face_reference_table(face, HB_OT_TAG_GDEF), hb_face_reference_table(face, HB_OT_TAG_GSUB),
                             hb_face_reference_table(face, HB_OT_TAG_GPOS)};
@@ -928,15 +957,10 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
     put16(&o, hb_face_get_upem(face));
     put16(&o, glyph_count);
     for (int i = 0; i < 17; ++i) put32(&o, 0);
-    set32(&o, 12, cmap_count);
+    set32(&o, 12, group_count);
     set32(&o, 16, (uint32_t)o.size);
-    for (hb_codepoint_t u = HB_SET_VALUE_INVALID; hb_set_next(unicodes, &u);) {
-        hb_codepoint_t g;
-        if (hb_font_get_nominal_glyph(font, u, &g) && g) {
-            put32(&o, u);
-            put32(&o, g);
-        }
-    }
+    for (uint32_t i = 0; i < 3 * group_count; ++i) put32(&o, groups[i]);
+    free(groups);
     set32(&o, 20, (uint32_t)o.size);
     for (unsigned g = 0; g < glyph_count; ++g) {
         hb_position_t advance = hb_font_get_glyph_h_advance(font, g);

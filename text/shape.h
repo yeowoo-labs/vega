@@ -21,7 +21,11 @@
  *
  * The section, little-endian:
  *   "VSHP", u32 size, u16 upem, u16 glyph_count,
- *   u32 cmap_count, u32 cmap_offset       (u32 code, u32 glyph; by code),
+ *   u32 cmap_groups, u32 cmap_offset      (u32 first, u32 last code, u32
+ *                                          glyph: first's, the next codes'
+ *                                          following it, or with the top bit
+ *                                          set, the glyph of them all; by
+ *                                          code, apart),
  *   u32 advances_offset                   (glyph_count u16),
  *   u32 offset, u32 size of GDEF, of GSUB and of GPOS (0 0 when absent),
  *   u32 plan_count, u32 plans_offset      (VEGA_PLAN_BYTES each),
@@ -109,7 +113,7 @@ typedef struct {
     const unsigned char *bytes;
     size_t size;
     uint16_t upem, glyph_count;
-    uint32_t cmap_count, plan_count;
+    uint32_t cmap_groups, plan_count;
     const unsigned char *cmap, *advances, *plans, *steps, *extents;
     VegaTable gdef, gsub, gpos, kern;
     VegaTable fallback;             /* Arabic fallback shaping's lookups, a GSUB table */

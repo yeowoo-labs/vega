@@ -133,8 +133,10 @@ def main():
     counts = Counter(verdict.split(' ', 1)[0] for verdict in outcome.values())
     is_known = lambda case: any(fnmatch.fnmatchcase(case, pattern) for pattern in known)
     unexpected = sorted(case for case, verdict in outcome.items() if verdict != 'same' and not is_known(case))
-    now_same = sorted(case for case, verdict in outcome.items() if verdict == 'same' and is_known(case) and
-                      case in known)
+    # a listed case, or pattern, all of whose cases now agree
+    now_same = sorted(pattern for pattern in known
+                      if any(fnmatch.fnmatchcase(case, pattern) for case in outcome) and
+                      all(verdict == 'same' for case, verdict in outcome.items() if fnmatch.fnmatchcase(case, pattern)))
     for case in unexpected[:args.show]:
         print(f'{case}: {outcome[case]}', file=sys.stderr)
         print(details.get(case, ''), end='', file=sys.stderr)

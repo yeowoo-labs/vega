@@ -87,8 +87,10 @@ Sentence_Break, 동아시아 폭이 F·W·H인 여는·닫는 괄호)와 규칙�
   히브리, 한글 셰이퍼의 목록과 단계), 중복을 합치고, 마스크 비트를 나누고, 글꼴의 문자 체계·언어 체계에서 기능을 찾고,
   단계별로 조회를 모아 정렬해 합친다. 누가 자리를 잡는지도 여기서 정한다. GPOS, 옛 `kern` 표(GPOS에 `kern` 기능이 없을 때),
   부호의 대체 배치(GPOS가 없을 때) 가운데 무엇을 쓸지, 부호의 폭을 0으로 만들며 오프셋을 옮길지를 HarfBuzz의 조건 그대로
-  고른다. 결과는 조회 번호, 마스크, ZWJ/ZWNJ 규칙, 이 깃발들의 목록이다. 글꼴의 문자 지도와 advance, GDEF·GSUB·GPOS와 `kern`
-  표는 그대로 싣고, 대체 배치를 하는 계획이 있으면 글리프마다 외곽 상자(HarfBuzz의 glyph extents, 16비트 넷)를 싣는다
+  고른다. 결과는 조회 번호, 마스크, ZWJ/ZWNJ 규칙, 이 깃발들의 목록이다. 문자 지도는 HarfBuzz가 매기는 대로 싣는다. 모든
+  코드 포인트를 `hb_font_get_nominal_glyph`로 물어, 이어지는 글리프로 가거나 한 글리프로 가는 묶음으로 적는다. 목록
+  (`hb_face_collect_unicodes`)으로 만들면 틀린다. 형식 13 지도는 목록이 잘리고, 기호 지도(3,0)의 라틴과 아랍 문자는 HarfBuzz가
+  사용자 영역으로 옮겨 찾는다. advance, GDEF·GSUB·GPOS와 `kern` 표는 그대로 싣고, 대체 배치를 하는 계획이 있으면 글리프마다 외곽 상자(HarfBuzz의 glyph extents, 16비트 넷)를 싣는다
   ([text/shape.h](../../text/shape.h), [text/shape-build.c](../../text/shape-build.c)).
 - 실행 중에: [text/shape.c](../../text/shape.c)가 HarfBuzz 10의 절차를 함수 단위로 옮긴다. 유니코드 성질과 자소 묶음,
   글꼴을 보는 정규화(없는 글자는 분해하고 있는 합성은 합치며, 부호는 HarfBuzz의 수정 결합 등급과 아랍 UTR #53, 히브리
@@ -231,6 +233,21 @@ U+180B–180E만 넣고 네 번째 자유 이체 선택자(U+180F)를 빠뜨렸�
 - AAT 표(morx, kerx, trak).
 - 미얀마 Zawgyi(표준이 아닌 인코딩, 문자 체계 태그 Qaag로만 오는 것).
 - 이체 선택자(cmap 형식 14)는 싣지 않는다. 선택자는 숨기고 앞 글자는 기본 글리프로 둔다.
+
+### HarfBuzz의 시험 모음
+
+무작위 실행은 흔한 경우를 덮지만, 글꼴 하나가 드러낸 버릇은 그 글꼴과 그 입력이 있어야 보인다. HarfBuzz의 시험 모음
+(`test/shape/data`: in-house, text-rendering-tests, aots)이 그 목록이다. 버릇이 드러날 때마다 글꼴과 입력을 더해 온 것이다.
+[text/harfbuzz-suite.py](../../text/harfbuzz-suite.py)는 그 모든 경우를 `vega-symbols shape-cases`로 양쪽에서 셰이핑한다.
+경우들이 쓰는 문자 체계로 글꼴의 구역을 컴파일하고(문자 체계와 방향은 HarfBuzz가 추측하는 대로), 실행마다 HarfBuzz와 글리프·
+위치를 댄다. 기대 출력 대신 HarfBuzz를 그 자리에서 돌린다. 기록된 출력은 Vega에 없는 선택(글꼴 함수, 크기, 출력 형식)에
+딸려 있기 때문이다. Vega가 하지 않는 것을 묻는 경우(사용자 기능, 가변 글꼴, 언어, 앞뒤 문맥, 클러스터 수준, 버퍼 깃발, 세로쓰기)와
+다른 시스템의 글꼴은 이유별로 세고 뺀다. [text/harfbuzz-suite.known](../../text/harfbuzz-suite.known)에 적힌 것 밖의 차이는
+실패다. 적힌 것이 맞게 되면 알린다(`make check-harfbuzz HARFBUZZ_SRC=...`).
+
+처음 돌렸을 때 비교한 5,199건 가운데 1,355건만 같았다. 차이 대부분은 문자 지도였다(위의 형식 13과 기호 지도). 그것을 고치자
+5,011건이 같다. 남은 것은 AAT 글꼴(거부), 이체 선택자, 글리프를 나눠 쓰는 아랍 대체 셰이핑, `kern` 형식 2, Zawgyi, 계획이 없는
+실행 하나다. 설치된 글꼴 213개와 Noto 21개의 무작위 실행도 다시 돌려 차이가 없다.
 
 ## 비례폭 글줄
 

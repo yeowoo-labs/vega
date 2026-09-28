@@ -180,22 +180,29 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
     s->size = size;
     s->upem = le16(bytes + 8);
     s->glyph_count = le16(bytes + 10);
-    s->cmap_count = le32(bytes + 12);
+    s->cmap_groups = le32(bytes + 12);
     uint32_t cmap = le32(bytes + 16), advances = le32(bytes + 20);
     if (!s->upem) REFUSE("units per em");
-    if (!within(size, cmap, (uint64_t)s->cmap_count * 8)) REFUSE("character map");
+    if (!within(size, cmap, (uint64_t)s->cmap_groups * 12)) REFUSE("character map");
     s->cmap = bytes + cmap;
-    for (uint32_t i = 0; i < s->cmap_count; ++i) {
-        uint32_t code = le32(s->cmap + 8 * i), glyph = le32(s->cmap + 8 * i + 4);
-        if ((i && code <= le32(s->cmap + 8 * i - 8)) || !glyph || glyph >= s->glyph_count)
-            REFUSE("character map: entry %u", i);
+    for (uint32_t i = 0; i < s->cmap_groups; ++i) {
+        const unsigned char *g = s->cmap + 12 * (size_t)i;
+        uint32_t first = le32(g), last = le32(g + 4), glyph = le32(g + 8) & 0x7FFFFFFF;
+        bool same = le32(g + 8) >> 31;
+        if ((i && first <= le32(g - 8)) || last < first || last > 0x10FFFF || !glyph ||
+            (uint64_t)glyph + (same ? 0 : last - first) >= s->glyph_count)
+            REFUSE("character map: group %u", i);
     }
-    for (uint32_t i = 0; i < s->cmap_count; ++i) {
-        uint32_t code = le32(s->cmap + 8 * i);
-        if (code > 0xFFFF) break;
-        uint16_t **page = &s->bmp[code >> 8];
-        if (!*page && !(*page = calloc(256, sizeof(**page)))) REFUSE("out of memory");
-        (*page)[code & 255] = (uint16_t)le32(s->cmap + 8 * i + 4);
+    for (uint32_t i = 0; i < s->cmap_groups; ++i) {
+        const unsigned char *g = s->cmap + 12 * (size_t)i;
+        uint32_t first = le32(g), last = le32(g + 4), glyph = le32(g + 8) & 0x7FFFFFFF;
+        bool same = le32(g + 8) >> 31;
+        if (first > 0xFFFF) break;
+        for (uint32_t code = first; code <= last && code <= 0xFFFF; ++code) {
+            uint16_t **page = &s->bmp[code >> 8];
+            if (!*page && !(*page = calloc(256, sizeof(**page)))) REFUSE("out of memory");
+            (*page)[code & 255] = (uint16_t)(same ? glyph : glyph + (code - first));
+        }
     }
     if (!within(size, advances, 2 * (uint64_t)s->glyph_count)) REFUSE("advances");
     s->advances = bytes + advances;
@@ -272,12 +279,13 @@ void vega_shaping_close(VegaShaping *s) {
 
 uint32_t vega_shaping_glyph(const VegaShaping *s, uint32_t code) {
     if (code <= 0xFFFF) return s->bmp[code >> 8] ? s->bmp[code >> 8][code & 255] : 0;
-    uint32_t low = 0, high = s->cmap_count;
+    uint32_t low = 0, high = s->cmap_groups;
     while (low < high) {
-        uint32_t middle = (low + high) / 2, c = le32(s->cmap + 8 * (size_t)middle);
-        if (c < code) low = middle + 1;
-        else if (c > code) high = middle;
-        else return le32(s->cmap + 8 * (size_t)middle + 4);
+        uint32_t middle = (low + high) / 2;
+        const unsigned char *g = s->cmap + 12 * (size_t)middle;
+        if (le32(g + 4) < code) low = middle + 1;
+        else if (le32(g) > code) high = middle;
+        else return le32(g + 8) >> 31 ? le32(g + 8) & 0x7FFFFFFF : le32(g + 8) + (code - le32(g));
     }
     return 0;
 }
