@@ -39,24 +39,37 @@ $(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h symbols/symbols.c symbols/
 		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c \
 		$(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@
 
-# Building symbol files reads fonts through FreeType; reading them does not.
+# Building symbol files reads fonts through FreeType, and compiles and checks
+# their shaping with HarfBuzz; reading them needs neither.
 FREETYPE_CFLAGS ?= $(shell pkg-config --cflags freetype2)
 FREETYPE_LIBS ?= $(shell pkg-config --libs freetype2)
+HARFBUZZ_CFLAGS ?= $(shell pkg-config --cflags harfbuzz)
+HARFBUZZ_LIBS ?= $(shell pkg-config --libs harfbuzz)
 # Drawing them on the GPU takes OpenGL ES 3.1 through EGL.
 GL_LIBS ?= $(shell pkg-config --libs egl glesv2)
 SYMBOLS = symbols/symbols.c symbols/symbols-gl.c
-$(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbols/symbols-gl.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) symbols/symbols-tool.c $(SYMBOLS) $(LDFLAGS) \
-		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
+SHAPE = text/shape.c text/unicode-data.c
+$(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbols/symbols-gl.h $(SHAPE) text/shape-build.c \
+		text/shape.h text/shape-build.h text/text.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) -Itext symbols/symbols-tool.c $(SYMBOLS) $(SHAPE) \
+		text/shape-build.c $(LDFLAGS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
 TEXT = text/bidi.c text/normalize.c text/unicode-data.c
 $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
 
-# Unicode's conformance tests, where the UCD is installed (Debian: unicode-data).
+# Unicode's conformance tests, where the UCD is installed (Debian: unicode-data);
+# and shaping, where DejaVu Sans is: the build refuses a file whose shaping
+# differs from HarfBuzz's on random runs of Latin, Greek, Cyrillic, Hebrew,
+# Arabic and Common text, both ways.
 UCD ?= /usr/share/unicode
+SHAPED_FONT ?= /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+SHAPED_CODES = 0x20-0x7e,0xa0-0x24f,0x300-0x36f,0x370-0x3ff,0x400-0x4ff,0x591-0x5f4,0x600-0x6ff,0x2000-0x206f
 check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text
 	if [ -f $(UCD)/BidiTest.txt ]; then $(BUILD)/test-text $(UCD); else echo "no UCD at $(UCD): text tests skipped"; fi
+	if [ -f $(SHAPED_FONT) ]; then $(BUILD)/vega-symbols build --font $(SHAPED_FONT) --codes $(SHAPED_CODES) \
+		--shape Latn,Grek,Cyrl,Hebr,Arab,Zyyy --runs 5000 -o $(BUILD)/shaped.vsym; \
+		else echo "no $(SHAPED_FONT): shaping tests skipped"; fi
 	$(MAKE) -C $(AUP) build/aup
 	$(MAKE) -C $(PURE) build/pure-serve
 	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve

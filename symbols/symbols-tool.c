@@ -1,13 +1,17 @@
 #define _POSIX_C_SOURCE 200809L
 /* vega-symbols: build symbol files from fonts and SVG icons, and measure them
  * against FreeType (docs/design/002-symbol-format.md).
- *   vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,...]... [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym
+ *   vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,... [--shape Latn,Arab,...]]... [--svg CODE=ICON.svg ...]
+ *                      [--units N] [--runs N] -o OUT.vsym
+ *   vega-symbols shape-check FONT.ttf OUT.vsym [--face N] [--runs N] [--seed N]
  *   vega-symbols compare FONT.ttf OUT.vsym --sizes 12,16,32,64
  *   vega-symbols info OUT.vsym
  *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm
  *   vega-symbols gpu OUT.vsym --sizes 12,16,32,64 [--frames N] */
+#include "shape-build.h"
 #include "symbols-gl.h"
 #include "symbols.h"
+#include "text.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <ft2build.h>
@@ -18,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define PI 3.14159265358979323846
 
@@ -27,7 +32,9 @@ typedef struct { double x, y; } Point;
 typedef enum { MOVE, LINE, QUAD } Kind;
 typedef struct { Kind kind; bool smooth; Point control, end; } Segment;
 typedef struct { Segment *items; size_t count, capacity; Point at, start; bool open; double font_scale; } Path;
-typedef struct { uint32_t code; size_t first, count; int16_t advance; } Built; /* segments [first, first + count) */
+/* segments [first, first + count); a font's glyph (-1 for an icon), for
+ * symbols that share it to share its points */
+typedef struct { uint32_t code; size_t first, count; int16_t advance; int font; long glyph; } Built;
 
 static void fail(const char *why) {
     fprintf(stderr, "vega-symbols: %s\n", why);
@@ -407,18 +414,45 @@ static int by_code(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* line: a font's ascent and descent in the build's units (0 and 0 without a font). */
-static void write_symbols(const char *out, uint16_t units, const long line[2], Built *built, size_t count, const Path *path) {
+/* The first symbol built from the same font's glyph, or i itself. */
+static size_t shared_with(const Built *built, size_t i, long *table, size_t capacity) {
+    if (built[i].glyph < 0) return i;
+    size_t at = ((size_t)built[i].glyph * 2654435761u + (size_t)built[i].font) & (capacity - 1);
+    for (;; at = (at + 1) & (capacity - 1)) {
+        if (table[at] < 0) {
+            table[at] = (long)i;
+            return i;
+        }
+        const Built *other = &built[table[at]];
+        if (other->glyph == built[i].glyph && other->font == built[i].font) return (size_t)table[at];
+    }
+}
+
+/* line: a font's ascent and descent in the build's units (0 and 0 without a
+ * font); shaping: a shaping section to carry (NULL for none). */
+static void write_symbols(const char *out, uint16_t units, const long line[2], Built *built, size_t count, const Path *path,
+                          const VegaSection *shaping) {
     long ascent = line[0], descent = line[1];
     qsort(built, count, sizeof(*built), by_code);
     for (size_t i = 1; i < count; ++i) if (built[i].code == built[i - 1].code) fail("a code is given twice");
     Points points = {0};
-    size_t *first = calloc(count + 1, sizeof(*first));
+    size_t *first = calloc(count + 1, sizeof(*first)), *length = calloc(count + 1, sizeof(*length)), capacity = 16;
+    while (capacity < 2 * count) capacity *= 2;
+    long *table = malloc(capacity * sizeof(*table));
+    if (!first || !length || !table) fail("out of memory");
+    for (size_t i = 0; i < capacity; ++i) table[i] = -1;
     for (size_t i = 0; i < count; ++i) {
+        size_t same = shared_with(built, i, table, capacity);
+        if (same != i) {
+            first[i] = first[same];
+            length[i] = length[same];
+            continue;
+        }
         first[i] = points.count;
         emit_symbol(&points, path->items + built[i].first, built[i].count);
+        length[i] = points.count - first[i];
     }
-    first[count] = points.count;
+    free(table);
     /* Halve units while every coordinate is even: a TrueType font's own. */
     for (;;) {
         bool even = units % 2 == 0 && units > 16;
@@ -432,10 +466,14 @@ static void write_symbols(const char *out, uint16_t units, const long line[2], B
         units /= 2;
     }
     if (ascent > INT16_MAX || descent < INT16_MIN) fail("the font's line does not fit 16 bits");
-    size_t size = VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES + points.count * VEGA_POINT_BYTES;
+    size_t size = VEGA_SYMBOLS_HEADER + count * VEGA_SYMBOL_BYTES + points.count * VEGA_POINT_BYTES,
+           outlines = size;
+    if (shaping) size += shaping->size;
     unsigned char *bytes = calloc(1, size);
     if (!bytes) fail("out of memory");
-    memcpy(bytes, "VEGASYM3", 8);
+    memcpy(bytes, shaping ? "VEGASYM4" : "VEGASYM3", 8);
+    put16(bytes + 10, shaping ? VEGA_SYMBOLS_SHAPING : 0);
+    if (shaping) memcpy(bytes + outlines, shaping->bytes, shaping->size);
     put16(bytes + 8, units);
     put16(bytes + 24, (int)ascent);
     put16(bytes + 26, (int)descent);
@@ -451,7 +489,7 @@ static void write_symbols(const char *out, uint16_t units, const long line[2], B
     }
     for (size_t i = 0; i < count; ++i) {
         long left = 0, bottom = 0, right = 0, top = 0;
-        for (size_t k = first[i]; k < first[i + 1]; ++k) {
+        for (size_t k = first[i]; k < first[i] + length[i]; ++k) {
             const Emitted *e = &points.items[k];
             if (k == first[i]) { left = right = e->x; bottom = top = e->y; }
             left = e->x < left ? e->x : left;
@@ -462,7 +500,7 @@ static void write_symbols(const char *out, uint16_t units, const long line[2], B
         unsigned char *p = bytes + VEGA_SYMBOLS_HEADER + i * VEGA_SYMBOL_BYTES;
         put32(p, built[i].code);
         put32(p + 4, (uint32_t)first[i]);
-        put32(p + 8, (uint32_t)(first[i + 1] - first[i]));
+        put32(p + 8, (uint32_t)length[i]);
         put16(p + 12, (int)left);
         put16(p + 14, (int)bottom);
         put16(p + 16, (int)right);
@@ -480,10 +518,11 @@ static void write_symbols(const char *out, uint16_t units, const long line[2], B
         VegaSymbol symbol = vega_symbol_at(&check, i);
         for (uint32_t k = symbol.first; k < symbol.first + symbol.count; ++k) curves += vega_symbol_curve(&check, &symbol, k, &curve);
     }
-    printf("{\"symbols\":%zu,\"points\":%zu,\"curves\":%zu,\"units\":%u,\"bytes\":%zu}\n", count, points.count, curves,
-           units, size);
+    printf("{\"symbols\":%zu,\"points\":%zu,\"curves\":%zu,\"units\":%u,\"shaping\":%zu,\"bytes\":%zu}\n", count,
+           points.count, curves, units, shaping ? shaping->size : 0, size);
     free(bytes);
     free(first);
+    free(length);
     free(points.items);
 }
 
@@ -513,23 +552,72 @@ static double seconds(void) {
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
 
-#define BUILD_USAGE \
-    "usage: vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,...]... [--svg CODE=ICON.svg ...] [--units N] -o OUT.vsym"
+#define BUILD_USAGE                                                                                          \
+    "usage: vega-symbols build [--font FONT.ttf [--face N] --codes 0x20-0x7e,... [--shape Latn,Arab,...]]... " \
+    "[--svg CODE=ICON.svg ...] [--units N] [--runs N] -o OUT.vsym"
+
+static VegaSymbols open_symbols(const char *name, char **bytes);
 
 /* Fonts in order, each with the codes to take from it: a code an earlier
  * font gave is not taken again, so later fonts fill what earlier ones lack
- * (a monospace Latin font, then a CJK one for Hangul). */
-typedef struct { const char *path, *codes; long face; } Font;
+ * (a monospace Latin font, then a CJK one for Hangul). One font may be
+ * shaped: its shaping for the scripts named (ISO 15924 codes) goes into the
+ * file, with the glyphs shaping reaches as symbols of their own. */
+typedef struct { const char *path, *codes, *shape; long face; } Font;
+
+static uint32_t le32_at(const unsigned char *p) { return p[0] | p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+/* Shape runs random runs of codes per plan of the file's shaping with it
+ * and with HarfBuzz; one JSON line per plan; false when any run differs. */
+static bool check_shaping(const VegaSymbols *symbols, hb_font_t *font, const uint32_t *codes, size_t count, size_t runs,
+                          uint64_t seed) {
+    char error[128];
+    VegaShaping shaping;
+    if (!symbols->shaping) fail("the symbol file carries no shaping");
+    if (!vega_shaping_open(&shaping, symbols->shaping, symbols->shaping_size, error, sizeof(error))) fail(error);
+    bool same = true;
+    for (uint32_t i = 0; i < shaping.plan_count; ++i) {
+        const unsigned char *plan = shaping.plans + (size_t)i * VEGA_PLAN_BYTES;
+        uint32_t script = le32_at(plan);
+        VegaShapeCheck check;
+        vega_shaping_check(font, &shaping, script, plan[4], codes, count, seed, runs, &check, stderr);
+        printf("{\"script\":\"%c%c%c%c\",\"direction\":\"%s\",\"runs\":%zu,\"characters\":%zu,\"glyphs\":%zu,"
+               "\"differences\":%zu,\"vega_ns_per_character\":%.1f,\"harfbuzz_ns_per_character\":%.1f}\n",
+               (char)(script >> 24), (char)(script >> 16), (char)(script >> 8), (char)script,
+               plan[4] == VEGA_SHAPE_RTL ? "rtl" : "ltr", check.runs, check.characters, check.glyphs, check.differences,
+               check.characters ? 1e9 * check.vega_seconds / (double)check.characters : 0,
+               check.characters ? 1e9 * check.harfbuzz_seconds / (double)check.characters : 0);
+        same = same && !check.differences;
+    }
+    vega_shaping_close(&shaping);
+    return same;
+}
+
+/* 0x4C61746E for "Latn,..." and so on. */
+static size_t script_tags(const char *text, uint32_t *out, size_t room) {
+    size_t count = 0;
+    for (const char *p = text; *p && count < room;) {
+        if (strlen(p) < 4) fail("--shape takes ISO 15924 codes: Latn,Arab,...");
+        out[count++] = (uint32_t)(unsigned char)p[0] << 24 | (uint32_t)(unsigned char)p[1] << 16 |
+                       (uint32_t)(unsigned char)p[2] << 8 | (unsigned char)p[3];
+        p += 4;
+        if (*p == ',') ++p;
+        else if (*p) fail("--shape takes ISO 15924 codes: Latn,Arab,...");
+    }
+    return count;
+}
 
 static int build(int argc, char **argv) {
     const char *out = NULL, **icons = calloc((size_t)argc, sizeof(*icons));
     Font *fonts = calloc((size_t)argc, sizeof(*fonts));
-    size_t icon_count = 0, font_count = 0;
+    size_t icon_count = 0, font_count = 0, runs = 3000;
     long units = 0;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 == argc) fail(BUILD_USAGE);
         if (!strcmp(argv[i], "-o")) out = argv[i + 1];
-        else if (!strcmp(argv[i], "--font")) fonts[font_count++] = (Font){argv[i + 1], NULL, 0};
+        else if (!strcmp(argv[i], "--font")) fonts[font_count++] = (Font){argv[i + 1], NULL, NULL, 0};
+        else if (!strcmp(argv[i], "--shape") && font_count) fonts[font_count - 1].shape = argv[i + 1];
+        else if (!strcmp(argv[i], "--runs")) runs = strtoul(argv[i + 1], NULL, 10);
         else if (!strcmp(argv[i], "--face") && font_count) fonts[font_count - 1].face = strtol(argv[i + 1], NULL, 10); /* in a .ttc */
         else if (!strcmp(argv[i], "--codes") && font_count) fonts[font_count - 1].codes = argv[i + 1];
         else if (!strcmp(argv[i], "--units")) units = strtol(argv[i + 1], NULL, 10);
@@ -537,7 +625,12 @@ static int build(int argc, char **argv) {
         else fail(BUILD_USAGE);
     }
     if (!out) fail(BUILD_USAGE);
-    for (size_t f = 0; f < font_count; ++f) if (!fonts[f].codes) fail(BUILD_USAGE);
+    long shaped = -1;
+    for (size_t f = 0; f < font_count; ++f) {
+        if (!fonts[f].codes) fail(BUILD_USAGE);
+        if (fonts[f].shape && shaped >= 0) fail("only one font can be shaped");
+        if (fonts[f].shape) shaped = (long)f;
+    }
     FT_Library library = NULL;
     FT_Face *faces = calloc(font_count + 1, sizeof(*faces));
     if (font_count && FT_Init_FreeType(&library)) fail("cannot start FreeType");
@@ -553,6 +646,23 @@ static int build(int argc, char **argv) {
     uint32_t **lists = calloc(font_count + 1, sizeof(*lists));
     size_t *counts = calloc(font_count + 1, sizeof(*counts));
     for (size_t f = 0; f < font_count; ++f) capacity += counts[f] = codes_of(fonts[f].codes, &lists[f]);
+    /* The shaped font's section, and the glyphs shaping reaches. */
+    VegaSection section = {0};
+    hb_face_t *hb_face = NULL;
+    hb_set_t *reached = hb_set_create();
+    if (shaped >= 0) {
+        uint32_t scripts[64];
+        size_t script_count = script_tags(fonts[shaped].shape, scripts, 64);
+        hb_blob_t *blob = hb_blob_create_from_file_or_fail(fonts[shaped].path);
+        if (!blob) fail("cannot read a font to shape");
+        hb_face = hb_face_create(blob, (unsigned)fonts[shaped].face);
+        hb_blob_destroy(blob);
+        char error[160];
+        if (!vega_shaping_compile(hb_face, scripts, script_count, lists[shaped], counts[shaped], &section, reached, error,
+                                  sizeof(error)))
+            fail(error);
+        capacity += hb_set_get_population(reached);
+    }
     Built *built = calloc(capacity, sizeof(*built));
     Path path = {.font_scale = 1};
     size_t made = 0;
@@ -573,7 +683,22 @@ static int build(int argc, char **argv) {
             }
             close_path(&path);
             long advance = lround((double)face->glyph->metrics.horiAdvance * units / face->units_per_EM);
-            built[made++] = (Built){lists[f][i], first, path.count - first, (int16_t)(advance > INT16_MAX ? INT16_MAX : advance)};
+            built[made++] = (Built){lists[f][i], first, path.count - first, (int16_t)(advance > INT16_MAX ? INT16_MAX : advance),
+                                    (int)f, (long)glyph};
+        }
+        if ((long)f != shaped) continue;
+        for (hb_codepoint_t glyph = HB_SET_VALUE_INVALID; hb_set_next(reached, &glyph);) {
+            if (FT_Load_Glyph(face, glyph, FT_LOAD_NO_SCALE)) fail("cannot load a glyph shaping reaches");
+            size_t first = path.count;
+            path.open = false;
+            if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+                FT_Outline_Transform(&face->glyph->outline, &(FT_Matrix){0x20000, 0, 0, 0x20000});
+                if (FT_Outline_Decompose(&face->glyph->outline, &walk, &path)) fail("cannot walk an outline");
+            }
+            close_path(&path);
+            long advance = lround((double)face->glyph->metrics.horiAdvance * units / face->units_per_EM);
+            built[made++] = (Built){VEGA_GLYPH_SYMBOLS + glyph, first, path.count - first,
+                                    (int16_t)(advance > INT16_MAX ? INT16_MAX : advance), (int)f, (long)glyph};
         }
     }
     for (size_t i = 0; i < icon_count; ++i) {
@@ -583,12 +708,28 @@ static int build(int argc, char **argv) {
         path.open = false;
         int16_t advance;
         svg_icon(&path, equals + 1, (uint16_t)units, &advance);
-        built[made++] = (Built){(uint32_t)strtoul(icons[i], NULL, 0), first, path.count - first, advance};
+        built[made++] = (Built){(uint32_t)strtoul(icons[i], NULL, 0), first, path.count - first, advance, -1, -1};
     }
     /* The first font's line as FreeType reports it (hhea or typo metrics). */
     long line[2] = {font_count ? lround((double)faces[0]->ascender * units / faces[0]->units_per_EM) : 0,
                     font_count ? lround((double)faces[0]->descender * units / faces[0]->units_per_EM) : 0};
-    write_symbols(out, (uint16_t)units, line, built, made, &path);
+    write_symbols(out, (uint16_t)units, line, built, made, &path, shaped >= 0 ? &section : NULL);
+    if (shaped >= 0) {
+        /* The file refuses to exist if its shaping differs from HarfBuzz's. */
+        char *bytes;
+        VegaSymbols check = open_symbols(out, &bytes);
+        hb_font_t *font = hb_font_create(hb_face);
+        bool same = check_shaping(&check, font, lists[shaped], counts[shaped], runs, 1);
+        hb_font_destroy(font);
+        free(bytes);
+        if (!same) {
+            unlink(out);
+            fail("shaping differs from HarfBuzz's: the file is not written");
+        }
+        hb_face_destroy(hb_face);
+        free(section.bytes);
+    }
+    hb_set_destroy(reached);
     for (size_t f = 0; f < font_count; ++f) {
         FT_Done_Face(faces[f]);
         free(lists[f]);
@@ -926,12 +1067,96 @@ static int gpu(int argc, char **argv) {
     return 0;
 }
 
+/* Check a file's shaping against HarfBuzz with the font it was built from,
+ * on runs made of the codes it has symbols for. */
+static int shape_check(int argc, char **argv) {
+    if (argc < 4) fail("usage: vega-symbols shape-check FONT.ttf OUT.vsym [--face N] [--runs N] [--seed N]");
+    long face_index = 0;
+    size_t runs = 20000;
+    uint64_t seed = 1;
+    for (int i = 4; i + 1 < argc; i += 2) {
+        if (!strcmp(argv[i], "--face")) face_index = strtol(argv[i + 1], NULL, 10);
+        else if (!strcmp(argv[i], "--runs")) runs = strtoul(argv[i + 1], NULL, 10);
+        else if (!strcmp(argv[i], "--seed")) seed = strtoull(argv[i + 1], NULL, 10);
+        else fail("shape-check takes --face, --runs and --seed");
+    }
+    char *bytes;
+    VegaSymbols s = open_symbols(argv[3], &bytes);
+    uint32_t *codes = malloc((s.symbols + 1) * sizeof(*codes));
+    size_t count = 0;
+    for (uint32_t i = 0; i < s.symbols; ++i) {
+        uint32_t code = vega_symbol_at(&s, i).code;
+        if (code < VEGA_GLYPH_SYMBOLS) codes[count++] = code;
+    }
+    hb_blob_t *blob = hb_blob_create_from_file_or_fail(argv[2]);
+    if (!blob) fail("cannot read the font");
+    hb_face_t *face = hb_face_create(blob, (unsigned)face_index);
+    hb_font_t *font = hb_font_create(face);
+    bool same = check_shaping(&s, font, codes, count, runs, seed);
+    hb_font_destroy(font);
+    hb_face_destroy(face);
+    hb_blob_destroy(blob);
+    free(codes);
+    free(bytes);
+    return same ? 0 : 1;
+}
+
+/* Shape one run with both and print them: vega-symbols shape FONT.ttf
+ * OUT.vsym SCRIPT ltr|rtl 0066,0069,... */
+static int shape_one(int argc, char **argv) {
+    if (argc != 7) fail("usage: vega-symbols shape FONT.ttf OUT.vsym SCRIPT ltr|rtl CODE,CODE,...");
+    char *bytes, error[128];
+    VegaSymbols s = open_symbols(argv[3], &bytes);
+    VegaShaping shaping;
+    if (!s.shaping || !vega_shaping_open(&shaping, s.shaping, s.shaping_size, error, sizeof(error))) fail("no shaping");
+    uint32_t script, codes[256];
+    script_tags(argv[4], &script, 1);
+    int direction = !strcmp(argv[5], "rtl") ? VEGA_SHAPE_RTL : VEGA_SHAPE_LTR;
+    size_t count = 0;
+    for (char *p = argv[6]; *p && count < 256;) {
+        codes[count++] = (uint32_t)strtoul(p, &p, 16);
+        if (*p == ',') ++p;
+    }
+    VegaShaper *shaper = vega_shaper_new();
+    const VegaShaped *ours;
+    long n = vega_shape(shaper, &shaping, codes, count, script, direction, &ours);
+    printf("vega    ");
+    for (long i = 0; i < n; ++i)
+        printf(" %u@%u(%d+%d,%d)", ours[i].glyph, ours[i].cluster, ours[i].x_advance, ours[i].x_offset, ours[i].y_offset);
+    printf("\n");
+    hb_blob_t *blob = hb_blob_create_from_file_or_fail(argv[2]);
+    hb_face_t *face = hb_face_create(blob, 0);
+    hb_font_t *font = hb_font_create(face);
+    hb_buffer_t *buffer = hb_buffer_create();
+    hb_buffer_add_codepoints(buffer, codes, (int)count, 0, (int)count);
+    hb_buffer_set_direction(buffer, direction == VEGA_SHAPE_RTL ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+    hb_buffer_set_script(buffer, hb_script_from_iso15924_tag(script));
+    hb_shape(font, buffer, NULL, 0);
+    unsigned m;
+    hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &m);
+    hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buffer, &m);
+    printf("harfbuzz");
+    for (unsigned i = 0; i < m; ++i)
+        printf(" %u@%u(%d+%d,%d)", info[i].codepoint, info[i].cluster, pos[i].x_advance, pos[i].x_offset, pos[i].y_offset);
+    printf("\n");
+    hb_buffer_destroy(buffer);
+    hb_font_destroy(font);
+    hb_face_destroy(face);
+    hb_blob_destroy(blob);
+    vega_shaper_free(shaper);
+    vega_shaping_close(&shaping);
+    free(bytes);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "shape")) return shape_one(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "build")) return build(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "shape-check")) return shape_check(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "compare")) return compare(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "info")) return info(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "render")) return render(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "gpu")) return gpu(argc, argv);
-    fail("vega-symbols build|compare|info|render|gpu ...");
+    fail("vega-symbols build|shape-check|compare|info|render|gpu ...");
     return 2;
 }

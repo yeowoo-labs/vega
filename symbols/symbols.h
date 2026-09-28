@@ -26,7 +26,14 @@ typedef struct {
     uint16_t units;          /* per em */
     int16_t ascent, descent; /* a font's line, in units from the baseline, y up (0 and 0 for icons) */
     uint32_t symbols, points;
+    /* A font's shaping (text/shape.h), when the file carries it: after the
+     * points, a flag in the header saying so (VEGASYM4). */
+    const unsigned char *shaping;
+    size_t shaping_size;
 } VegaSymbols;
+/* The glyphs shaping gives are the shaped font's own: glyph g is the symbol
+ * VEGA_GLYPH_SYMBOLS + g (past every code point). */
+enum { VEGA_GLYPH_SYMBOLS = 0x110000, VEGA_SYMBOLS_SHAPING = 1 };
 
 /* Verify bytes as a symbol file (kept, not copied); false with why. What
  * reading needs is checked, per symbol: after this no read leaves the file

@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const unsigned char magic[8] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M', '3'};
+/* VEGASYM3, or VEGASYM4: flags in the header (VEGA_SYMBOLS_SHAPING) and
+ * what they name after the points. */
+static const unsigned char magic[7] = {'V', 'E', 'G', 'A', 'S', 'Y', 'M'};
 
 static uint16_t u16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static int16_t i16(const unsigned char *p) { return (int16_t)u16(p); }
@@ -28,10 +30,19 @@ VegaPoint vega_symbols_point(const VegaSymbols *s, uint32_t index) {
 #define REFUSE(...) do { snprintf(error, error_size, __VA_ARGS__); return false; } while (0)
 
 bool vega_symbols_open(VegaSymbols *s, const unsigned char *bytes, size_t size, char *error, size_t error_size) {
-    if (size < VEGA_SYMBOLS_HEADER || memcmp(bytes, magic, sizeof(magic))) REFUSE("not a symbol file");
-    *s = (VegaSymbols){bytes, size, u16(bytes + 8), i16(bytes + 24), i16(bytes + 26), u32(bytes + 12), u32(bytes + 16)};
+    if (size < VEGA_SYMBOLS_HEADER || memcmp(bytes, magic, sizeof(magic)) || (bytes[7] != '3' && bytes[7] != '4'))
+        REFUSE("not a symbol file");
+    *s = (VegaSymbols){bytes, size, u16(bytes + 8), i16(bytes + 24), i16(bytes + 26), u32(bytes + 12), u32(bytes + 16), NULL, 0};
     uint64_t expected = VEGA_SYMBOLS_HEADER + (uint64_t)s->symbols * VEGA_SYMBOL_BYTES + (uint64_t)s->points * VEGA_POINT_BYTES;
-    if (u16(bytes + 10) || !s->units || s->ascent < s->descent) REFUSE("header");
+    unsigned flags = u16(bytes + 10);
+    if ((flags && bytes[7] == '3') || (flags & ~(unsigned)VEGA_SYMBOLS_SHAPING) || !s->units || s->ascent < s->descent)
+        REFUSE("header");
+    if (flags & VEGA_SYMBOLS_SHAPING) {
+        if (expected > size || size - expected < 8) REFUSE("size: no room for the shaping section");
+        s->shaping = bytes + expected;
+        s->shaping_size = u32(s->shaping + 4);
+        expected += s->shaping_size;
+    }
     if (u32(bytes + 20) != size || expected != size) REFUSE("size: %zu bytes for %u symbols and %u points", size, s->symbols, s->points);
     for (uint32_t i = 0; i < s->symbols; ++i) {
         VegaSymbol symbol = vega_symbol_at(s, i);
