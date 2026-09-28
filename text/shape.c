@@ -227,7 +227,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
         uint32_t ranges[2][2] = {{le32(p + 80), le32(p + 84)}, {le32(p + 88), le32(p + 92)}};
-        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_MYANMAR)
+        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_USE)
             REFUSE("plan %u", i);
         if ((p[7] & VEGA_PLAN_FALLBACK_MARKS) && !s->extents) REFUSE("plan %u: marks placed without extents", i);
         for (int table = 0; table < 2; ++table) {
@@ -236,7 +236,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
             for (uint32_t k = 0; k < ranges[table][1]; ++k) {
                 const unsigned char *step = s->steps + (size_t)(ranges[table][0] + k) * VEGA_STEP_BYTES;
                 bool pause = le16(step) == VEGA_STEP_PAUSE;
-                if (pause ? table || !step[2] || step[2] > VEGA_PAUSE_CLEAR_SYLLABLES : le16(step) >= s->lookup_count[table])
+                if (pause ? table || !step[2] || step[2] > VEGA_PAUSE_RECORD_PREF : le16(step) >= s->lookup_count[table])
                     REFUSE("plan %u: a lookup the font lacks", i);
             }
         }
@@ -315,6 +315,7 @@ typedef struct {
 struct VegaShaper {
     Info *info, *out;
     Position *pos;
+    uint32_t *kept; /* the glyphs a syllable machine reads (USE's) */
     size_t len, out_len, idx, allocated, max_len;
     bool have_output, successful;
     int direction;
@@ -334,6 +335,7 @@ void vega_shaper_free(VegaShaper *b) {
     free(b->info);
     free(b->out);
     free(b->pos);
+    free(b->kept);
     free(b->glyphs);
     free(b);
 }
@@ -352,11 +354,13 @@ static bool ensure(VegaShaper *b, size_t size) {
     Info *out = info ? realloc(b->out, n * sizeof(*out)) : NULL;
     if (out) b->out = out;
     Position *pos = out ? realloc(b->pos, n * sizeof(*pos)) : NULL;
-    if (!pos) {
+    if (pos) b->pos = pos;
+    uint32_t *kept = pos ? realloc(b->kept, n * sizeof(*kept)) : NULL;
+    if (!kept) {
         b->successful = false;
         return false;
     }
-    b->pos = pos;
+    b->kept = kept;
     b->allocated = n;
     return true;
 }
@@ -823,7 +827,7 @@ static bool compose(const Normalizer *c, uint32_t a, uint32_t b, uint32_t *ab) {
     switch (c->plan->shaper) {
     case VEGA_SHAPER_HEBREW: return compose_hebrew(c, a, b, ab);
     case VEGA_SHAPER_INDIC: return compose_indic(a, b, ab);
-    case VEGA_SHAPER_KHMER: return !is_mark_category(vega_category(a)) && compose_unicode(a, b, ab);
+    case VEGA_SHAPER_KHMER: case VEGA_SHAPER_USE: return !is_mark_category(vega_category(a)) && compose_unicode(a, b, ab);
     default: return compose_unicode(a, b, ab);
     }
 }
@@ -1035,7 +1039,7 @@ static void normalize(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
      * Indic's decomposes what decomposes even when the font has it whole. */
     const bool none = plan->shaper == VEGA_SHAPER_HANGUL;
     const bool syllabic = plan->shaper == VEGA_SHAPER_INDIC || plan->shaper == VEGA_SHAPER_KHMER ||
-                          plan->shaper == VEGA_SHAPER_MYANMAR;
+                          plan->shaper == VEGA_SHAPER_MYANMAR || plan->shaper == VEGA_SHAPER_USE;
     const bool always_short_circuit = none, might_short_circuit = none || !syllabic;
     bool all_simple = true;
     clear_output(b);
@@ -1169,6 +1173,10 @@ static void setup_masks_arabic(VegaShaper *b, const Plan *plan) {
         prev = i;
         state = entry[2];
     }
+    if (plan->script == TAG4('M', 'o', 'n', 'g'))
+        for (size_t i = 1; i < b->len; ++i)
+            if ((b->info[i].codepoint >= 0x180B && b->info[i].codepoint <= 0x180D) || b->info[i].codepoint == 0x180F)
+                b->info[i].action = b->info[i - 1].action;
     for (size_t i = 0; i < b->len; ++i)
         if (b->info[i].action < NONE) b->info[i].mask |= plan->masks[VEGA_MASK_ISOL + b->info[i].action];
 }
@@ -3325,6 +3333,183 @@ static bool myanmar_reorder(const VegaShaping *s, VegaShaper *b) {
     return changed;
 }
 
+/* ---- The Universal Shaping Engine (hb-ot-shaper-use.cc): syllables by
+ * USE categories; rphf and pref, each recording what it made (a repha, a
+ * pre-base glyph); then a repha moved before the first post-base glyph and
+ * pre-base glyphs moved to the start (or past a halant). Scripts that join
+ * like Arabic take Arabic's forms; others join syllable to syllable. */
+
+enum { USE_VIRAMA_TERMINATED, USE_SAKOT_TERMINATED, USE_STANDARD, USE_NUMBER_JOINER_TERMINATED, USE_NUMERAL,
+       USE_SYMBOL, USE_HIEROGLYPH, USE_BROKEN, USE_NON_CLUSTER };
+
+/* The scripts with Arabic's joining data (hb-ot-shaper-arabic-joining-list.hh). */
+static bool arabic_joining_script(uint32_t script) {
+    switch (script) {
+    case TAG4('A', 'd', 'l', 'm'): case TAG4('A', 'r', 'a', 'b'): case TAG4('C', 'h', 'r', 's'):
+    case TAG4('R', 'o', 'h', 'g'): case TAG4('M', 'a', 'n', 'd'): case TAG4('M', 'a', 'n', 'i'):
+    case TAG4('M', 'o', 'n', 'g'): case TAG4('N', 'k', 'o', 'o'): case TAG4('O', 'u', 'g', 'r'):
+    case TAG4('P', 'h', 'a', 'g'): case TAG4('P', 'h', 'l', 'p'): case TAG4('S', 'o', 'g', 'd'):
+    case TAG4('S', 'y', 'r', 'c'):
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void setup_masks_use(VegaShaper *b, const Plan *plan) {
+    if (arabic_joining_script(plan->script)) setup_masks_arabic(b, plan);
+    for (size_t i = 0; i < b->len; ++i) b->info[i].category = vega_use_category(b->info[i].codepoint);
+}
+
+/* The machine reads the glyphs but CGJs, and a ZWNJ only when no mark
+ * follows it (past CGJs); a syllable holds what it skipped after it. */
+static void find_syllables_use(VegaShaper *b) {
+    size_t n = 0;
+    for (size_t i = 0; i < b->len; ++i) {
+        if (b->info[i].category == VEGA_USE_CGJ) continue;
+        if (b->info[i].category == VEGA_USE_ZWNJ) {
+            size_t k = i + 1;
+            while (k < b->len && b->info[k].category == VEGA_USE_CGJ) k++;
+            if (k < b->len && is_unicode_mark(&b->info[k])) continue;
+        }
+        b->kept[n++] = (uint32_t)i;
+    }
+    const VegaMachine *m = &vega_use_machine;
+    unsigned serial = 1;
+    for (size_t p = 0; p < n;) {
+        unsigned state = 0, type = 0;
+        size_t end = p + 1;
+        for (size_t q = p; q < n; ++q) {
+            unsigned category = b->info[b->kept[q]].category;
+            size_t cell = (size_t)state * m->classes + m->class_of[category < 63 ? category : 63];
+            state = m->width == 1 ? ((const uint8_t *)m->next)[cell] : ((const uint16_t *)m->next)[cell];
+            if (state >= m->states) break;
+            if (m->accept[state]) type = m->accept[state], end = q + 1;
+        }
+        if (type == m->broken) b->scratch |= HAS_BROKEN_SYLLABLE;
+        size_t first = b->kept[p], last = end < n ? b->kept[end] : b->len;
+        for (size_t i = first; i < last; ++i) b->info[i].syllable = (uint8_t)(serial << 4 | (type ? type - 1 : 0));
+        if (++serial == 16) serial = 1;
+        p = end;
+    }
+}
+
+static void use_setup_syllables(const Plan *plan, VegaShaper *b) {
+    find_syllables_use(b);
+    Info *info = b->info;
+    /* rphf on what may be a repha: an encoded one, or the first three */
+    uint32_t rphf = plan->masks[VEGA_MASK_USE_RPHF];
+    if (rphf)
+        for (size_t start = 0, end; start < b->len; start = end) {
+            end = next_syllable(b, start);
+            size_t limit = info[start].category == VEGA_USE_R ? 1 : end - start < 3 ? end - start : 3;
+            for (size_t i = start; i < start + limit; ++i) info[i].mask |= rphf;
+        }
+    /* Joining forms, syllable to syllable, where Arabic's did not come. */
+    if (arabic_joining_script(plan->script)) return;
+    enum { FORM_ISOL, FORM_INIT, FORM_MEDI, FORM_FINA, FORM_NONE };
+    uint32_t masks[4] = {plan->masks[VEGA_MASK_ISOL], plan->masks[VEGA_MASK_INIT], plan->masks[VEGA_MASK_MEDI],
+                         plan->masks[VEGA_MASK_FINA]},
+             all = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (masks[i] == plan->global_mask) masks[i] = 0;
+        all |= masks[i];
+    }
+    if (!all) return;
+    uint32_t other = ~all;
+    size_t last_start = 0;
+    int last_form = FORM_NONE;
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        unsigned type = info[start].syllable & 0x0F;
+        if (type == USE_HIEROGLYPH || type == USE_NON_CLUSTER)
+            last_form = FORM_NONE;
+        else {
+            bool join = last_form == FORM_FINA || last_form == FORM_ISOL;
+            if (join) {
+                last_form = last_form == FORM_FINA ? FORM_MEDI : FORM_INIT;
+                for (size_t i = last_start; i < start; ++i) info[i].mask = (info[i].mask & other) | masks[last_form];
+            }
+            last_form = join ? FORM_FINA : FORM_ISOL;
+            for (size_t i = start; i < end; ++i) info[i].mask = (info[i].mask & other) | masks[last_form];
+        }
+        last_start = start;
+    }
+}
+
+/* A repha rphf made (the first substituted glyph under its mask) is a
+ * repha; a glyph pref made is a pre-base vowel. */
+static void use_record(const Plan *plan, VegaShaper *b, unsigned pause) {
+    uint32_t rphf = plan->masks[VEGA_MASK_USE_RPHF];
+    if (pause == VEGA_PAUSE_RECORD_RPHF && !rphf) return;
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        for (size_t i = start; i < end && (pause != VEGA_PAUSE_RECORD_RPHF || (b->info[i].mask & rphf)); ++i)
+            if (b->info[i].gprops & SUBSTITUTED) {
+                b->info[i].category = pause == VEGA_PAUSE_RECORD_RPHF ? VEGA_USE_R : VEGA_USE_VPRE;
+                break;
+            }
+    }
+}
+
+static bool is_halant_use(const Info *i) {
+    return (i->category == VEGA_USE_H || i->category == VEGA_USE_HVM || i->category == VEGA_USE_IS) &&
+           !(i->gprops & LIGATED);
+}
+
+#define FLAG64_UNSAFE(x) ((x) < 64 ? (uint64_t)1 << (x) : 0)
+#define USE_POST_BASE                                                                                               \
+    (FLAG64_UNSAFE(VEGA_USE_FABV) | FLAG64_UNSAFE(VEGA_USE_FBLW) | FLAG64_UNSAFE(VEGA_USE_FPST) |                  \
+     FLAG64_UNSAFE(VEGA_USE_FMABV) | FLAG64_UNSAFE(VEGA_USE_FMBLW) | FLAG64_UNSAFE(VEGA_USE_FMPST) |               \
+     FLAG64_UNSAFE(VEGA_USE_MABV) | FLAG64_UNSAFE(VEGA_USE_MBLW) | FLAG64_UNSAFE(VEGA_USE_MPST) |                  \
+     FLAG64_UNSAFE(VEGA_USE_MPRE) | FLAG64_UNSAFE(VEGA_USE_VABV) | FLAG64_UNSAFE(VEGA_USE_VBLW) |                  \
+     FLAG64_UNSAFE(VEGA_USE_VPST) | FLAG64_UNSAFE(VEGA_USE_VPRE) | FLAG64_UNSAFE(VEGA_USE_VMABV) |                 \
+     FLAG64_UNSAFE(VEGA_USE_VMBLW) | FLAG64_UNSAFE(VEGA_USE_VMPST) | FLAG64_UNSAFE(VEGA_USE_VMPRE))
+
+static void use_reorder_syllable(VegaShaper *b, size_t start, size_t end) {
+    unsigned type = b->info[start].syllable & 0x0F;
+    if (!(FLAG_UNSAFE(type) & (FLAG(USE_VIRAMA_TERMINATED) | FLAG(USE_SAKOT_TERMINATED) | FLAG(USE_STANDARD) |
+                               FLAG(USE_SYMBOL) | FLAG(USE_BROKEN))))
+        return;
+    Info *info = b->info;
+    /* A repha forward, before the first post-base glyph (or to the end). */
+    if (info[start].category == VEGA_USE_R && end - start > 1)
+        for (size_t i = start + 1; i < end; ++i) {
+            bool post_base = (FLAG64_UNSAFE(info[i].category) & USE_POST_BASE) || is_halant_use(&info[i]);
+            if (post_base || i == end - 1) {
+                if (post_base) i--;
+                merge_clusters(b, start, i + 1);
+                Info t = info[start];
+                memmove(&info[start], &info[start + 1], (i - start) * sizeof(Info));
+                info[i] = t;
+                break;
+            }
+        }
+    /* Pre-base vowels back, to the start or past the last halant (only a
+     * multiple substitution's first component). */
+    size_t j = start;
+    for (size_t i = start; i < end; ++i) {
+        uint32_t flag = FLAG_UNSAFE(info[i].category);
+        if (is_halant_use(&info[i]))
+            j = i + 1;
+        else if ((flag & (FLAG(VEGA_USE_VPRE) | FLAG(VEGA_USE_VMPRE))) && !lig_comp(&info[i]) && j < i) {
+            merge_clusters(b, j, i + 1);
+            Info t = info[i];
+            memmove(&info[j + 1], &info[j], (i - j) * sizeof(Info));
+            info[j] = t;
+        }
+    }
+}
+
+static bool use_reorder(const VegaShaping *s, VegaShaper *b) {
+    bool changed = insert_dotted_circles(s, b, USE_BROKEN, VEGA_USE_B, VEGA_USE_R, -1);
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        use_reorder_syllable(b, start, end);
+    }
+    return changed;
+}
+
 /* The shaper's part of the work at a pause in GSUB; whether it changed the
  * buffer. */
 static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause) {
@@ -3344,6 +3529,16 @@ static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, 
     case VEGA_SHAPER_MYANMAR:
         if (pause == VEGA_PAUSE_SYLLABLES) find_syllables(b, &vega_myanmar_machine);
         return pause == VEGA_PAUSE_INITIAL_REORDERING && myanmar_reorder(s, b);
+    case VEGA_SHAPER_USE:
+        switch (pause) {
+        case VEGA_PAUSE_SYLLABLES: use_setup_syllables(plan, b); return false;
+        case VEGA_PAUSE_CLEAR_SUBSTITUTED:
+            for (size_t i = 0; i < b->len; ++i) b->info[i].gprops &= (uint16_t)~SUBSTITUTED;
+            return false;
+        case VEGA_PAUSE_RECORD_RPHF: case VEGA_PAUSE_RECORD_PREF: use_record(plan, b, pause); return false;
+        case VEGA_PAUSE_INITIAL_REORDERING: return use_reorder(s, b);
+        default: return false;
+        }
     default: return false;
     }
 }
@@ -3423,8 +3618,8 @@ static void position(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     for (size_t i = 0; i < b->len; ++i) b->pos[i].x_advance = advance_of(s, b->info[i].codepoint);
     if (b->scratch & HAS_SPACE_FALLBACK) fallback_spaces(s, b);
     bool adjust = (plan->flags & VEGA_PLAN_ADJUST_ZEROING) && b->direction == VEGA_SHAPE_LTR;
-    /* Marks' advances go by GDEF: before GPOS (Myanmar's shaper) or after. */
-    bool early = plan->shaper == VEGA_SHAPER_MYANMAR;
+    /* Marks' advances go by GDEF: before GPOS (Myanmar's shaper and USE) or after. */
+    bool early = plan->shaper == VEGA_SHAPER_MYANMAR || plan->shaper == VEGA_SHAPER_USE;
     if ((plan->flags & VEGA_PLAN_ZERO_MARKS) && early) zero_mark_widths(b, adjust);
     if (plan->flags & VEGA_PLAN_GPOS) apply_table(s, plan, b, 1);
     if (plan->flags & VEGA_PLAN_KERN) kern_table(s, b, plan);
@@ -3460,7 +3655,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     form_clusters(b);
     ensure_native_direction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_HANGUL) preprocess_hangul(s, b);
-    if (plan.shaper == VEGA_SHAPER_INDIC) preprocess_vowel_constraints(&plan, b);
+    if (plan.shaper == VEGA_SHAPER_INDIC || plan.shaper == VEGA_SHAPER_USE) preprocess_vowel_constraints(&plan, b);
 
     /* Mirror what the font mirrors; mark the rest for rtlm. */
     if (direction == VEGA_SHAPE_RTL)
@@ -3474,6 +3669,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     if (plan.shaper == VEGA_SHAPER_ARABIC) setup_masks_arabic(b, &plan);
     if (plan.shaper == VEGA_SHAPER_INDIC) setup_masks_indic(b);
     if (plan.shaper == VEGA_SHAPER_KHMER || plan.shaper == VEGA_SHAPER_MYANMAR) setup_masks_category(b);
+    if (plan.shaper == VEGA_SHAPER_USE) setup_masks_use(b, &plan);
     if (plan.shaper == VEGA_SHAPER_HANGUL)
         for (size_t i = 0; i < b->len; ++i)
             if (b->info[i].action >= LJMO && b->info[i].action <= TJMO)

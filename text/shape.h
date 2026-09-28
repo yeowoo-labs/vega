@@ -6,8 +6,8 @@
 
 /* Shaping (docs/design/004-text.md): a run of characters (one script, one
  * direction) to glyphs and their positions, as HarfBuzz 10 shapes it with
- * its default, Arabic, Hebrew, Hangul, Indic, Khmer and Myanmar shapers,
- * glyph for glyph and unit for unit.
+ * its default, Arabic, Hebrew, Hangul, Indic, Khmer, Myanmar and Universal
+ * (USE) shapers, glyph for glyph and unit for unit.
  *
  * What a font's shaping needs travels in a symbol file (its shaping
  * section), written by the build tool:
@@ -48,7 +48,7 @@ enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEG
        VEGA_PLAN_STAGES = 5 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
 enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC,
-       VEGA_SHAPER_KHMER, VEGA_SHAPER_MYANMAR };
+       VEGA_SHAPER_KHMER, VEGA_SHAPER_MYANMAR, VEGA_SHAPER_USE };
 /* Plan flags: GPOS runs; mark advances are zeroed after it (by GDEF); glyph
  * classes come from Unicode (the font has none); the font positions marks
  * (a 'mark' feature); automatic fractions; the kern table kerns; marks are
@@ -66,6 +66,7 @@ enum { VEGA_MASK_RPHF = VEGA_MASK_SHAPER, VEGA_MASK_PREF, VEGA_MASK_BLWF, VEGA_M
        VEGA_MASK_PSTF, VEGA_MASK_INDIC_INIT };                                /* Indic */
 enum { VEGA_MASK_KHMER_PREF = VEGA_MASK_SHAPER, VEGA_MASK_KHMER_BLWF, VEGA_MASK_KHMER_ABVF, VEGA_MASK_KHMER_PSTF,
        VEGA_MASK_KHMER_CFAR };                                                /* Khmer */
+enum { VEGA_MASK_USE_RPHF = VEGA_MASK_INIT + 1 };         /* USE: that, and Arabic's for its joining forms */
 /* The stages a plan names: Indic's, whose features decide a consonant's
  * position by whether they would substitute it. */
 enum { VEGA_STAGE_RPHF, VEGA_STAGE_PREF, VEGA_STAGE_BLWF, VEGA_STAGE_PSTF, VEGA_STAGE_VATU };
@@ -75,7 +76,8 @@ enum { VEGA_INDIC_OLD_SPEC = 1 };
 /* Step flags; pauses, which the shaper tells apart. */
 enum { VEGA_STEP_AUTO_ZWNJ = 1, VEGA_STEP_AUTO_ZWJ = 2, VEGA_STEP_RANDOM = 4, VEGA_STEP_PER_SYLLABLE = 8 };
 enum { VEGA_STEP_PAUSE = 0xFFFF };
-enum { VEGA_PAUSE_SYLLABLES = 1, VEGA_PAUSE_INITIAL_REORDERING, VEGA_PAUSE_FINAL_REORDERING, VEGA_PAUSE_CLEAR_SYLLABLES };
+enum { VEGA_PAUSE_SYLLABLES = 1, VEGA_PAUSE_INITIAL_REORDERING, VEGA_PAUSE_FINAL_REORDERING, VEGA_PAUSE_CLEAR_SYLLABLES,
+       VEGA_PAUSE_CLEAR_SUBSTITUTED, VEGA_PAUSE_RECORD_RPHF, VEGA_PAUSE_RECORD_PREF };
 
 typedef struct { const unsigned char *p; uint32_t size; } VegaTable;
 /* Which glyphs may be in a set, as three 64-bit patterns of glyph bits

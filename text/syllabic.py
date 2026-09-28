@@ -12,6 +12,10 @@ HARFBUZZ_SRC is HarfBuzz 10.2.0's src/ directory; what is read from it:
   read cell for cell (Unicode here is 15.1: the table is taken as HarfBuzz
   has it). Khmer and Myanmar read the same table.
 
+- Each character's category for the Universal Shaping Engine: hb-ot-
+  shaper-use-table.hh, whose arrays and lookup (gen-use-table.py's) are
+  carried over as they are, the categories named in them resolved.
+
 - The syllable machines: hb-ot-shaper-*-machine.rl, the Ragel grammars.
   This compiles each to a DFA with Ragel's scanner semantics (the longest
   match from each position, ties to the pattern listed first), its symbols
@@ -27,7 +31,7 @@ import sys
 from pathlib import Path
 
 HB = Path(sys.argv[1] if len(sys.argv) > 1 else '.')
-MACHINES = ['indic', 'khmer', 'myanmar']
+MACHINES = ['indic', 'khmer', 'myanmar', 'use']
 ALPHABET = 64  # categories past 63 are folded into 63, which only `any` takes
 
 
@@ -277,6 +281,22 @@ def runs_of(cells):
     return runs
 
 
+def use_table(grammar):
+    """HarfBuzz's USE lookup: its arrays (categories resolved to numbers)
+    and its expression, as C."""
+    text = (HB / 'hb-ot-shaper-use-table.hh').read_text()
+    part = text[text.index('#ifndef HB_OPTIMIZE_SIZE'):text.index('#else')]
+    arrays = []
+    for kind, name, n, body in re.findall(r'static const (uint8_t|uint16_t)\s+(hb_use_\w+)\[(\d+)\] =\s*\{(.*?)\};',
+                                          part, re.S):
+        values = [int(t) if t.isdigit() else grammar.symbols[t] for t in re.findall(r'[A-Za-z_]\w*|\d+', body)]
+        assert len(values) == int(n), name
+        arrays.append((kind, name.replace('hb_use_', 'use_'), values))
+    expression = re.search(r'return (u<.*?);\n', part).group(1).replace('hb_use_', 'use_')
+    assert expression.endswith(':O')
+    return arrays, expression[:-1] + str(grammar.symbols['O'])
+
+
 # ---- Checking against Ragel's machines (hb-ot-shaper-*-machine.hh)
 
 def ragel(name):
@@ -444,6 +464,24 @@ def main():
     out.append('        if (u <= indic_runs[i].last) return indic_cells[indic_runs[i].at + u - indic_runs[i].first];')
     out.append(f'    return 0x{default[0] | default[1] << 8:04X};')
     out.append('}')
+    out.append('')
+    arrays, expression = use_table(grammars['use'])
+    out.append('/* Each character\'s USE category (hb-ot-shaper-use-table.hh, Unicode 16): HarfBuzz\'s arrays and')
+    out.append(' * lookup. */')
+    for kind, name, values in arrays:
+        out.append(f'static const {kind} {name}[{len(values)}] = {{')
+        for k in range(0, len(values), 16):
+            out.append('    ' + ', '.join(str(v) for v in values[k:k + 16]) + ',')
+        out.append('};')
+    out.append('static unsigned use_b4(const uint8_t *a, unsigned i) { return (a[i >> 1] >> ((i & 1u) << 2)) & 15u; }')
+    out.append(f'uint8_t vega_use_category(uint32_t u) {{ return (uint8_t)({expression}); }}')
+    out.append('')
+    out.append('/* The categories syllabic.h names are the machines\' own. */')
+    for name, prefix in (('indic', 'VEGA_OT_'), ('khmer', 'VEGA_OT_'), ('myanmar', 'VEGA_OT_'), ('use', 'VEGA_USE_')):
+        for symbol, value in sorted(grammars[name].symbols.items()):
+            if name == 'myanmar' and symbol in ('IV', 'DB', 'GB'):
+                continue  # Myanmar's names for V, N and PLACEHOLDER
+            out.append(f'_Static_assert({prefix}{symbol.upper()} == {value}, "{name} {symbol}");')
     out.append('')
     out.append('/* The syllable machines: a DFA over classes of symbol; a state\'s accept is')
     out.append(' * the syllable type it ends, plus one. */')

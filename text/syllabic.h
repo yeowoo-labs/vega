@@ -24,6 +24,20 @@ enum {
 /* A character's category | position << 8 (hb_indic_get_categories). */
 uint16_t vega_indic_categories(uint32_t u);
 
+/* The Universal Shaping Engine's categories (hb-ot-shaper-use-machine.rl). */
+enum {
+    VEGA_USE_O = 0, VEGA_USE_B = 1, VEGA_USE_N = 4, VEGA_USE_GB = 5, VEGA_USE_CGJ = 6, VEGA_USE_SUB = 11,
+    VEGA_USE_H = 12, VEGA_USE_HN = 13, VEGA_USE_ZWNJ = 14, VEGA_USE_WJ = 16, VEGA_USE_R = 18, VEGA_USE_VPRE = 22,
+    VEGA_USE_VMPRE = 23, VEGA_USE_FABV = 24, VEGA_USE_FBLW = 25, VEGA_USE_FPST = 26, VEGA_USE_MABV = 27,
+    VEGA_USE_MBLW = 28, VEGA_USE_MPST = 29, VEGA_USE_MPRE = 30, VEGA_USE_CMABV = 31, VEGA_USE_CMBLW = 32,
+    VEGA_USE_VABV = 33, VEGA_USE_VBLW = 34, VEGA_USE_VPST = 35, VEGA_USE_VMABV = 37, VEGA_USE_VMBLW = 38,
+    VEGA_USE_VMPST = 39, VEGA_USE_SMABV = 41, VEGA_USE_SMBLW = 42, VEGA_USE_CS = 43, VEGA_USE_IS = 44,
+    VEGA_USE_FMABV = 45, VEGA_USE_FMBLW = 46, VEGA_USE_FMPST = 47, VEGA_USE_SK = 48, VEGA_USE_G = 49, VEGA_USE_J = 50,
+    VEGA_USE_SB = 51, VEGA_USE_SE = 52, VEGA_USE_HVM = 53, VEGA_USE_HM = 54, VEGA_USE_HR = 55, VEGA_USE_RK = 56
+};
+/* A character's USE category (hb_use_get_category). */
+uint8_t vega_use_category(uint32_t u);
+
 /* A syllable machine: a DFA over classes of symbols (categories, those
  * past 63 taken as 63). From each position the longest run it accepts is
  * a syllable, ties to the pattern its grammar lists first (Ragel's
@@ -36,5 +50,5 @@ typedef struct {
     const uint8_t *accept;   /* [states]: the syllable type a state ends, plus one; 0 for none */
     unsigned broken;         /* the broken cluster's type, plus one */
 } VegaMachine;
-extern const VegaMachine vega_indic_machine, vega_khmer_machine, vega_myanmar_machine;
+extern const VegaMachine vega_indic_machine, vega_khmer_machine, vega_myanmar_machine, vega_use_machine;
 #endif
