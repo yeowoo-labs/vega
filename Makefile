@@ -80,10 +80,10 @@ UCD ?= $(if $(wildcard build/upstream/ucd-$(UNICODE_VERSION)/ReadMe.txt),build/u
 SHAPED_FONT ?= /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 SHAPED_CODES = 0x20-0x7e,0xa0-0x24f,0x300-0x36f,0x370-0x3ff,0x400-0x4ff,0x591-0x5f4,0x600-0x6ff,0x2000-0x206f
 # HarfBuzz's own shaping tests, where a HarfBuzz release's source is
-# (HARFBUZZ_SRC: the same version the build links; build/upstream's, when
-# text/upstream.py fetched one): each case shaped by Vega and by HarfBuzz
-# must agree, but for those text/harfbuzz-suite.known lists.
-HARFBUZZ_SRC ?= $(lastword $(wildcard build/upstream/harfbuzz-*))
+# (HARFBUZZ_SRC: the same version the build links; build/upstream's of that
+# version, when text/upstream.py fetched it): each case shaped by Vega and
+# by HarfBuzz must agree, but for those text/harfbuzz-suite.known lists.
+HARFBUZZ_SRC ?= $(wildcard build/upstream/harfbuzz-$(shell pkg-config --modversion harfbuzz))
 check-harfbuzz: $(BUILD)/vega-symbols
 	if [ -d "$(HARFBUZZ_SRC)/test/shape/data" ]; then python3 text/harfbuzz-suite.py $(HARFBUZZ_SRC) $(BUILD)/vega-symbols; \
 	else echo "no HarfBuzz source at HARFBUZZ_SRC: its test suite skipped"; fi
