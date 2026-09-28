@@ -573,7 +573,7 @@ static bool default_ignorable(uint32_t ch) {
         case 0x03: return ch == 0x034F;
         case 0x06: return ch == 0x061C;
         case 0x17: return ch >= 0x17B4 && ch <= 0x17B5;
-        case 0x18: return ch >= 0x180B && ch <= 0x180F;
+        case 0x18: return ch >= 0x180B && ch <= 0x180E; /* HarfBuzz 10.2 leaves out U+180F */
         case 0x20: return (ch >= 0x200B && ch <= 0x200F) || (ch >= 0x202A && ch <= 0x202E) || (ch >= 0x2060 && ch <= 0x206F);
         case 0xFE: return (ch >= 0xFE00 && ch <= 0xFE0F) || ch == 0xFEFF;
         case 0xFF: return ch >= 0xFFF0 && ch <= 0xFFF8;
