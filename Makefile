@@ -48,9 +48,9 @@ HARFBUZZ_LIBS ?= $(shell pkg-config --libs harfbuzz)
 # Drawing them on the GPU takes OpenGL ES 3.1 through EGL.
 GL_LIBS ?= $(shell pkg-config --libs egl glesv2)
 SYMBOLS = symbols/symbols.c symbols/symbols-gl.c
-SHAPE = text/shape.c text/layout.c text/bidi.c text/linebreak.c text/unicode-data.c
+SHAPE = text/shape.c text/syllabic-data.c text/layout.c text/bidi.c text/linebreak.c text/unicode-data.c
 $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbols/symbols-gl.h $(SHAPE) text/shape-build.c \
-		text/shape.h text/shape-build.h text/layout.h text/text.h | $(BUILD)
+		text/shape.h text/shape-build.h text/layout.h text/text.h text/syllabic.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) -Itext symbols/symbols-tool.c $(SYMBOLS) $(SHAPE) \
 		text/shape-build.c $(LDFLAGS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
@@ -58,8 +58,8 @@ TEXT = text/bidi.c text/normalize.c text/linebreak.c text/grapheme.c text/word.c
 $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
 
-LAYOUT = text/layout.c text/shape.c text/bidi.c text/linebreak.c text/unicode-data.c
-$(BUILD)/test-layout: text/test-layout.c $(LAYOUT) text/layout.h text/shape.h text/text.h symbols/symbols.c \
+LAYOUT = text/layout.c text/shape.c text/syllabic-data.c text/bidi.c text/linebreak.c text/unicode-data.c
+$(BUILD)/test-layout: text/test-layout.c $(LAYOUT) text/layout.h text/shape.h text/text.h text/syllabic.h symbols/symbols.c \
 		symbols/symbols.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext -Isymbols text/test-layout.c $(LAYOUT) symbols/symbols.c $(LDFLAGS) -lm $(LDLIBS) -o $@
 

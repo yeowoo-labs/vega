@@ -1,14 +1,17 @@
-/* Shaping as HarfBuzz 10 does it (text/shape.h), with its default, Arabic
- * and Hebrew shapers. The code follows HarfBuzz's own step for step
- * (hb-ot-shape.cc, hb-ot-shape-normalize.cc, hb-buffer.cc, hb-ot-layout-
- * gsubgpos.hh, the GSUB and GPOS lookups, hb-ot-shaper-arabic.cc and
- * -hebrew.cc), under HarfBuzz's names, so that the two read side by side;
- * the build tool compares the results with HarfBuzz's (symbols-tool.c). */
+/* Shaping as HarfBuzz 10 does it (text/shape.h), with its default, Arabic,
+ * Hebrew, Hangul and Indic shapers. The code follows HarfBuzz's own step
+ * for step (hb-ot-shape.cc, hb-ot-shape-normalize.cc, hb-buffer.cc,
+ * hb-ot-layout-gsubgpos.hh, the GSUB and GPOS lookups, hb-ot-shaper-*.cc),
+ * under HarfBuzz's names, so that the two read side by side; the build
+ * tool compares the results with HarfBuzz's (symbols-tool.c). */
 #include "shape.h"
+#include "syllabic.h"
 #include "text.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define TAG4(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
 
 /* ---- OpenType tables, read in place: a read past a table's end gives 0 */
 
@@ -223,17 +226,22 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
         REFUSE("out of memory");
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
-        uint32_t ranges[2][2] = {{le32(p + 72), le32(p + 76)}, {le32(p + 80), le32(p + 84)}};
-        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_HANGUL)
+        uint32_t ranges[2][2] = {{le32(p + 80), le32(p + 84)}, {le32(p + 88), le32(p + 92)}};
+        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_INDIC)
             REFUSE("plan %u", i);
         if ((p[7] & VEGA_PLAN_FALLBACK_MARKS) && !s->extents) REFUSE("plan %u: marks placed without extents", i);
         for (int table = 0; table < 2; ++table) {
             if (ranges[table][0] > step_count || ranges[table][1] > step_count - ranges[table][0])
                 REFUSE("plan %u: steps", i);
-            for (uint32_t k = 0; k < ranges[table][1]; ++k)
-                if (le16(s->steps + (size_t)(ranges[table][0] + k) * VEGA_STEP_BYTES) >= s->lookup_count[table])
+            for (uint32_t k = 0; k < ranges[table][1]; ++k) {
+                const unsigned char *step = s->steps + (size_t)(ranges[table][0] + k) * VEGA_STEP_BYTES;
+                bool pause = le16(step) == VEGA_STEP_PAUSE;
+                if (pause ? table || !step[2] || step[2] > VEGA_PAUSE_CLEAR_SYLLABLES : le16(step) >= s->lookup_count[table])
                     REFUSE("plan %u: a lookup the font lacks", i);
+            }
         }
+        for (int k = 0; k < VEGA_PLAN_STAGES; ++k)
+            if ((uint32_t)le16(p + 100 + 8 * k) + le16(p + 102 + 8 * k) > ranges[0][1]) REFUSE("plan %u: stages", i);
     }
     return true;
 }
@@ -290,7 +298,13 @@ typedef struct {
     uint32_t codepoint; /* a character, then (map_glyphs) a glyph */
     uint32_t mask, cluster, glyph_index;
     uint16_t uprops, gprops;
-    uint8_t lig_props, action;
+    uint8_t lig_props;
+    union {
+        uint8_t action;   /* Arabic's joining action, Hangul's jamo feature */
+        uint8_t position; /* Indic's */
+    };
+    uint8_t category;     /* Indic's */
+    uint8_t syllable;     /* serial << 4 | type, once a shaper finds syllables */
 } Info;
 typedef struct {
     int32_t x_advance, y_advance, x_offset, y_offset;
@@ -311,7 +325,7 @@ struct VegaShaper {
 };
 
 enum { HAS_NON_ASCII = 1, HAS_DEFAULT_IGNORABLES = 2, HAS_SPACE_FALLBACK = 4, HAS_GPOS_ATTACHMENT = 8, HAS_CGJ = 16,
-       HAS_VARIATION_SELECTOR_FALLBACK = 32 };
+       HAS_VARIATION_SELECTOR_FALLBACK = 32, HAS_BROKEN_SYLLABLE = 64 };
 
 VegaShaper *vega_shaper_new(void) { return calloc(1, sizeof(VegaShaper)); }
 
@@ -388,6 +402,11 @@ static void output_glyph(VegaShaper *b, uint32_t glyph) {
     if (b->idx == b->len && !b->out_len) return;
     b->out[b->out_len] = b->idx < b->len ? b->info[b->idx] : b->out[b->out_len - 1];
     b->out[b->out_len++].codepoint = glyph;
+}
+
+static void output_info(VegaShaper *b, Info info) {
+    if (!ensure(b, b->out_len + 1)) return;
+    b->out[b->out_len++] = info;
 }
 
 /* num_in glyphs become num_out, each a copy of the first with its own
@@ -674,12 +693,15 @@ static void form_clusters(VegaShaper *b) {
 
 /* ---- The plan */
 
+typedef struct { uint32_t first, count; } Stage;
 typedef struct {
     uint32_t script;
     int direction, native, shaper, flags;
     uint32_t global_mask, kern_mask, masks[VEGA_PLAN_MASKS];
     const unsigned char *gsub, *gpos;
     uint32_t gsub_count, gpos_count;
+    unsigned shaper_flags;
+    Stage stages[VEGA_PLAN_STAGES];
 } Plan;
 
 static bool find_plan(const VegaShaping *s, uint32_t script, int direction, Plan *plan) {
@@ -691,9 +713,12 @@ static bool find_plan(const VegaShaping *s, uint32_t script, int direction, Plan
         }
     if (!found) return false;
     *plan = (Plan){le32(found), found[4], found[5], found[6], found[7], le32(found + 8), le32(found + 12), {0},
-                   s->steps + (size_t)le32(found + 72) * VEGA_STEP_BYTES,
-                   s->steps + (size_t)le32(found + 80) * VEGA_STEP_BYTES, le32(found + 76), le32(found + 84)};
+                   s->steps + (size_t)le32(found + 80) * VEGA_STEP_BYTES,
+                   s->steps + (size_t)le32(found + 88) * VEGA_STEP_BYTES, le32(found + 84), le32(found + 92), found[96],
+                   {{0, 0}}};
     for (int k = 0; k < VEGA_PLAN_MASKS; ++k) plan->masks[k] = le32(found + 16 + 4 * k);
+    for (int k = 0; k < VEGA_PLAN_STAGES; ++k)
+        plan->stages[k] = (Stage){le16(found + 100 + 8 * k), le16(found + 102 + 8 * k)};
     return true;
 }
 
@@ -783,8 +808,23 @@ static bool compose_hebrew(const Normalizer *c, uint32_t a, uint32_t b, uint32_t
     return *ab != 0;
 }
 
+/* Indic's: no split matra composes again, and Bengali YA with nukta does,
+ * though Unicode excludes it. */
+static bool compose_indic(uint32_t a, uint32_t b, uint32_t *ab) {
+    if (is_mark_category(vega_category(a))) return false;
+    if (a == 0x09AF && b == 0x09BC) {
+        *ab = 0x09DF;
+        return true;
+    }
+    return compose_unicode(a, b, ab);
+}
+
 static bool compose(const Normalizer *c, uint32_t a, uint32_t b, uint32_t *ab) {
-    return c->plan->shaper == VEGA_SHAPER_HEBREW ? compose_hebrew(c, a, b, ab) : compose_unicode(a, b, ab);
+    switch (c->plan->shaper) {
+    case VEGA_SHAPER_HEBREW: return compose_hebrew(c, a, b, ab);
+    case VEGA_SHAPER_INDIC: return compose_indic(a, b, ab);
+    default: return compose_unicode(a, b, ab);
+    }
 }
 
 static bool nominal(const VegaShaping *s, uint32_t u, uint32_t *glyph) { return (*glyph = vega_shaping_glyph(s, u)) != 0; }
@@ -801,10 +841,17 @@ static void next_char(VegaShaper *b, uint32_t glyph) {
     next_glyph(b);
 }
 
+/* The shaper's decomposition: Indic keeps a few letters whole. */
+static bool decompose_char(const Normalizer *c, uint32_t ab, uint32_t *a, uint32_t *b) {
+    if (c->plan->shaper == VEGA_SHAPER_INDIC && (ab == 0x0931 || ab == 0x09DC || ab == 0x09DD || ab == 0x0B94))
+        return false;
+    return decompose_unicode(ab, a, b);
+}
+
 /* Returns how many characters ab became, 0 if it did not decompose. */
 static unsigned decompose(const Normalizer *c, bool shortest, uint32_t ab) {
     uint32_t a, bb, a_glyph = 0, b_glyph = 0;
-    if (!decompose_unicode(ab, &a, &bb) || (bb && !nominal(c->s, bb, &b_glyph))) return 0;
+    if (!decompose_char(c, ab, &a, &bb) || (bb && !nominal(c->s, bb, &b_glyph))) return 0;
     bool has_a = nominal(c->s, a, &a_glyph);
     if (shortest && has_a) {
         output_char(c->b, a, a_glyph);
@@ -976,9 +1023,10 @@ static void normalize(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     if (!b->len) return;
     Normalizer c = {s, plan, b};
     /* The shapers' preference is "auto" (composed diacritics); Hangul's is
-     * none: what the font has stays, and nothing is composed again. */
+     * none: what the font has stays, and nothing is composed again;
+     * Indic's decomposes what decomposes even when the font has it whole. */
     const bool none = plan->shaper == VEGA_SHAPER_HANGUL;
-    const bool might_short_circuit = true, always_short_circuit = none;
+    const bool always_short_circuit = none, might_short_circuit = none || plan->shaper != VEGA_SHAPER_INDIC;
     bool all_simple = true;
     clear_output(b);
     size_t count = b->len;
@@ -1237,6 +1285,7 @@ typedef struct {
     uint32_t lookup_mask, lookup_props;
     bool auto_zwnj, auto_zwj, random, has_glyph_classes;
     int nesting_left;
+    bool per_syllable; /* GSUB matches within the syllable it starts in */
     uint32_t random_state;
     long last_base;
     size_t last_base_until;
@@ -1271,6 +1320,7 @@ typedef struct {
     Matcher matcher;
     uint32_t glyph_data;
     size_t idx, end;
+    uint8_t syllable; /* per syllable, from where the lookup is: only its glyphs match */
 } Skippy;
 
 enum { SKIP_NO, SKIP_YES, SKIP_MAYBE };
@@ -1278,9 +1328,11 @@ enum { MATCH_NO, MATCH_YES, MATCH_MAYBE };
 enum { MATCH, NOT_MATCH, SKIP };
 
 static void skippy_init(Skippy *it, Apply *c, bool context_match, size_t start) {
+    VegaShaper *b = c->b;
     *it = (Skippy){c, c->lookup_props, context_match ? 0xFFFFFFFFu : c->lookup_mask,
                    c->table == 1 || (context_match && c->auto_zwnj), context_match || c->auto_zwj, c->table == 1,
-                   {MATCH_ANY, 0, 0}, 0, start, c->b->len};
+                   {MATCH_ANY, 0, 0}, 0, start, b->len,
+                   !c->table && c->per_syllable && start == b->idx && b->idx < b->len ? b->info[b->idx].syllable : 0};
 }
 
 static int may_skip(const Skippy *it, const Info *info) {
@@ -1302,7 +1354,7 @@ static bool matches(const Apply *c, const Matcher *m, uint32_t index, uint32_t g
 }
 
 static int may_match(const Skippy *it, const Info *info) {
-    if (!(info->mask & it->mask)) return MATCH_NO;
+    if (!(info->mask & it->mask) || (it->syllable && it->syllable != info->syllable)) return MATCH_NO;
     if (it->matcher.kind != MATCH_ANY) return matches(it->c, &it->matcher, it->glyph_data, info->codepoint) ? MATCH_YES : MATCH_NO;
     return MATCH_MAYBE;
 }
@@ -2105,13 +2157,23 @@ static VegaDigest buffer_digest(const VegaShaper *b) {
     return d;
 }
 
-static void apply_table(const VegaShaping *s, VegaShaper *b, int table, const unsigned char *steps, uint32_t count) {
+static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause);
+
+/* hb_ot_map_t::apply: the plan's lookups for a table in order; at a pause,
+ * the shaper's part (when it changed the buffer, the digest starts over). */
+static void apply_table(const VegaShaping *s, const Plan *plan, VegaShaper *b, int table) {
+    const unsigned char *steps = table ? plan->gpos : plan->gsub;
+    uint32_t count = table ? plan->gpos_count : plan->gsub_count;
     /* A lookup can apply only where the buffer has a glyph it starts from. */
-    Apply c = {s, b, table, table ? s->gpos : s->gsub, 0, 0, true, true, false, s->glyph_classes != 0,
-               MAX_NESTING_LEVEL, 1, -1, 0, buffer_digest(b)};
+    Apply c = {.s = s, .b = b, .table = table, .t = table ? s->gpos : s->gsub, .has_glyph_classes = s->glyph_classes != 0,
+               .nesting_left = MAX_NESTING_LEVEL, .random_state = 1, .last_base = -1, .digest = buffer_digest(b)};
     for (uint32_t i = 0; i < count; ++i) {
         const unsigned char *step = steps + (size_t)i * VEGA_STEP_BYTES;
         uint32_t index = le16(step);
+        if (index == VEGA_STEP_PAUSE) {
+            if (shaper_pause(s, plan, b, step[2])) c.digest = buffer_digest(b);
+            continue;
+        }
         if (!digest_may_intersect(&s->lookups[table][index].digest, &c.digest)) continue;
         c.lookup_mask = le32(step + 4);
         c.last_base = -1;
@@ -2119,6 +2181,7 @@ static void apply_table(const VegaShaping *s, VegaShaper *b, int table, const un
         c.auto_zwnj = step[2] & VEGA_STEP_AUTO_ZWNJ;
         c.auto_zwj = step[2] & VEGA_STEP_AUTO_ZWJ;
         c.random = step[2] & VEGA_STEP_RANDOM;
+        c.per_syllable = step[2] & VEGA_STEP_PER_SYLLABLE;
         apply_string(&c, &s->lookups[table][index]);
     }
 }
@@ -2160,8 +2223,9 @@ static void kern_table(const VegaShaping *s, VegaShaper *b, const Plan *plan) {
         if ((apple && (coverage & 0x20)) || !horizontal || format != 0) continue;
         bool reverse = b->direction == VEGA_SHAPE_RTL;
         if (reverse) reverse_range(b, 0, b->len, true);
-        Apply c = {s, b, 1, s->gpos, plan->kern_mask, 0x08, true, true, false, s->glyph_classes != 0, MAX_NESTING_LEVEL, 1,
-                   -1, 0, {{0, 0, 0}}};
+        Apply c = {.s = s, .b = b, .table = 1, .t = s->gpos, .lookup_mask = plan->kern_mask, .lookup_props = 0x08,
+                   .auto_zwnj = true, .auto_zwj = true, .has_glyph_classes = s->glyph_classes != 0,
+                   .nesting_left = MAX_NESTING_LEVEL, .random_state = 1, .last_base = -1};
         for (size_t idx = 0; idx < b->len;) {
             if (!(b->info[idx].mask & plan->kern_mask)) {
                 idx++;
@@ -2385,6 +2449,756 @@ static void fallback_marks(const VegaShaping *s, const Plan *plan, VegaShaper *b
     position_cluster(s, plan, b, start, b->len, adjust);
 }
 
+/* ---- Would a lookup substitute glyphs as they are, alone
+ * (hb_ot_layout_lookup_would_substitute): the Indic shaper's question of
+ * its basic features. */
+
+static bool would_match_input(const Apply *c, Matcher m, const uint32_t *glyphs, unsigned len, unsigned count) {
+    if (count != len) return false;
+    for (unsigned i = 1; i < count; ++i)
+        if (!matches(c, &m, i - 1, glyphs[i])) return false;
+    return true;
+}
+
+static bool would_apply_rules(const Apply *c, int type, uint32_t set, Matcher input, const uint32_t *glyphs,
+                              unsigned len, bool zero_context) {
+    VegaTable t = c->t;
+    for (uint32_t r = 0, n = set ? get16(t, set) : 0; r < n; ++r) {
+        uint32_t rule = offset16(t, set, set + 2 + 2 * r);
+        if (type == 5) {
+            input.values = rule + 4;
+            if (would_match_input(c, input, glyphs, len, get16(t, rule))) return true;
+            continue;
+        }
+        unsigned back_count = get16(t, rule);
+        uint32_t input_at = rule + 2 + 2 * back_count;
+        unsigned input_count = get16(t, input_at);
+        unsigned ahead_count = input_count ? get16(t, input_at + 2 + 2 * (input_count - 1)) : 0;
+        if (zero_context && (back_count || ahead_count)) continue;
+        input.values = input_at + 2;
+        if (would_match_input(c, input, glyphs, len, input_count)) return true;
+    }
+    return false;
+}
+
+static bool would_apply_subtable(const Apply *c, const VegaSubtable *st, const uint32_t *glyphs, unsigned len,
+                                 bool zero_context) {
+    VegaTable t = c->t;
+    uint32_t at = st->at, format = get16(t, at);
+    switch (st->type) {
+    case 1: case 2: case 3: case 8:
+        if (format != 1 && !(st->type == 1 && format == 2)) return false;
+        return len == 1 && coverage(t, offset16(t, at, at + 2), glyphs[0]) != NOT_COVERED;
+    case 4: {
+        uint32_t index = coverage(t, offset16(t, at, at + 2), glyphs[0]);
+        if (format != 1 || index == NOT_COVERED || index >= get16(t, at + 4)) return false;
+        uint32_t set = offset16(t, at, at + 6 + 2 * index);
+        for (uint32_t k = 0, n = set ? get16(t, set) : 0; k < n; ++k) {
+            uint32_t lig = offset16(t, set, set + 2 + 2 * k);
+            if (would_match_input(c, (Matcher){MATCH_GLYPH, 0, lig + 4}, glyphs, len, get16(t, lig + 2))) return true;
+        }
+        return false;
+    }
+    case 5: case 6: {
+        bool chain = st->type == 6;
+        if (format == 1 || format == 2) {
+            /* format 2 takes the first glyph's class whatever the coverage */
+            uint32_t classes = format == 2 ? offset16(t, at, at + (chain ? 6 : 4)) : 0;
+            uint32_t index = format == 1 ? coverage(t, offset16(t, at, at + 2), glyphs[0]) : class_of(t, classes, glyphs[0]);
+            uint32_t sets_at = format == 1 ? at + 4 : at + (chain ? 10 : 6);
+            if (index == NOT_COVERED || index >= get16(t, sets_at)) return false;
+            Matcher input = {format == 2 ? MATCH_CLASS : MATCH_GLYPH, classes, 0};
+            return would_apply_rules(c, st->type, offset16(t, at, sets_at + 2 + 2 * index), input, glyphs, len,
+                                     zero_context);
+        }
+        if (format != 3) return false;
+        if (!chain) return would_match_input(c, (Matcher){MATCH_COVERAGE, at, at + 8}, glyphs, len, get16(t, at + 2));
+        unsigned back_count = get16(t, at + 2);
+        uint32_t input_at = at + 4 + 2 * back_count;
+        unsigned input_count = get16(t, input_at);
+        unsigned ahead_count = get16(t, input_at + 2 + 2 * input_count);
+        if (zero_context && (back_count || ahead_count)) return false;
+        return would_match_input(c, (Matcher){MATCH_COVERAGE, at, input_at + 4}, glyphs, len, input_count);
+    }
+    default: return false;
+    }
+}
+
+/* Whether the lookups of a feature's stage (all of them, whatever their
+ * masks) would substitute glyphs, len of them. */
+static bool would_substitute(const VegaShaping *s, const Plan *plan, int stage, const uint32_t *glyphs, unsigned len,
+                             bool zero_context) {
+    const Stage *st = &plan->stages[stage];
+    Apply c = {.s = s, .t = s->gsub};
+    for (uint32_t k = 0; k < st->count; ++k) {
+        const unsigned char *step = plan->gsub + (size_t)(st->first + k) * VEGA_STEP_BYTES;
+        uint32_t index = le16(step);
+        if (index == VEGA_STEP_PAUSE) continue;
+        const VegaLookup *l = &s->lookups[0][index];
+        if (!len || !digest_may_have(&l->digest, glyphs[0])) continue;
+        for (uint32_t i = 0; i < l->count; ++i)
+            if (would_apply_subtable(&c, &s->subtables[l->first + i], glyphs, len, zero_context)) return true;
+    }
+    return false;
+}
+
+/* ---- Syllables (hb-ot-shaper-*-machine.rl, hb-ot-shaper-syllabic.cc) */
+
+/* A shaper's machine over the buffer's categories: from each position the
+ * longest syllable it accepts; each numbered, 1 to 15 over again, beside
+ * its type. */
+static void find_syllables(VegaShaper *b, const VegaMachine *m) {
+    unsigned serial = 1;
+    for (size_t p = 0; p < b->len;) {
+        unsigned state = 0, type = 0;
+        size_t end = p + 1;
+        for (size_t q = p; q < b->len; ++q) {
+            size_t cell = (size_t)state * m->classes + m->class_of[b->info[q].category < 63 ? b->info[q].category : 63];
+            state = m->width == 1 ? ((const uint8_t *)m->next)[cell] : ((const uint16_t *)m->next)[cell];
+            if (state >= m->states) break;
+            if (m->accept[state]) type = m->accept[state], end = q + 1;
+        }
+        if (type == m->broken) b->scratch |= HAS_BROKEN_SYLLABLE;
+        for (size_t i = p; i < end; ++i) b->info[i].syllable = (uint8_t)(serial << 4 | (type ? type - 1 : 0));
+        if (++serial == 16) serial = 1;
+        p = end;
+    }
+}
+
+static size_t next_syllable(const VegaShaper *b, size_t start) {
+    size_t end = start + 1;
+    while (end < b->len && b->info[end].syllable == b->info[start].syllable) end++;
+    return end;
+}
+
+/* A dotted circle at the start of each broken syllable (after a repha that
+ * starts it), for its marks to sit on; false when none went in. */
+static bool insert_dotted_circles(const VegaShaping *s, VegaShaper *b, unsigned broken, unsigned category, int repha,
+                                  unsigned position) {
+    uint32_t glyph;
+    if (!(b->scratch & HAS_BROKEN_SYLLABLE) || !nominal(s, 0x25CC, &glyph)) return false;
+    /* All of it zero but these: HarfBuzz's is a fresh glyph_info. */
+    Info circle = {.codepoint = glyph, .uprops = VEGA_CC, .position = (uint8_t)position, .category = (uint8_t)category};
+    clear_output(b);
+    unsigned last = 0;
+    while (b->idx < b->len && b->successful) {
+        unsigned syllable = b->info[b->idx].syllable;
+        if (last != syllable && (syllable & 0x0F) == broken) {
+            last = syllable;
+            Info c = circle;
+            c.cluster = b->info[b->idx].cluster;
+            c.mask = b->info[b->idx].mask;
+            c.syllable = (uint8_t)syllable;
+            if (repha >= 0)
+                while (b->idx < b->len && b->successful && b->info[b->idx].syllable == last &&
+                       b->info[b->idx].category == (unsigned)repha)
+                    next_glyph(b);
+            output_info(b, c);
+        } else
+            next_glyph(b);
+    }
+    sync(b);
+    return true;
+}
+
+/* Vowel sequences that read as another vowel get a dotted circle between
+ * (hb-ot-shaper-vowel-constraints.cc, from the Universal Shaping Engine's
+ * IndicShapingInvalidCluster.txt): each first letter with what may not
+ * follow it. */
+static const struct { uint32_t script, first, second[12]; } vowel_constraints[] = {
+    {TAG4('D', 'e', 'v', 'a'), 0x0905, {0x093A, 0x093B, 0x093E, 0x0945, 0x0946, 0x0949, 0x094A, 0x094B, 0x094C, 0x094F, 0x0956, 0x0957}},
+    {TAG4('D', 'e', 'v', 'a'), 0x0906, {0x093A, 0x0945, 0x0946, 0x0947, 0x0948}},
+    {TAG4('D', 'e', 'v', 'a'), 0x0909, {0x0941}},
+    {TAG4('D', 'e', 'v', 'a'), 0x090F, {0x0945, 0x0946, 0x0947}},
+    {TAG4('B', 'e', 'n', 'g'), 0x0985, {0x09BE}},
+    {TAG4('B', 'e', 'n', 'g'), 0x098B, {0x09C3}},
+    {TAG4('B', 'e', 'n', 'g'), 0x098C, {0x09E2}},
+    {TAG4('G', 'u', 'r', 'u'), 0x0A05, {0x0A3E, 0x0A48, 0x0A4C}},
+    {TAG4('G', 'u', 'r', 'u'), 0x0A72, {0x0A3F, 0x0A40, 0x0A47}},
+    {TAG4('G', 'u', 'r', 'u'), 0x0A73, {0x0A41, 0x0A42, 0x0A4B}},
+    {TAG4('G', 'u', 'j', 'r'), 0x0A85, {0x0ABE, 0x0AC5, 0x0AC7, 0x0AC8, 0x0AC9, 0x0ACB, 0x0ACC}},
+    {TAG4('G', 'u', 'j', 'r'), 0x0AC5, {0x0ABE}},
+    {TAG4('O', 'r', 'y', 'a'), 0x0B05, {0x0B3E}},
+    {TAG4('O', 'r', 'y', 'a'), 0x0B0F, {0x0B57}},
+    {TAG4('O', 'r', 'y', 'a'), 0x0B13, {0x0B57}},
+    {TAG4('T', 'a', 'm', 'l'), 0x0B85, {0x0BC2}},
+    {TAG4('T', 'e', 'l', 'u'), 0x0C12, {0x0C4C, 0x0C55}},
+    {TAG4('T', 'e', 'l', 'u'), 0x0C3F, {0x0C55}},
+    {TAG4('T', 'e', 'l', 'u'), 0x0C46, {0x0C55}},
+    {TAG4('T', 'e', 'l', 'u'), 0x0C4A, {0x0C55}},
+    {TAG4('K', 'n', 'd', 'a'), 0x0C89, {0x0CBE}},
+    {TAG4('K', 'n', 'd', 'a'), 0x0C8B, {0x0CBE}},
+    {TAG4('K', 'n', 'd', 'a'), 0x0C92, {0x0CCC}},
+    {TAG4('M', 'l', 'y', 'm'), 0x0D07, {0x0D57}},
+    {TAG4('M', 'l', 'y', 'm'), 0x0D09, {0x0D57}},
+    {TAG4('M', 'l', 'y', 'm'), 0x0D0E, {0x0D46}},
+    {TAG4('M', 'l', 'y', 'm'), 0x0D12, {0x0D3E, 0x0D57}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D85, {0x0DCF, 0x0DD0, 0x0DD1}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D8B, {0x0DDF}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D8D, {0x0DD8}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D8F, {0x0DDF}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D91, {0x0DCA, 0x0DD9, 0x0DDA, 0x0DDC, 0x0DDD, 0x0DDE}},
+    {TAG4('S', 'i', 'n', 'h'), 0x0D94, {0x0DDF}},
+    {TAG4('B', 'r', 'a', 'h'), 0x11005, {0x11038}},
+    {TAG4('B', 'r', 'a', 'h'), 0x1100B, {0x1103E}},
+    {TAG4('B', 'r', 'a', 'h'), 0x1100F, {0x11042}},
+    {TAG4('K', 'h', 'o', 'j'), 0x11200, {0x1122C, 0x11231, 0x11233}},
+    {TAG4('K', 'h', 'o', 'j'), 0x11206, {0x1122C}},
+    {TAG4('K', 'h', 'o', 'j'), 0x1122C, {0x11230, 0x11231}},
+    {TAG4('K', 'h', 'o', 'j'), 0x11240, {0x1122E}},
+    {TAG4('S', 'i', 'n', 'd'), 0x112B0, {0x112E0, 0x112E5, 0x112E6, 0x112E7, 0x112E8}},
+    {TAG4('T', 'i', 'r', 'h'), 0x11481, {0x114B0}},
+    {TAG4('T', 'i', 'r', 'h'), 0x1148B, {0x114BA}},
+    {TAG4('T', 'i', 'r', 'h'), 0x1148D, {0x114BA}},
+    {TAG4('T', 'i', 'r', 'h'), 0x114AA, {0x114B5, 0x114B6}},
+    {TAG4('M', 'o', 'd', 'i'), 0x11600, {0x11639, 0x1163A}},
+    {TAG4('M', 'o', 'd', 'i'), 0x11601, {0x11639, 0x1163A}},
+    {TAG4('T', 'a', 'k', 'r'), 0x11680, {0x116AD, 0x116B4, 0x116B5}},
+    {TAG4('T', 'a', 'k', 'r'), 0x11686, {0x116B2}},
+};
+
+/* A dotted circle out before the current character, as a copy of it (its
+ * properties, less continuing the character before). */
+static void output_dotted_circle(VegaShaper *b) {
+    output_glyph(b, 0x25CC);
+    if (b->out_len) b->out[b->out_len - 1].uprops &= (uint16_t)~UPROPS_CONTINUATION;
+}
+
+static void preprocess_vowel_constraints(const Plan *plan, VegaShaper *b) {
+    bool any = false;
+    for (size_t k = 0; k < sizeof(vowel_constraints) / sizeof(*vowel_constraints) && !any; ++k)
+        any = vowel_constraints[k].script == plan->script;
+    if (!any && plan->script != TAG4('D', 'e', 'v', 'a')) return;
+    clear_output(b);
+    while (b->idx + 1 < b->len && b->successful) {
+        uint32_t u = b->info[b->idx].codepoint, next = b->info[b->idx + 1].codepoint;
+        bool matched = false;
+        for (size_t k = 0; k < sizeof(vowel_constraints) / sizeof(*vowel_constraints) && !matched; ++k)
+            if (vowel_constraints[k].script == plan->script && vowel_constraints[k].first == u)
+                for (int j = 0; j < 12 && vowel_constraints[k].second[j] && !matched; ++j)
+                    matched = vowel_constraints[k].second[j] == next;
+        /* Devanagari's RA, virama, I: the circle goes before the I */
+        if (plan->script == TAG4('D', 'e', 'v', 'a') && u == 0x0930 && next == 0x094D && b->idx + 2 < b->len &&
+            b->info[b->idx + 2].codepoint == 0x0907) {
+            next_glyph(b);
+            next_glyph(b);
+            output_dotted_circle(b);
+        }
+        next_glyph(b);
+        if (matched) {
+            output_dotted_circle(b);
+            next_glyph(b);
+        }
+    }
+    sync(b);
+}
+
+/* ---- Indic (hb-ot-shaper-indic.cc): each consonant syllable's base found,
+ * its pre-base matras, reph and the like moved around the base and masked
+ * for the basic features; after those, the matras, reph and
+ * pre-base-reordering consonants placed again by what the features made. */
+
+enum { REPH_IMPLICIT, REPH_EXPLICIT, REPH_LOG_REPHA };
+typedef struct { uint32_t script, virama; uint8_t reph_pos, reph_mode; bool blwf_post_only; } IndicConfig;
+static const IndicConfig indic_configs[] = {
+    {0, 0, VEGA_POS_BEFORE_POST, REPH_IMPLICIT, false},
+    {TAG4('D', 'e', 'v', 'a'), 0x094D, VEGA_POS_BEFORE_POST, REPH_IMPLICIT, false},
+    {TAG4('B', 'e', 'n', 'g'), 0x09CD, VEGA_POS_AFTER_SUB, REPH_IMPLICIT, false},
+    {TAG4('G', 'u', 'r', 'u'), 0x0A4D, VEGA_POS_BEFORE_SUB, REPH_IMPLICIT, false},
+    {TAG4('G', 'u', 'j', 'r'), 0x0ACD, VEGA_POS_BEFORE_POST, REPH_IMPLICIT, false},
+    {TAG4('O', 'r', 'y', 'a'), 0x0B4D, VEGA_POS_AFTER_MAIN, REPH_IMPLICIT, false},
+    {TAG4('T', 'a', 'm', 'l'), 0x0BCD, VEGA_POS_AFTER_POST, REPH_IMPLICIT, false},
+    {TAG4('T', 'e', 'l', 'u'), 0x0C4D, VEGA_POS_AFTER_POST, REPH_EXPLICIT, true},
+    {TAG4('K', 'n', 'd', 'a'), 0x0CCD, VEGA_POS_AFTER_POST, REPH_IMPLICIT, true},
+    {TAG4('M', 'l', 'y', 'm'), 0x0D4D, VEGA_POS_AFTER_MAIN, REPH_LOG_REPHA, false},
+};
+
+typedef struct {
+    const VegaShaping *s;
+    const Plan *plan;
+    const IndicConfig *config;
+    bool old_spec, zero_context;
+    uint32_t virama; /* its glyph; 0 when the font has none */
+} Indic;
+
+static Indic indic_of(const VegaShaping *s, const Plan *plan) {
+    Indic d = {s, plan, &indic_configs[0], plan->shaper_flags & VEGA_INDIC_OLD_SPEC, false, 0};
+    for (size_t i = 1; i < sizeof(indic_configs) / sizeof(*indic_configs); ++i)
+        if (indic_configs[i].script == plan->script) d.config = &indic_configs[i];
+    /* New specifications match the basic features without context; so do
+     * scripts with one, but Malayalam's both take context. */
+    d.zero_context = !d.old_spec && plan->script != TAG4('M', 'l', 'y', 'm');
+    if (d.config->virama) nominal(s, d.config->virama, &d.virama);
+    return d;
+}
+
+#define FLAG(x) (1u << (x))
+#define FLAG_UNSAFE(x) ((x) < 32 ? 1u << (x) : 0u)
+static bool is_one_of(const Info *i, uint32_t flags) {
+    return !(i->gprops & LIGATED) && (FLAG_UNSAFE(i->category) & flags); /* a ligature is none of them */
+}
+static bool is_consonant(const Info *i) {
+    return is_one_of(i, FLAG(VEGA_OT_C) | FLAG(VEGA_OT_CS) | FLAG(VEGA_OT_RA) | FLAG(VEGA_OT_CM) | FLAG(VEGA_OT_V) |
+                            FLAG(VEGA_OT_PLACEHOLDER) | FLAG(VEGA_OT_DOTTEDCIRCLE));
+}
+static bool is_joiner(const Info *i) { return is_one_of(i, FLAG(VEGA_OT_ZWJ) | FLAG(VEGA_OT_ZWNJ)); }
+static bool is_halant(const Info *i) { return is_one_of(i, FLAG(VEGA_OT_H)); }
+static bool ligated_and_didnt_multiply(const Info *i) { return (i->gprops & LIGATED) && !(i->gprops & MULTIPLIED); }
+
+static bool indic_would(const Indic *d, int stage, const uint32_t *glyphs, unsigned len) {
+    return would_substitute(d->s, d->plan, stage, glyphs, len, d->zero_context);
+}
+
+/* Below-base, post-base or base: what the font's features would make of
+ * the consonant with a virama, either way round (fonts copied old lookups
+ * into new scripts). */
+static uint8_t consonant_position(const Indic *d, uint32_t consonant) {
+    uint32_t glyphs[3] = {d->virama, consonant, d->virama};
+    if (indic_would(d, VEGA_STAGE_BLWF, glyphs, 2) || indic_would(d, VEGA_STAGE_BLWF, glyphs + 1, 2) ||
+        indic_would(d, VEGA_STAGE_VATU, glyphs, 2) || indic_would(d, VEGA_STAGE_VATU, glyphs + 1, 2))
+        return VEGA_POS_BELOW_C;
+    if (indic_would(d, VEGA_STAGE_PSTF, glyphs, 2) || indic_would(d, VEGA_STAGE_PSTF, glyphs + 1, 2) ||
+        indic_would(d, VEGA_STAGE_PREF, glyphs, 2) || indic_would(d, VEGA_STAGE_PREF, glyphs + 1, 2))
+        return VEGA_POS_POST_C;
+    return VEGA_POS_BASE_C;
+}
+
+static void setup_masks_indic(VegaShaper *b) {
+    for (size_t i = 0; i < b->len; ++i) {
+        uint16_t categories = vega_indic_categories(b->info[i].codepoint);
+        b->info[i].category = categories & 0xFF;
+        b->info[i].position = categories >> 8;
+    }
+}
+
+static void indic_reorder_consonant_syllable(const Indic *d, VegaShaper *b, size_t start, size_t end) {
+    Info *info = b->info;
+    const uint32_t *masks = d->plan->masks;
+    uint32_t script = d->plan->script;
+    /* Kannada's Ra, halant, ZWJ is Ra, ZWJ, halant. */
+    if (script == TAG4('K', 'n', 'd', 'a') && start + 3 <= end && is_one_of(&info[start], FLAG(VEGA_OT_RA)) &&
+        is_one_of(&info[start + 1], FLAG(VEGA_OT_H)) && is_one_of(&info[start + 2], FLAG(VEGA_OT_ZWJ))) {
+        merge_clusters(b, start + 1, start + 3);
+        Info t = info[start + 1];
+        info[start + 1] = info[start + 2];
+        info[start + 2] = t;
+    }
+
+    /* 1. The base: from the end back, the first consonant without a
+     * below-base or post-base form (those follow below-base ones), or the
+     * first consonant. An initial Ra, halant that the font makes a reph
+     * is no candidate. */
+    size_t base = end, limit = start;
+    bool has_reph = false;
+    if (masks[VEGA_MASK_RPHF] && start + 3 <= end &&
+        ((d->config->reph_mode == REPH_IMPLICIT && !is_joiner(&info[start + 2])) ||
+         (d->config->reph_mode == REPH_EXPLICIT && info[start + 2].category == VEGA_OT_ZWJ))) {
+        uint32_t glyphs[3] = {info[start].codepoint, info[start + 1].codepoint,
+                              d->config->reph_mode == REPH_EXPLICIT ? info[start + 2].codepoint : 0};
+        if (indic_would(d, VEGA_STAGE_RPHF, glyphs, 2) ||
+            (d->config->reph_mode == REPH_EXPLICIT && indic_would(d, VEGA_STAGE_RPHF, glyphs, 3))) {
+            limit += 2;
+            while (limit < end && is_joiner(&info[limit])) limit++;
+            base = start;
+            has_reph = true;
+        }
+    } else if (d->config->reph_mode == REPH_LOG_REPHA && info[start].category == VEGA_OT_REPHA) {
+        limit += 1;
+        while (limit < end && is_joiner(&info[limit])) limit++;
+        base = start;
+        has_reph = true;
+    }
+    {
+        size_t i = end;
+        bool seen_below = false;
+        do {
+            i--;
+            if (is_consonant(&info[i])) {
+                if (info[i].position != VEGA_POS_BELOW_C && (info[i].position != VEGA_POS_POST_C || seen_below)) {
+                    base = i;
+                    break;
+                }
+                if (info[i].position == VEGA_POS_BELOW_C) seen_below = true;
+                base = i;
+            } else if (start < i && info[i].category == VEGA_OT_ZWJ && info[i - 1].category == VEGA_OT_H)
+                break; /* a ZWJ after a halant asks for a half form: the search stops */
+        } while (i > limit);
+    }
+    if (has_reph && base == start && limit - base <= 2) has_reph = false; /* Ra alone is the base */
+
+    /* 2 and 3 (matras decomposed, marks in canonical order) normalization
+     * did. Reorder: */
+    for (size_t i = start; i < base; ++i)
+        if (info[i].position > VEGA_POS_PRE_C) info[i].position = VEGA_POS_PRE_C;
+    if (base < end) info[base].position = VEGA_POS_BASE_C;
+    if (has_reph) info[start].position = VEGA_POS_RA_TO_BECOME_REPH;
+
+    /* Old specifications: the first post-base halant after the last
+     * consonant (Kannada not past a halant already there). */
+    if (d->old_spec) {
+        bool disallow_double_halants = script == TAG4('K', 'n', 'd', 'a');
+        for (size_t i = base + 1; i < end; ++i)
+            if (info[i].category == VEGA_OT_H) {
+                size_t j;
+                for (j = end - 1; j > i; j--)
+                    if (is_consonant(&info[j]) || (disallow_double_halants && info[j].category == VEGA_OT_H)) break;
+                if (info[j].category != VEGA_OT_H && j > i) {
+                    Info t = info[i];
+                    memmove(&info[i], &info[i + 1], (j - i) * sizeof(Info));
+                    info[j] = t;
+                }
+                break;
+            }
+    }
+
+    /* Joiners, nuktas, register shifters, medials and halants go with what
+     * is before them (a halant not with a left matra). */
+    {
+        uint8_t last_pos = VEGA_POS_START;
+        for (size_t i = start; i < end; ++i) {
+            if (FLAG_UNSAFE(info[i].category) & (FLAG(VEGA_OT_ZWJ) | FLAG(VEGA_OT_ZWNJ) | FLAG(VEGA_OT_N) |
+                                                 FLAG(VEGA_OT_RS) | FLAG(VEGA_OT_CM) | FLAG(VEGA_OT_H))) {
+                info[i].position = last_pos;
+                if (info[i].category == VEGA_OT_H && info[i].position == VEGA_POS_PRE_M)
+                    for (size_t j = i; j > start; j--)
+                        if (info[j - 1].position != VEGA_POS_PRE_M) {
+                            info[i].position = info[j - 1].position;
+                            break;
+                        }
+            } else if (info[i].position != VEGA_POS_SMVD) {
+                if (info[i].category == VEGA_OT_MPST && i > start && info[i - 1].category == VEGA_OT_SM)
+                    info[i - 1].position = info[i].position;
+                last_pos = info[i].position;
+            }
+        }
+    }
+    /* A post-base consonant owns what is before it since the last
+     * consonant or matra. */
+    {
+        size_t last = base;
+        for (size_t i = base + 1; i < end; ++i)
+            if (is_consonant(&info[i])) {
+                for (size_t j = last + 1; j < i; ++j)
+                    if (info[j].position < VEGA_POS_SMVD) info[j].position = info[i].position;
+                last = i;
+            } else if (FLAG_UNSAFE(info[i].category) & (FLAG(VEGA_OT_M) | FLAG(VEGA_OT_MPST)))
+                last = i;
+    }
+
+    {
+        /* Sorted by position, stably; syllable holds each glyph's place
+         * before, to merge the clusters of what moved past base. */
+        uint8_t syllable = info[start].syllable;
+        for (size_t i = start; i < end; ++i) info[i].syllable = (uint8_t)(i - start);
+        for (size_t i = start + 1; i < end; ++i) {
+            size_t j = i;
+            while (j > start && info[j - 1].position > info[i].position) j--;
+            if (j == i) continue;
+            Info t = info[i];
+            memmove(&info[j + 1], &info[j], (i - j) * sizeof(Info));
+            info[j] = t;
+        }
+        /* The base again; a run of left matras back in their order. */
+        size_t first_left_matra = end, last_left_matra = end;
+        base = end;
+        for (size_t i = start; i < end; ++i) {
+            if (info[i].position == VEGA_POS_BASE_C) {
+                base = i;
+                break;
+            }
+            if (info[i].position == VEGA_POS_PRE_M) {
+                if (first_left_matra == end) first_left_matra = i;
+                last_left_matra = i;
+            }
+        }
+        if (first_left_matra < last_left_matra) {
+            reverse_range(b, first_left_matra, last_left_matra + 1, false);
+            size_t i = first_left_matra;
+            for (size_t j = i; j <= last_left_matra; ++j)
+                if (FLAG_UNSAFE(info[j].category) & (FLAG(VEGA_OT_M) | FLAG(VEGA_OT_MPST))) {
+                    reverse_range(b, i, j + 1, false);
+                    i = j + 1;
+                }
+        }
+        if (d->old_spec || end - start > 127)
+            merge_clusters(b, base, end);
+        else
+            for (size_t i = base; i < end; ++i)
+                if (info[i].syllable != 255) {
+                    size_t min = i, max = i, j = start + info[i].syllable;
+                    while (j != i) {
+                        if (j < min) min = j;
+                        if (j > max) max = j;
+                        size_t next = start + info[j].syllable;
+                        info[j].syllable = 255;
+                        j = next;
+                    }
+                    merge_clusters(b, base > min ? base : min, max + 1);
+                }
+        for (size_t i = start; i < end; ++i) info[i].syllable = syllable;
+    }
+
+    /* Masks: reph; pre-base (half, and blwf in new specifications that
+     * have it there); post-base. */
+    for (size_t i = start; i < end && info[i].position == VEGA_POS_RA_TO_BECOME_REPH; ++i)
+        info[i].mask |= masks[VEGA_MASK_RPHF];
+    uint32_t mask = masks[VEGA_MASK_HALF];
+    if (!d->old_spec && !d->config->blwf_post_only) mask |= masks[VEGA_MASK_BLWF];
+    for (size_t i = start; i < base; ++i) info[i].mask |= mask;
+    mask = masks[VEGA_MASK_BLWF] | masks[VEGA_MASK_ABVF] | masks[VEGA_MASK_PSTF];
+    for (size_t i = base + 1; i < end; ++i) info[i].mask |= mask;
+
+    /* Old-spec Devanagari: an eyelash Ra below a half form too, but not
+     * with a ZWJ. */
+    if (d->old_spec && script == TAG4('D', 'e', 'v', 'a'))
+        for (size_t i = start; i + 1 < base; ++i)
+            if (info[i].category == VEGA_OT_RA && info[i + 1].category == VEGA_OT_H &&
+                (i + 2 == base || info[i + 2].category != VEGA_OT_ZWJ)) {
+                info[i].mask |= masks[VEGA_MASK_BLWF];
+                info[i + 1].mask |= masks[VEGA_MASK_BLWF];
+            }
+
+    /* A halant, Ra the font reorders before the base: marked for pref. */
+    if (masks[VEGA_MASK_PREF] && base + 2 < end)
+        for (size_t i = base + 1; i + 1 < end; ++i) {
+            uint32_t glyphs[2] = {info[i].codepoint, info[i + 1].codepoint};
+            if (indic_would(d, VEGA_STAGE_PREF, glyphs, 2)) {
+                info[i].mask |= masks[VEGA_MASK_PREF];
+                info[i + 1].mask |= masks[VEGA_MASK_PREF];
+                break;
+            }
+        }
+
+    /* A ZWNJ keeps what is before it back to a consonant from half forms. */
+    for (size_t i = start + 1; i < end; ++i)
+        if (is_joiner(&info[i])) {
+            bool non_joiner = info[i].category == VEGA_OT_ZWNJ;
+            size_t j = i;
+            do {
+                j--;
+                if (non_joiner) info[j].mask &= ~masks[VEGA_MASK_HALF];
+            } while (j > start && !is_consonant(&info[j]));
+        }
+}
+
+static bool indic_initial_reordering(const Indic *d, VegaShaper *b) {
+    if (d->virama)
+        for (size_t i = 0; i < b->len; ++i)
+            if (b->info[i].position == VEGA_POS_BASE_C) b->info[i].position = consonant_position(d, b->info[i].codepoint);
+    bool changed = insert_dotted_circles(d->s, b, 4, VEGA_OT_DOTTEDCIRCLE, VEGA_OT_REPHA, VEGA_POS_END);
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        /* Vowel syllables look like consonant ones, and broken ones have
+         * their dotted circle, like a standalone cluster's. */
+        unsigned type = b->info[start].syllable & 0x0F;
+        if (type <= 2 || type == 4) indic_reorder_consonant_syllable(d, b, start, end);
+    }
+    return changed;
+}
+
+/* Categories of the preceding character that keep a left matra from
+ * 'init': HarfBuzz's Cf to Mn. */
+static bool word_character(unsigned c) {
+    switch (c) {
+    case VEGA_CF: case VEGA_CN: case VEGA_CO: case VEGA_CS: case VEGA_LL: case VEGA_LM: case VEGA_LO: case VEGA_LT:
+    case VEGA_LU: case VEGA_MC: case VEGA_ME: case VEGA_MN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void indic_final_syllable(const Indic *d, VegaShaper *b, size_t start, size_t end) {
+    Info *info = b->info;
+    const uint32_t *masks = d->plan->masks;
+    uint32_t script = d->plan->script;
+    bool malayalam_or_tamil = script == TAG4('M', 'l', 'y', 'm') || script == TAG4('T', 'a', 'm', 'l');
+    /* A virama that ligated and multiplied back out is a halant again. */
+    if (d->virama)
+        for (size_t i = start; i < end; ++i)
+            if (info[i].codepoint == d->virama && (info[i].gprops & LIGATED) && (info[i].gprops & MULTIPLIED)) {
+                info[i].category = VEGA_OT_H;
+                info[i].gprops &= (uint16_t)~(LIGATED | MULTIPLIED);
+            }
+
+    /* 4. The base again: where a pref candidate formed nothing, or (in
+     * Malayalam) past unformed below-base forms. */
+    bool try_pref = masks[VEGA_MASK_PREF] != 0;
+    size_t base;
+    for (base = start; base < end; base++)
+        if (info[base].position >= VEGA_POS_BASE_C) {
+            if (try_pref && base + 1 < end)
+                for (size_t i = base + 1; i < end; ++i)
+                    if (info[i].mask & masks[VEGA_MASK_PREF]) {
+                        if (!((info[i].gprops & SUBSTITUTED) && ligated_and_didnt_multiply(&info[i]))) {
+                            base = i;
+                            while (base < end && is_halant(&info[base])) base++;
+                            if (base < end) info[base].position = VEGA_POS_BASE_C;
+                            try_pref = false;
+                        }
+                        break;
+                    }
+            if (script == TAG4('M', 'l', 'y', 'm'))
+                for (size_t i = base + 1; i < end; ++i) {
+                    while (i < end && is_joiner(&info[i])) i++;
+                    if (i == end || !is_halant(&info[i])) break;
+                    i++;
+                    while (i < end && is_joiner(&info[i])) i++;
+                    if (i < end && is_consonant(&info[i]) && info[i].position == VEGA_POS_BELOW_C) {
+                        base = i;
+                        info[base].position = VEGA_POS_BASE_C;
+                    }
+                }
+            if (start < base && info[base].position > VEGA_POS_BASE_C) base--;
+            break;
+        }
+    if (base == end && start < base && is_one_of(&info[base - 1], FLAG(VEGA_OT_ZWJ))) base--;
+    if (base < end)
+        while (start < base && is_one_of(&info[base], FLAG(VEGA_OT_N) | FLAG(VEGA_OT_H))) base--;
+
+    /* Pre-base matras: after the last halant before the base (not one a
+     * ZWJ follows, nor the matra's own), else where they are. */
+    if (start + 1 < end && start < base) {
+        size_t new_pos = base == end ? base - 2 : base - 1;
+        if (!malayalam_or_tamil) {
+            for (;;) {
+                while (new_pos > start &&
+                       !is_one_of(&info[new_pos], FLAG(VEGA_OT_M) | FLAG(VEGA_OT_MPST) | FLAG(VEGA_OT_H)))
+                    new_pos--;
+                if (is_halant(&info[new_pos]) && info[new_pos].position != VEGA_POS_PRE_M) {
+                    if (new_pos + 1 < end && info[new_pos + 1].category == VEGA_OT_ZWJ && new_pos > start) {
+                        new_pos--;
+                        continue; /* keep searching */
+                    }
+                } else
+                    new_pos = start;
+                break;
+            }
+        }
+        if (start < new_pos && info[new_pos].position != VEGA_POS_PRE_M) {
+            for (size_t i = new_pos; i > start; i--)
+                if (info[i - 1].position == VEGA_POS_PRE_M) {
+                    size_t old_pos = i - 1;
+                    if (old_pos < base && base <= new_pos) base--;
+                    Info t = info[old_pos];
+                    memmove(&info[old_pos], &info[old_pos + 1], (new_pos - old_pos) * sizeof(Info));
+                    info[new_pos] = t;
+                    merge_clusters(b, new_pos, end < base + 1 ? end : base + 1);
+                    new_pos--;
+                }
+        } else
+            for (size_t i = start; i < base; ++i)
+                if (info[i].position == VEGA_POS_PRE_M) {
+                    merge_clusters(b, i, end < base + 1 ? end : base + 1);
+                    break;
+                }
+    }
+
+    /* Reph: moved only if it formed (or, encoded as a repha, if it did
+     * not ligate), to where the script puts it. */
+    if (start + 1 < end && info[start].position == VEGA_POS_RA_TO_BECOME_REPH &&
+        ((info[start].category == VEGA_OT_REPHA) ^ ligated_and_didnt_multiply(&info[start]))) {
+        size_t new_reph_pos = start;
+        unsigned reph_pos = d->config->reph_pos;
+        bool found = false;
+        if (reph_pos != VEGA_POS_AFTER_POST) {
+            /* 2. after the first explicit halant before the base (and a
+             * joiner after it) */
+            new_reph_pos = start + 1;
+            while (new_reph_pos < base && !is_halant(&info[new_reph_pos])) new_reph_pos++;
+            if (new_reph_pos < base && is_halant(&info[new_reph_pos])) {
+                if (new_reph_pos + 1 < base && is_joiner(&info[new_reph_pos + 1])) new_reph_pos++;
+                found = true;
+            }
+            /* 3. after the main consonant */
+            if (!found && reph_pos == VEGA_POS_AFTER_MAIN) {
+                new_reph_pos = base;
+                while (new_reph_pos + 1 < end && info[new_reph_pos + 1].position <= VEGA_POS_AFTER_MAIN) new_reph_pos++;
+                found = new_reph_pos < end;
+            }
+            /* 4. before the first post-base consonant or matra */
+            if (!found && reph_pos == VEGA_POS_AFTER_SUB) {
+                new_reph_pos = base;
+                while (new_reph_pos + 1 < end &&
+                       !(FLAG_UNSAFE(info[new_reph_pos + 1].position) &
+                         (FLAG(VEGA_POS_POST_C) | FLAG(VEGA_POS_AFTER_POST) | FLAG(VEGA_POS_SMVD))))
+                    new_reph_pos++;
+                found = new_reph_pos < end;
+            }
+        }
+        if (!found) {
+            /* 5. as step 2 */
+            new_reph_pos = start + 1;
+            while (new_reph_pos < base && !is_halant(&info[new_reph_pos])) new_reph_pos++;
+            if (new_reph_pos < base && is_halant(&info[new_reph_pos])) {
+                if (new_reph_pos + 1 < base && is_joiner(&info[new_reph_pos + 1])) new_reph_pos++;
+                found = true;
+            }
+        }
+        if (!found) {
+            /* 6. the end, before any syllable modifiers; before a halant
+             * that follows a matra */
+            new_reph_pos = end - 1;
+            while (new_reph_pos > start && info[new_reph_pos].position == VEGA_POS_SMVD) new_reph_pos--;
+            if (is_halant(&info[new_reph_pos]))
+                for (size_t i = base + 1; i < new_reph_pos; ++i)
+                    if (FLAG_UNSAFE(info[i].category) & (FLAG(VEGA_OT_M) | FLAG(VEGA_OT_MPST))) new_reph_pos--;
+        }
+        merge_clusters(b, start, new_reph_pos + 1);
+        Info reph = info[start];
+        memmove(&info[start], &info[start + 1], (new_reph_pos - start) * sizeof(Info));
+        info[new_reph_pos] = reph;
+        if (start < base && base <= new_reph_pos) base--;
+    }
+
+    /* A pre-base-reordering consonant that pref formed: before the base,
+     * where a pre-base matra would go. */
+    if (try_pref && base + 1 < end)
+        for (size_t i = base + 1; i < end; ++i)
+            if (info[i].mask & masks[VEGA_MASK_PREF]) {
+                if (ligated_and_didnt_multiply(&info[i])) {
+                    size_t new_pos = base;
+                    if (!malayalam_or_tamil)
+                        while (new_pos > start &&
+                               !is_one_of(&info[new_pos - 1], FLAG(VEGA_OT_M) | FLAG(VEGA_OT_MPST) | FLAG(VEGA_OT_H)))
+                            new_pos--;
+                    if (new_pos > start && is_halant(&info[new_pos - 1]) && new_pos < end && is_joiner(&info[new_pos]))
+                        new_pos++;
+                    size_t old_pos = i;
+                    merge_clusters(b, new_pos, old_pos + 1);
+                    Info t = info[old_pos];
+                    memmove(&info[new_pos + 1], &info[new_pos], (old_pos - new_pos) * sizeof(Info));
+                    info[new_pos] = t;
+                    if (new_pos <= base && base < old_pos) base++;
+                }
+                break;
+            }
+
+    /* 'init' on a left matra that starts a word. */
+    if (info[start].position == VEGA_POS_PRE_M && (!start || !word_character(gen_cat(&info[start - 1]))))
+        info[start].mask |= masks[VEGA_MASK_INDIC_INIT];
+}
+
+static void indic_final_reordering(const Indic *d, VegaShaper *b) {
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        indic_final_syllable(d, b, start, end);
+    }
+}
+
+/* The shaper's part of the work at a pause in GSUB; whether it changed the
+ * buffer. */
+static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause) {
+    if (plan->shaper != VEGA_SHAPER_INDIC) return false;
+    Indic d = indic_of(s, plan);
+    switch (pause) {
+    case VEGA_PAUSE_SYLLABLES: find_syllables(b, &vega_indic_machine); return false;
+    case VEGA_PAUSE_INITIAL_REORDERING: return indic_initial_reordering(&d, b);
+    case VEGA_PAUSE_FINAL_REORDERING: indic_final_reordering(&d, b); return false;
+    default: return false;
+    }
+}
+
 /* ---- Positions */
 
 static void fallback_spaces(const VegaShaping *s, VegaShaper *b) {
@@ -2449,7 +3263,7 @@ static void position(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     for (size_t i = 0; i < b->len; ++i) b->pos[i].x_advance = advance_of(s, b->info[i].codepoint);
     if (b->scratch & HAS_SPACE_FALLBACK) fallback_spaces(s, b);
     bool adjust = (plan->flags & VEGA_PLAN_ADJUST_ZEROING) && b->direction == VEGA_SHAPE_LTR;
-    if (plan->flags & VEGA_PLAN_GPOS) apply_table(s, b, 1, plan->gpos, plan->gpos_count);
+    if (plan->flags & VEGA_PLAN_GPOS) apply_table(s, plan, b, 1);
     if (plan->flags & VEGA_PLAN_KERN) kern_table(s, b, plan);
     if (plan->flags & VEGA_PLAN_ZERO_MARKS)
         for (size_t i = 0; i < b->len; ++i)
@@ -2484,13 +3298,14 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     b->max_len = count * 64 > 16384 ? count * 64 : 16384;
     b->max_ops = (long)(count * 1024 > 16384 ? count * 1024 : 16384);
     if (!ensure(b, count + 1)) return -1;
-    for (size_t i = 0; i < count; ++i) b->info[i] = (Info){codes[i], plan.global_mask, (uint32_t)i, 0, 0, 0, 0, 0};
+    for (size_t i = 0; i < count; ++i) b->info[i] = (Info){.codepoint = codes[i], .mask = plan.global_mask, .cluster = (uint32_t)i};
     b->len = count;
 
     set_unicode_props(b);
     form_clusters(b);
     ensure_native_direction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_HANGUL) preprocess_hangul(s, b);
+    if (plan.shaper == VEGA_SHAPER_INDIC) preprocess_vowel_constraints(&plan, b);
 
     /* Mirror what the font mirrors; mark the rest for rtlm. */
     if (direction == VEGA_SHAPE_RTL)
@@ -2502,6 +3317,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     normalize(s, &plan, b);
     setup_masks_fraction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_ARABIC) setup_masks_arabic(b, &plan);
+    if (plan.shaper == VEGA_SHAPER_INDIC) setup_masks_indic(b);
     if (plan.shaper == VEGA_SHAPER_HANGUL)
         for (size_t i = 0; i < b->len; ++i)
             if (b->info[i].action >= LJMO && b->info[i].action <= TJMO)
@@ -2517,7 +3333,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
         if (plan.flags & VEGA_PLAN_GUESS_CLASSES)
             info->gprops = gen_cat(info) != VEGA_MN || is_default_ignorable(info) ? BASE_GLYPH : MARK;
     }
-    apply_table(s, b, 0, plan.gsub, plan.gsub_count);
+    apply_table(s, &plan, b, 0);
     if (!b->successful || !ensure(b, b->len)) return -1;
     position(s, &plan, b);
 

@@ -3,6 +3,7 @@
  * masks and stages), what the section carries, and a check of it against
  * HarfBuzz on random runs. */
 #include "shape-build.h"
+#include "syllabic.h"
 #include "text.h"
 #include <hb-ot.h>
 #include <stdlib.h>
@@ -25,7 +26,8 @@ typedef struct {
     uint32_t mask, one_mask;
     bool auto_zwnj, auto_zwj, random, per_syllable, needs_fallback;
 } FeatureMap;
-typedef struct { unsigned index; uint32_t mask; bool auto_zwnj, auto_zwj, random, per_syllable; } LookupMap;
+/* A lookup to run, or (index VEGA_STEP_PAUSE) the pause that ends a stage. */
+typedef struct { unsigned index; uint32_t mask; bool auto_zwnj, auto_zwj, random, per_syllable; unsigned pause; } LookupMap;
 
 typedef struct {
     hb_face_t *face;
@@ -33,6 +35,7 @@ typedef struct {
     hb_tag_t chosen_script[2];
     FeatureInfo infos[MAX_FEATURES];
     unsigned info_count, current_stage[2];
+    unsigned pause[2][MAX_STAGES]; /* what ends each stage: VEGA_PAUSE_..., or 0 */
     bool is_simple;
     /* compiled */
     FeatureMap features[MAX_FEATURES];
@@ -40,6 +43,7 @@ typedef struct {
     uint32_t global_mask;
     LookupMap *lookups[2];
     unsigned lookup_count[2];
+    unsigned stage_first[2][MAX_STAGES], stage_end[2][MAX_STAGES]; /* each stage's lookups */
 } Map;
 
 static const hb_tag_t table_tags[2] = {HB_OT_TAG_GSUB, HB_OT_TAG_GPOS};
@@ -51,7 +55,10 @@ static void add_feature(Map *m, hb_tag_t tag, unsigned flags, unsigned value) {
     m->info_count++;
 }
 static void enable_feature(Map *m, hb_tag_t tag, unsigned flags, unsigned value) { add_feature(m, tag, flags | F_GLOBAL, value); }
-static void add_gsub_pause(Map *m) { m->current_stage[0]++; }
+static void add_gsub_pause(Map *m, unsigned pause) {
+    if (m->current_stage[0] < MAX_STAGES) m->pause[0][m->current_stage[0]] = pause;
+    m->current_stage[0]++;
+}
 
 static bool has_feature(const Map *m, hb_tag_t tag) {
     for (int t = 0; t < 2; ++t)
@@ -97,6 +104,17 @@ static uint32_t one_mask(const Map *m, const char *tag) {
     return f ? f->one_mask : 0;
 }
 
+static bool push_lookup(Map *m, int table, LookupMap l, unsigned *allocated) {
+    if (m->lookup_count[table] == *allocated) {
+        *allocated = *allocated ? 2 * *allocated : 64;
+        LookupMap *grown = realloc(m->lookups[table], *allocated * sizeof(*grown));
+        if (!grown) return false;
+        m->lookups[table] = grown;
+    }
+    m->lookups[table][m->lookup_count[table]++] = l;
+    return true;
+}
+
 static bool add_lookups(Map *m, int table, unsigned feature_index, uint32_t mask, bool auto_zwnj, bool auto_zwj,
                         bool random, bool per_syllable, unsigned *allocated) {
     unsigned table_lookup_count = hb_ot_layout_table_get_lookup_count(m->face, table_tags[table]);
@@ -104,17 +122,11 @@ static bool add_lookups(Map *m, int table, unsigned feature_index, uint32_t mask
     do {
         len = 32;
         hb_ot_layout_feature_get_lookups(m->face, table_tags[table], feature_index, offset, &len, indices);
-        for (unsigned i = 0; i < len; ++i) {
-            if (indices[i] >= table_lookup_count) continue;
-            if (m->lookup_count[table] == *allocated) {
-                *allocated = *allocated ? 2 * *allocated : 64;
-                LookupMap *grown = realloc(m->lookups[table], *allocated * sizeof(*grown));
-                if (!grown) return false;
-                m->lookups[table] = grown;
-            }
-            m->lookups[table][m->lookup_count[table]++] =
-                (LookupMap){indices[i], mask, auto_zwnj, auto_zwj, random, per_syllable};
-        }
+        for (unsigned i = 0; i < len; ++i)
+            if (indices[i] < table_lookup_count &&
+                !push_lookup(m, table, (LookupMap){indices[i], mask, auto_zwnj, auto_zwj, random, per_syllable, 0},
+                             allocated))
+                return false;
         offset += len;
     } while (len == 32);
     return true;
@@ -254,9 +266,9 @@ static bool compile_map(Map *m) {
         map->one_mask = (1u << map->shift) & map->mask;
     }
     if (m->is_simple) qsort(m->features, m->feature_count, sizeof(*m->features), by_tag);
-    /* The final pause, then each stage's lookups: sorted, duplicates merged. */
-    m->current_stage[0]++;
-    m->current_stage[1]++;
+    /* The final pause, then each stage's lookups: sorted, duplicates merged,
+     * the stage's pause after them. */
+    if (++m->current_stage[0] > MAX_STAGES || ++m->current_stage[1] > MAX_STAGES) return false;
     for (int t = 0; t < 2; ++t) {
         unsigned allocated = 0, last = 0;
         for (unsigned stage = 0; stage < m->current_stage[t]; ++stage) {
@@ -284,6 +296,12 @@ static bool compile_map(Map *m) {
                     }
                 m->lookup_count[t] = j + 1;
             }
+            m->stage_first[t][stage] = last;
+            m->stage_end[t][stage] = m->lookup_count[t];
+            if (m->pause[t][stage] &&
+                !push_lookup(m, t, (LookupMap){VEGA_STEP_PAUSE, 0, false, false, false, false, m->pause[t][stage]},
+                             &allocated))
+                return false;
             last = m->lookup_count[t];
         }
     }
@@ -316,9 +334,9 @@ static int categorize(uint32_t script, hb_tag_t gsub_script) {
     if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Khmr") ||
         script == TAG("Qaag"))
         return -1;
-    if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script) ||
-        listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script))
-        return dflt ? VEGA_SHAPER_DEFAULT : -1;
+    if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script))
+        return dflt ? VEGA_SHAPER_DEFAULT : (gsub_script & 0xFF) == '3' ? -1 : VEGA_SHAPER_INDIC;
+    if (listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script)) return dflt ? VEGA_SHAPER_DEFAULT : -1;
     if (script == TAG("Mymr")) return dflt || gsub_script == TAG("mymr") ? VEGA_SHAPER_DEFAULT : -1;
     return VEGA_SHAPER_DEFAULT;
 }
@@ -330,13 +348,25 @@ static bool has_table(hb_face_t *face, hb_tag_t tag) {
     return has;
 }
 
+typedef struct { unsigned first, count; } Stage;
 typedef struct {
     uint32_t script;
     int direction, native, shaper, flags;
     uint32_t global_mask, kern_mask, masks[VEGA_PLAN_MASKS];
     LookupMap *lookups[2];
     unsigned lookup_count[2];
+    unsigned shaper_flags;
+    Stage stages[VEGA_PLAN_STAGES];
 } Plan;
+
+/* The GSUB stage a feature is in (hb_ot_map_t::get_stage_lookups), for a
+ * shaper's would-substitute questions. */
+static Stage stage_of(const Map *m, const char *tag) {
+    const FeatureMap *f = find_feature(m, TAG(tag));
+    if (!f || f->stage[0] >= m->current_stage[0]) return (Stage){0, 0};
+    unsigned first = m->stage_first[0][f->stage[0]];
+    return (Stage){first, m->stage_end[0][f->stage[0]] - first};
+}
 
 /* What HarfBuzz makes of the font's kern table (hb-ot-kern-table.hh): one
  * with subtables that pass its checks (data), Apple's state machines among
@@ -415,7 +445,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     /* hb_ot_shape_collect_features */
     m->is_simple = true;
     enable_feature(m, TAG("rvrn"), F_NONE, 1);
-    add_gsub_pause(m);
+    add_gsub_pause(m, 0);
     if (direction == VEGA_SHAPE_LTR) {
         enable_feature(m, TAG("ltra"), F_NONE, 1);
         enable_feature(m, TAG("ltrm"), F_NONE, 1);
@@ -434,22 +464,56 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     if (shaper == VEGA_SHAPER_ARABIC) {
         m->is_simple = false;
         enable_feature(m, TAG("stch"), F_NONE, 1);
-        add_gsub_pause(m); /* record_stch */
+        add_gsub_pause(m, 0); /* record_stch */
         enable_feature(m, TAG("ccmp"), F_MANUAL_ZWJ, 1);
         enable_feature(m, TAG("locl"), F_MANUAL_ZWJ, 1);
-        add_gsub_pause(m);
+        add_gsub_pause(m, 0);
         for (int i = 0; i < 7; ++i) {
             bool syriac = arabic_features[i][3] == '2' || arabic_features[i][3] == '3';
             add_feature(m, TAG(arabic_features[i]), F_MANUAL_ZWJ | (script == HB_SCRIPT_ARABIC && !syriac ? F_HAS_FALLBACK : 0), 1);
-            add_gsub_pause(m);
+            add_gsub_pause(m, 0);
         }
         enable_feature(m, TAG("rlig"), F_MANUAL_ZWJ | F_HAS_FALLBACK, 1);
-        if (script == HB_SCRIPT_ARABIC) add_gsub_pause(m); /* arabic_fallback_shape */
+        if (script == HB_SCRIPT_ARABIC) add_gsub_pause(m, 0); /* arabic_fallback_shape */
         enable_feature(m, TAG("calt"), F_MANUAL_ZWJ, 1);
-        if (!has_feature(m, TAG("rclt"))) add_gsub_pause(m);
+        if (!has_feature(m, TAG("rclt"))) add_gsub_pause(m, 0);
         enable_feature(m, TAG("liga"), F_MANUAL_ZWJ, 1);
         enable_feature(m, TAG("clig"), F_MANUAL_ZWJ, 1);
         enable_feature(m, TAG("mset"), F_MANUAL_ZWJ, 1);
+    }
+    /* hb-ot-shaper-indic.cc: syllables found before any lookup; locl and
+     * ccmp; the initial reordering; the basic features one stage each; the
+     * final reordering; the rest. */
+    static const struct { const char *tag; unsigned flags; } indic_features[17] = {
+        {"nukt", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"akhn", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"rphf", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"rkrf", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"pref", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"blwf", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"abvf", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"half", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"pstf", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"vatu", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"cjct", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"init", F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"pres", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"abvs", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"blws", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"psts", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE},
+        {"haln", F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE}};
+    if (shaper == VEGA_SHAPER_INDIC) {
+        m->is_simple = false;
+        add_gsub_pause(m, VEGA_PAUSE_SYLLABLES);
+        enable_feature(m, TAG("locl"), F_PER_SYLLABLE, 1);
+        enable_feature(m, TAG("ccmp"), F_PER_SYLLABLE, 1);
+        add_gsub_pause(m, VEGA_PAUSE_INITIAL_REORDERING);
+        for (int i = 0; i < 11; ++i) {
+            add_feature(m, TAG(indic_features[i].tag), indic_features[i].flags, 1);
+            add_gsub_pause(m, 0);
+        }
+        add_gsub_pause(m, VEGA_PAUSE_FINAL_REORDERING);
+        for (int i = 11; i < 17; ++i) add_feature(m, TAG(indic_features[i].tag), indic_features[i].flags, 1);
     }
     if (shaper == VEGA_SHAPER_HANGUL) {
         m->is_simple = false;
@@ -464,9 +528,14 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         add_feature(m, TAG(common[i]), F_GLOBAL | (i == 4 || i == 5 ? F_MANUAL_ZWNJ | F_MANUAL_ZWJ : 0), 1);
     static const char *const horizontal[] = {"calt", "clig", "curs", "dist", "kern", "liga", "rclt"};
     for (int i = 0; i < 7; ++i) add_feature(m, TAG(horizontal[i]), F_GLOBAL | (i == 4 ? F_HAS_FALLBACK : 0), 1);
-    /* Hangul turns calt off: fonts put jamo lookups there. */
+    /* Hangul turns calt off: fonts put jamo lookups there. Indic turns liga
+     * off, and is done with syllables after GSUB. */
     if (shaper == VEGA_SHAPER_HANGUL) add_feature(m, TAG("calt"), F_GLOBAL, 0);
-    if (!compile_map(m)) FAIL("out of memory");
+    if (shaper == VEGA_SHAPER_INDIC) {
+        add_feature(m, TAG("liga"), F_GLOBAL, 0);
+        add_gsub_pause(m, VEGA_PAUSE_CLEAR_SYLLABLES);
+    }
+    if (!compile_map(m)) FAIL("out of memory, or more than %d stages", MAX_STAGES);
 
     /* hb_ot_shape_planner_t::compile */
     const FeatureMap *kern = find_feature(m, TAG("kern"));
@@ -476,8 +545,9 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     bool apply_kern = (!has_gpos_kern || !apply_gpos) && kern_table.data;
     if (apply_kern && (kern_table.other || kern_table.cross))
         FAIL("%s: the font's kern table has more than pairs (state machines, classes, cross-stream kerning)", name);
-    /* Hangul's shaper neither zeroes marks nor places them without GPOS. */
-    bool script_marks = shaper != VEGA_SHAPER_HANGUL;
+    /* Hangul's and Indic's shapers neither zero marks nor place them
+     * without GPOS. */
+    bool script_marks = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC;
     bool adjust = !apply_gpos && (!apply_kern || !kern_table.cross), fallback_marks = adjust && script_marks;
     if (shaper == VEGA_SHAPER_ARABIC) {
         if (one_mask(m, "stch")) FAIL("%s: the font stretches (stch)", name);
@@ -499,15 +569,26 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
                        (apply_kern ? VEGA_PLAN_KERN : 0) | (fallback_marks ? VEGA_PLAN_FALLBACK_MARKS : 0) |
                        (adjust ? VEGA_PLAN_ADJUST_ZEROING : 0),
                    m->global_mask, kern ? kern->one_mask : 0, {0}, {m->lookups[0], m->lookups[1]},
-                   {m->lookup_count[0], m->lookup_count[1]}};
-    for (int i = 0; i < 7; ++i) plan->masks[VEGA_MASK_ISOL + i] = one_mask(m, arabic_features[i]);
+                   {m->lookup_count[0], m->lookup_count[1]}, 0, {{0, 0}}};
     plan->masks[VEGA_MASK_RTLM] = one_mask(m, "rtlm");
     plan->masks[VEGA_MASK_FRAC] = frac;
     plan->masks[VEGA_MASK_NUMR] = numr;
     plan->masks[VEGA_MASK_DNOM] = dnom;
-    plan->masks[VEGA_MASK_LJMO] = one_mask(m, "ljmo");
-    plan->masks[VEGA_MASK_VJMO] = one_mask(m, "vjmo");
-    plan->masks[VEGA_MASK_TJMO] = one_mask(m, "tjmo");
+    if (shaper == VEGA_SHAPER_ARABIC)
+        for (int i = 0; i < 7; ++i) plan->masks[VEGA_MASK_ISOL + i] = one_mask(m, arabic_features[i]);
+    if (shaper == VEGA_SHAPER_HANGUL) {
+        plan->masks[VEGA_MASK_LJMO] = one_mask(m, "ljmo");
+        plan->masks[VEGA_MASK_VJMO] = one_mask(m, "vjmo");
+        plan->masks[VEGA_MASK_TJMO] = one_mask(m, "tjmo");
+    }
+    if (shaper == VEGA_SHAPER_INDIC) {
+        /* the masks of the features set glyph by glyph (not global ones) */
+        static const char *const masked[] = {"rphf", "pref", "blwf", "abvf", "half", "pstf", "init"};
+        for (int i = 0; i < 7; ++i) plan->masks[VEGA_MASK_RPHF + i] = one_mask(m, masked[i]);
+        static const char *const staged[VEGA_PLAN_STAGES] = {"rphf", "pref", "blwf", "pstf", "vatu"};
+        for (int i = 0; i < VEGA_PLAN_STAGES; ++i) plan->stages[i] = stage_of(m, staged[i]);
+        if ((m->chosen_script[0] & 0xFF) != '2') plan->shaper_flags |= VEGA_INDIC_OLD_SPEC;
+    }
     free(m);
     return true;
 fail:
@@ -661,6 +742,13 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
             put32(&o, p->lookup_count[t]);
             step += p->lookup_count[t];
         }
+        put32(&o, p->shaper_flags);
+        for (int k = 0; k < VEGA_PLAN_STAGES; ++k) {
+            put16(&o, p->stages[k].first);
+            put16(&o, p->stages[k].count);
+            put32(&o, 0);
+        }
+        put32(&o, 0);
     }
     set32(&o, 56, step);
     set32(&o, 60, (uint32_t)o.size);
@@ -669,10 +757,11 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
             for (unsigned k = 0; k < plans[i].lookup_count[t]; ++k) {
                 const LookupMap *l = &plans[i].lookups[t][k];
                 put16(&o, l->index);
-                unsigned char flags[2] = {(unsigned char)((l->auto_zwnj ? VEGA_STEP_AUTO_ZWNJ : 0) |
-                                                          (l->auto_zwj ? VEGA_STEP_AUTO_ZWJ : 0) |
-                                                          (l->random ? VEGA_STEP_RANDOM : 0) |
-                                                          (l->per_syllable ? VEGA_STEP_PER_SYLLABLE : 0)),
+                unsigned char flags[2] = {(unsigned char)(l->index == VEGA_STEP_PAUSE ? l->pause
+                                                          : (l->auto_zwnj ? VEGA_STEP_AUTO_ZWNJ : 0) |
+                                                                (l->auto_zwj ? VEGA_STEP_AUTO_ZWJ : 0) |
+                                                                (l->random ? VEGA_STEP_RANDOM : 0) |
+                                                                (l->per_syllable ? VEGA_STEP_PER_SYLLABLE : 0)),
                                           0};
                 put(&o, flags, 2);
                 put32(&o, l->mask);
@@ -708,7 +797,8 @@ bool vega_shaping_compile(hb_face_t *face, const uint32_t *scripts, size_t scrip
             if (hb_font_get_nominal_glyph(font, u, &g)) hb_set_add(glyphs, g);
         }
         for (size_t i = 0; i < plan_count; ++i)
-            for (unsigned k = 0; k < plans[i].lookup_count[0]; ++k) hb_set_add(lookups, plans[i].lookups[0][k].index);
+            for (unsigned k = 0; k < plans[i].lookup_count[0]; ++k)
+                if (plans[i].lookups[0][k].index != VEGA_STEP_PAUSE) hb_set_add(lookups, plans[i].lookups[0][k].index);
         hb_ot_layout_lookups_substitute_closure(face, lookups, glyphs);
         hb_set_destroy(wanted);
         hb_set_destroy(lookups);
@@ -763,6 +853,46 @@ static uint32_t jamo(Random *r, const Pool *p, uint32_t first, uint32_t count) {
     return p->count && below(r, 2) ? pick(r, p) : first + below(r, count);
 }
 
+/* An Indic syllable the ways text spells one (hb-ot-shaper-indic.cc):
+ * consonants joined by viramas (a joiner by some), a Ra and virama first
+ * for a reph, nuktas, matras, syllable modifiers, a virama at the end; a
+ * vowel with its modifiers. indic holds the script's consonants, Ra,
+ * viramas, nuktas, matras, modifiers and vowels. */
+enum { INDIC_CONSONANTS, INDIC_RA, INDIC_HALANTS, INDIC_NUKTAS, INDIC_MATRAS, INDIC_MODIFIERS, INDIC_VOWELS, INDIC_POOLS };
+static size_t indic_syllable(Random *r, const Pool *indic, uint32_t *text, size_t n) {
+    const Pool *c = &indic[INDIC_CONSONANTS], *ra = &indic[INDIC_RA], *h = &indic[INDIC_HALANTS],
+               *nukta = &indic[INDIC_NUKTAS], *m = &indic[INDIC_MATRAS], *sm = &indic[INDIC_MODIFIERS],
+               *v = &indic[INDIC_VOWELS];
+    if (!c->count || !h->count) return n;
+    if (ra->count && !below(r, 4)) {
+        text[n++] = pick(r, ra);
+        text[n++] = pick(r, h);
+        if (!below(r, 8)) text[n++] = 0x200D;
+    }
+    if (v->count && !below(r, 6)) {
+        text[n++] = pick(r, v);
+        if (nukta->count && !below(r, 8)) text[n++] = pick(r, nukta);
+    } else
+        for (unsigned k = 0, count = 1 + below(r, 3); k < count; ++k) {
+            text[n++] = ra->count && !below(r, 5) ? pick(r, ra) : pick(r, c);
+            if (nukta->count && !below(r, 6)) text[n++] = pick(r, nukta);
+            if (k + 1 == count) break;
+            unsigned joiner = below(r, 8);
+            if (joiner == 0) text[n++] = 0x200D;
+            text[n++] = pick(r, h);
+            if (joiner == 1) text[n++] = 0x200D;
+            if (joiner == 2) text[n++] = 0x200C;
+        }
+    if (m->count && below(r, 3)) {
+        text[n++] = pick(r, m);
+        if (!below(r, 8)) text[n++] = pick(r, m);
+    }
+    if (sm->count && !below(r, 4)) text[n++] = pick(r, sm);
+    if (!below(r, 10)) text[n++] = pick(r, h);
+    if (!below(r, 12)) text[n++] = below(r, 2) ? 0x200C : 0x200D;
+    return n;
+}
+
 /* A Hangul syllable the ways text spells one (hb-ot-shaper-hangul.cc): jamo
  * in the orders that compose (L V, L V T, LV T), a syllable whole, jamo in
  * any order; now and then a tone mark after. jamo holds the font's L, V
@@ -805,8 +935,9 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     /* Letters of the script, marks it can take (its own and inherited
      * ones), the rest of its characters and Common's (spaces, digits,
      * punctuation), and those whose glyphs some substitution starts from. */
-    Pool letters = {0}, marks = {0}, others = {0}, hot = {0}, jamo_pools[3] = {{0}};
+    Pool letters = {0}, marks = {0}, others = {0}, hot = {0}, jamo_pools[3] = {{0}}, indic[INDIC_POOLS] = {{0}};
     bool hangul = script == HB_TAG('H', 'a', 'n', 'g');
+    bool syllabic = listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script);
     hb_set_t *inputs = hb_set_create();
     uint32_t common = HB_TAG('Z', 'y', 'y', 'y'), inherited = HB_TAG('Z', 'i', 'n', 'h');
     for (unsigned t = 0; t < s->lookup_count[0]; ++t)
@@ -820,6 +951,19 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
         if (hangul && ((code >= 0x1100 && code <= 0x115F) || (code >= 0xA960 && code <= 0xA97C))) pool_add(&jamo_pools[0], code);
         if (hangul && ((code >= 0x1160 && code <= 0x11A7) || (code >= 0xD7B0 && code <= 0xD7C6))) pool_add(&jamo_pools[1], code);
         if (hangul && ((code >= 0x11A8 && code <= 0x11FF) || (code >= 0xD7CB && code <= 0xD7FB))) pool_add(&jamo_pools[2], code);
+        if (syllabic && (of == script || of == inherited)) {
+            int pool = -1;
+            switch (vega_indic_categories(code) & 0xFF) {
+            case VEGA_OT_C: case VEGA_OT_CS: pool = INDIC_CONSONANTS; break;
+            case VEGA_OT_RA: pool = INDIC_RA; break;
+            case VEGA_OT_H: pool = INDIC_HALANTS; break;
+            case VEGA_OT_N: pool = INDIC_NUKTAS; break;
+            case VEGA_OT_M: case VEGA_OT_MPST: pool = INDIC_MATRAS; break;
+            case VEGA_OT_SM: case VEGA_OT_A: pool = INDIC_MODIFIERS; break;
+            case VEGA_OT_V: pool = INDIC_VOWELS; break;
+            }
+            if (pool >= 0) pool_add(&indic[pool], code);
+        }
         if (mark && (of == script || of == inherited)) pool_add(&marks, code);
         else if (!mark && of == script && c >= VEGA_LU && c <= VEGA_LO) pool_add(&letters, code);
         else if (!mark && (of == script || of == common) && c != VEGA_ZL && c != VEGA_ZP) pool_add(&others, code);
@@ -849,6 +993,10 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
                 for (unsigned k = 0; k < length && n < 200; ++k) {
                     if (hangul && below(&random, 2)) {
                         n = hangul_syllable(&random, jamo_pools, text, n);
+                        continue;
+                    }
+                    if (syllabic && below(&random, 3)) {
+                        n = indic_syllable(&random, indic, text, n);
                         continue;
                     }
                     text[n++] = hot.count && below(&random, 3) == 0 ? pick(&random, &hot) : pick(&random, &letters);
@@ -916,4 +1064,5 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
     free(others.items);
     free(hot.items);
     for (int k = 0; k < 3; ++k) free(jamo_pools[k].items);
+    for (int k = 0; k < INDIC_POOLS; ++k) free(indic[k].items);
 }

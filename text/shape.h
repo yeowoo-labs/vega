@@ -6,7 +6,8 @@
 
 /* Shaping (docs/design/004-text.md): a run of characters (one script, one
  * direction) to glyphs and their positions, as HarfBuzz 10 shapes it with
- * its default, Arabic and Hebrew shapers, glyph for glyph and unit for unit.
+ * its default, Arabic, Hebrew, Hangul and Indic shapers, glyph for glyph and
+ * unit for unit.
  *
  * What a font's shaping needs travels in a symbol file (its shaping
  * section), written by the build tool:
@@ -31,15 +32,22 @@
  *                                          no plan positions marks without
  *                                          GPOS; x_bearing INT16_MIN: none),
  *   u32 0
- * Offsets are from the section's start. A plan:
+ * Offsets are from the section's start. A plan (VEGA_PLAN_BYTES):
  *   u32 script (ISO 15924 as a tag: 'Latn'), u8 direction, u8 native
  *   direction (of its script; 0 when it has none), u8 shaper, u8 flags,
  *   u32 global mask, u32 kern mask, u32 masks[VEGA_PLAN_MASKS], u32 first
- *   GSUB step, u32 GSUB steps, u32 first GPOS step, u32 GPOS steps.
- * A step, a lookup to run: u16 lookup index, u8 flags, u8 0, u32 mask. */
-enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 88, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 14 };
+ *   GSUB step, u32 GSUB steps, u32 first GPOS step, u32 GPOS steps,
+ *   u8 shaper flags, u8 0[3],
+ *   the stages the shaper asks whether a feature would substitute in
+ *   (VEGA_PLAN_STAGES of: u16 first step, counted from the plan's first
+ *   GSUB step, u16 steps, u32 0), u32 0.
+ * A step, a lookup to run: u16 lookup index, u8 flags, u8 0, u32 mask; or
+ * a pause, where the shaper does its part: u16 VEGA_STEP_PAUSE, u8 which
+ * (VEGA_PAUSE_...), u8 0, u32 0. */
+enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 16,
+       VEGA_PLAN_STAGES = 5 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
-enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL };
+enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC };
 /* Plan flags: GPOS runs; mark advances are zeroed after it (by GDEF); glyph
  * classes come from Unicode (the font has none); the font positions marks
  * (a 'mark' feature); automatic fractions; the kern table kerns; marks are
@@ -47,12 +55,24 @@ enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_
  * it where it was. */
 enum { VEGA_PLAN_GPOS = 1, VEGA_PLAN_ZERO_MARKS = 2, VEGA_PLAN_GUESS_CLASSES = 4, VEGA_PLAN_GPOS_MARK = 8,
        VEGA_PLAN_FRACTIONS = 16, VEGA_PLAN_KERN = 32, VEGA_PLAN_FALLBACK_MARKS = 64, VEGA_PLAN_ADJUST_ZEROING = 128 };
-/* The masks a plan names, for the features set glyph by glyph. */
-enum { VEGA_MASK_ISOL, VEGA_MASK_FINA, VEGA_MASK_FIN2, VEGA_MASK_FIN3, VEGA_MASK_MEDI, VEGA_MASK_MED2,
-       VEGA_MASK_INIT, VEGA_MASK_RTLM, VEGA_MASK_FRAC, VEGA_MASK_NUMR, VEGA_MASK_DNOM, VEGA_MASK_LJMO, VEGA_MASK_VJMO,
-       VEGA_MASK_TJMO };
-/* Step flags. */
+/* The masks a plan names, for the features set glyph by glyph: those of
+ * every shaper, then each shaper's own. */
+enum { VEGA_MASK_RTLM, VEGA_MASK_FRAC, VEGA_MASK_NUMR, VEGA_MASK_DNOM, VEGA_MASK_SHAPER };
+enum { VEGA_MASK_ISOL = VEGA_MASK_SHAPER, VEGA_MASK_FINA, VEGA_MASK_FIN2, VEGA_MASK_FIN3, VEGA_MASK_MEDI,
+       VEGA_MASK_MED2, VEGA_MASK_INIT };                                      /* Arabic */
+enum { VEGA_MASK_LJMO = VEGA_MASK_SHAPER, VEGA_MASK_VJMO, VEGA_MASK_TJMO };      /* Hangul */
+enum { VEGA_MASK_RPHF = VEGA_MASK_SHAPER, VEGA_MASK_PREF, VEGA_MASK_BLWF, VEGA_MASK_ABVF, VEGA_MASK_HALF,
+       VEGA_MASK_PSTF, VEGA_MASK_INDIC_INIT };                                /* Indic */
+/* The stages a plan names: Indic's, whose features decide a consonant's
+ * position by whether they would substitute it. */
+enum { VEGA_STAGE_RPHF, VEGA_STAGE_PREF, VEGA_STAGE_BLWF, VEGA_STAGE_PSTF, VEGA_STAGE_VATU };
+/* Shaper flags: Indic's font follows the old specification (deva, not
+ * dev2). */
+enum { VEGA_INDIC_OLD_SPEC = 1 };
+/* Step flags; pauses, which the shaper tells apart. */
 enum { VEGA_STEP_AUTO_ZWNJ = 1, VEGA_STEP_AUTO_ZWJ = 2, VEGA_STEP_RANDOM = 4, VEGA_STEP_PER_SYLLABLE = 8 };
+enum { VEGA_STEP_PAUSE = 0xFFFF };
+enum { VEGA_PAUSE_SYLLABLES = 1, VEGA_PAUSE_INITIAL_REORDERING, VEGA_PAUSE_FINAL_REORDERING, VEGA_PAUSE_CLEAR_SYLLABLES };
 
 typedef struct { const unsigned char *p; uint32_t size; } VegaTable;
 /* Which glyphs may be in a set, as three 64-bit patterns of glyph bits
