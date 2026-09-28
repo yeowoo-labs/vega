@@ -745,7 +745,7 @@ static bool compose_hebrew(const Normalizer *c, uint32_t a, uint32_t b, uint32_t
     *ab = 0;
     switch (b) {
     case 0x05B4: if (a == 0x05D9) *ab = 0xFB1D; break;
-    case 0x05B7: if (a == 0x05D9) *ab = 0xFB1F; else if (a == 0x05D0) *ab = 0xFB2E; break;
+    case 0x05B7: if (a == 0x05F2) *ab = 0xFB1F; else if (a == 0x05D0) *ab = 0xFB2E; break;
     case 0x05B8: if (a == 0x05D0) *ab = 0xFB2F; break;
     case 0x05B9: if (a == 0x05D5) *ab = 0xFB4B; break;
     case 0x05BC:
