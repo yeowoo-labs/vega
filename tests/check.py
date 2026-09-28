@@ -1078,6 +1078,94 @@ def pixels(vega, tool, module, work):
     return {'frames': len(frames), 'cells': checked}
 
 
+def typeset(vega, tool, module, work):
+    """The pixel surface setting type, its first font shaping: fonts in order
+    of preference (DejaVu Sans for Latin and Arabic, Noto Sans CJK KR for
+    Hangul, FreeSans for Devanagari). The frames' text is the TUI's. A label
+    in one script, alone in its list, is pixel for pixel what the font that
+    has it sets by itself (vega-symbols paragraph): each cluster went to that
+    font, shaped and placed as the layout says (ink may pass its row, as
+    marks below a line do). With several labels, one too long for its row is
+    cut within it, rows without text stay blank, and the text cursor stands
+    after the prompt."""
+    fonts = {'latin': Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'),
+             'hangul': Path('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'),
+             'deva': Path('/usr/share/fonts/truetype/freefont/FreeSans.ttf')}
+    if not all(path.exists() for path in fonts.values()):
+        return None
+    faces = {name: work / f'type-{name}.vsym' for name in fonts}
+    for name, args in (('latin', ['--codes', '0x20-0x7e,0xa0-0xff,0x600-0x6ff,0x2010-0x2027,0x2190-0x21ff',
+                                  '--shape', 'Latn,Arab,Zyyy']),
+                       ('hangul', ['--face', 1, '--codes', '0x3131-0x318e,0xac00-0xd7a3', '--shape', 'Hang']),
+                       ('deva', ['--codes', '0x900-0x97f', '--shape', 'Deva'])):
+        built = run(tool, 'build', '--font', fonts[name], *args, '--runs', 300, '-o', faces[name])
+        assert built.returncode == 0, built.stderr
+    stack = [a for face in faces.values() for a in ('--symbols', face)]
+    columns, rows, size = 48, 12, 20
+    background, focused, normal = (0x1e, 0x1e, 0x2e), (0x31, 0x32, 0x44), (0xcd, 0xd6, 0xf4)
+    metrics = {name: json.loads(run(tool, 'info', face).stdout.split(',"symbols"')[0] + '}') for name, face in faces.items()}
+    baseline = lambda name: math.ceil(metrics[name]['ascent'] * size / metrics[name]['units'])
+
+    def frame(items):
+        script = ''.join(f'text {item.encode().hex()}\n' for item in items) + 'show\n'
+        text = run(vega, 'tui', module, '--dump', f'{columns}x{rows}', stdin=script)
+        drawn = run(vega, 'pixels', module, *stack, '--size', size, '--grid', f'{columns}x{rows}', '--out', work / 'type',
+                    stdin=script)
+        assert text.returncode == 0 and drawn.returncode == 0, drawn.stderr
+        lines = text.stdout.splitlines()
+        assert [line for line in drawn.stdout.splitlines() if not line.startswith('frame ')] == lines
+        (_, path, _), = [line.split() for line in drawn.stdout.splitlines() if line.startswith('frame ')]
+        header, image = Path(path).read_bytes().split(b'255\n', 1)
+        width, height = map(int, header.split()[1:3])
+        return lines, image, width, width // columns, height // rows
+
+    compared = 0
+    for label, name in {'Kerning AV Wa To': 'latin', '우유 사기': 'hangul', 'مرحبا بالعالم': 'latin',
+                        'नमस्ते दुनिया': 'deva'}.items():
+        lines, image, width, cell_width, cell_height = frame([label])
+        row = next(r for r, line in enumerate(lines[:rows]) if line[1:].split('\t')[0][2:].rstrip() == label)
+        set_alone = run(tool, 'paragraph', faces[name], size, 0, work / 'alone.pgm', label)
+        assert set_alone.returncode == 0, set_alone.stderr
+        head, gray = (work / 'alone.pgm').read_bytes().split(b'255\n', 1)
+        alone_width, alone_height = map(int, head.split()[1:3])
+        # The paragraph's pen starts at (size, size + its ascent); the label's at column 2, on the row's baseline.
+        dx, dy = 2 * cell_width - size, row * cell_height + baseline('latin') - size - baseline(name)
+        # coverage of the label's tone over the background of the row the pixel is in
+        under = lambda y: (focused if lines[y // cell_height][0] == '>' else background)[2]
+        at = lambda x, y: round((image[3 * (y * width + x) + 2] - under(y)) * 255 / (normal[2] - under(y)))
+        ink = 0
+        for y in range(alone_height):
+            for x in range(alone_width):
+                if 255 - gray[y * alone_width + x]:
+                    ink += 1
+                    assert abs(at(x + dx, y + dy) - (255 - gray[y * alone_width + x])) <= 4, (label, x, y)
+        for y in range(row * cell_height, (row + 1) * cell_height):
+            for x in range(2 * cell_width, width):
+                px, py = x - dx, y - dy
+                expected = 255 - gray[py * alone_width + px] if 0 <= px < alone_width and 0 <= py < alone_height else 0
+                assert abs(at(x, y) - expected) <= 4, (label, x, y, at(x, y), expected)
+                compared += 1
+        assert ink > 50, label
+    # Several: the long label cut, its ink reaching into its row's last cells.
+    long = 'Pure 런타임 ' + 'and a tail far too long to fit ' * 3
+    lines, image, width, cell_width, cell_height = frame(['우유 사기', 'Pure 런타임 문서 읽기', long])
+    pixel = lambda x, y: tuple(image[3 * (y * width + x):3 * (y * width + x) + 3])
+    row = next(r for r, line in enumerate(lines[:rows]) if line[3:].startswith('Pure 런타임 and'))
+    color = focused if lines[row][0] == '>' else background
+    inked = [x for x in range(width) if any(pixel(x, y) != color for y in range(row * cell_height, (row + 1) * cell_height))]
+    assert inked and width - 3 * cell_width <= inked[-1] < width, (inked[-1:], width)
+    # Rows without text (and none after a row of text: nothing there passes its row) are blank.
+    for row, line in enumerate(lines[:rows]):
+        if not line[1:].split('\t')[0].strip() and (not row or not lines[row - 1][1:].split('\t')[0].strip()):
+            color = focused if line[0] == '>' else background
+            assert all(pixel(x, y) == color for y in range(row * cell_height, (row + 1) * cell_height)
+                       for x in range(width)), row
+    prompt = rows - 1
+    assert any(sum(pixel(x, y) == normal for y in range(prompt * cell_height, (prompt + 1) * cell_height)) >= cell_height // 2
+               for x in range(width)), 'no text cursor'
+    return {'labels': 4, 'pixels': compared}
+
+
 def display(vega, module, work):
     """The same frames on a display through KMS, on a writeback connector: each
     comes back from the display controller exactly as drawn, and it is the
@@ -1600,6 +1688,7 @@ def main():
         if args.symbols:
             report['symbols'] = symbols(args.symbols.resolve(), work)
             report['pixels'] = pixels(vega, args.symbols.resolve(), modules['todo'], work)
+            report['typeset'] = typeset(vega, args.symbols.resolve(), modules['todo'], work)
             report['display'] = display(vega, modules['todo'], work)
             report['accessibility'] = accessibility(vega, modules['todo'], work)
             report['live_display'] = live_display(vega, modules['todo'], work)

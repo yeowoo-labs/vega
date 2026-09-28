@@ -1163,9 +1163,9 @@ static size_t decode_utf8(const char *text, uint32_t *out, size_t room) {
     return n;
 }
 
-/* Set text in lines at most width pixels wide and draw it: vega-symbols
- * paragraph OUT.vsym PIXELS WIDTH OUT.pgm TEXT... (the texts are
- * paragraphs, one after another). */
+/* Set text in lines at most width pixels wide (0: as wide as its widest
+ * line) and draw it: vega-symbols paragraph OUT.vsym PIXELS WIDTH OUT.pgm
+ * TEXT... (the texts are paragraphs, one after another). */
 static int paragraph(int argc, char **argv) {
     if (argc < 7) fail("usage: vega-symbols paragraph OUT.vsym PIXELS WIDTH OUT.pgm TEXT...");
     char *bytes, error[128];
@@ -1187,6 +1187,9 @@ static int paragraph(int argc, char **argv) {
             fail("cannot lay out");
         height += (int)layouts[k].line_count * line_height + line_height / 2;
     }
+    if (!width)
+        for (int k = 0; k < paragraphs; ++k)
+            if ((int)ceil(layouts[k].width * per_unit) + 1 > width) width = (int)ceil(layouts[k].width * per_unit) + 1;
     int total_width = width + 2 * margin;
     unsigned char *image = malloc((size_t)total_width * (size_t)height);
     memset(image, 255, (size_t)total_width * (size_t)height);

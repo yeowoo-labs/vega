@@ -21,10 +21,11 @@
  *   say              sentences (the first natural-language surface), driven by a script
  *   web [--listen ADDRESS] [--port N]
  *                    a web page (a GUI), on 127.0.0.1 unless another address is given
- *   pixels --symbols FONT.vsym [--size PX] --grid WxH --out PREFIX
- *                    the TUI's frames drawn with a font's glyphs, driven by a
- *                    script: each show writes PREFIX-N.ppm after the text
- *   display --symbols FONT.vsym [--size PX] [--card PATH] [--writeback WxH --out PREFIX]
+ *   pixels --symbols FONT.vsym... [--size PX] --grid WxH --out PREFIX
+ *                    the TUI's frames drawn in fonts (in order of preference;
+ *                    set as type when the first shapes), driven by a script:
+ *                    each show writes PREFIX-N.ppm after the text
+ *   display --symbols FONT.vsym... [--size PX] [--card PATH] [--writeback WxH --out PREFIX]
  *           [--live | --input EVENTS]
  *                    the same on a display through KMS, as many cells as fit,
  *                    driven by a script, or live: keyboards, mice and touch
@@ -865,22 +866,37 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
 /* Surfaces that draw glyphs. */
 static bool glyphed(const char *surface) { return !strcmp(surface, "pixels") || !strcmp(surface, "display"); }
 
-/* The symbols a pixel surface draws with, read whole and kept. */
-static bool open_face(const char *path, float size) {
-    static VegaSymbols symbols;
-    FILE *f = fopen(path, "rb");
-    long length = f && !fseek(f, 0, SEEK_END) ? ftell(f) : -1;
-    unsigned char *bytes = length > 0 && !fseek(f, 0, SEEK_SET) ? malloc((size_t)length) : NULL;
-    bool ok = bytes && fread(bytes, 1, (size_t)length, f) == (size_t)length;
-    if (f) fclose(f);
-    char error[128] = "cannot read it";
-    ok = ok && vega_symbols_open(&symbols, bytes, (size_t)length, error, sizeof(error));
-    if (ok && !vega_face_open(&face, &symbols, size)) {
-        ok = false;
-        snprintf(error, sizeof(error), "no line and digit to lay a grid out with");
+/* The fonts a pixel surface draws with (--symbols, in order of
+ * preference), read whole and kept. */
+static const char *symbols_paths[VEGA_FACES];
+static unsigned symbols_count;
+static bool add_symbols(const char *path) {
+    if (symbols_count == VEGA_FACES) return false;
+    symbols_paths[symbols_count++] = path;
+    return true;
+}
+static bool open_face(float size) {
+    static VegaSymbols symbols[VEGA_FACES];
+    const VegaSymbols *opened[VEGA_FACES];
+    char error[160] = "cannot read it";
+    for (unsigned k = 0; k < symbols_count; ++k) {
+        const char *path = symbols_paths[k];
+        FILE *f = fopen(path, "rb");
+        long length = f && !fseek(f, 0, SEEK_END) ? ftell(f) : -1;
+        unsigned char *bytes = length > 0 && !fseek(f, 0, SEEK_SET) ? malloc((size_t)length) : NULL;
+        bool ok = bytes && fread(bytes, 1, (size_t)length, f) == (size_t)length;
+        if (f) fclose(f);
+        if (!ok || !vega_symbols_open(&symbols[k], bytes, (size_t)length, error, sizeof(error))) {
+            fprintf(stderr, "vega: %s: %s\n", path, error);
+            return false;
+        }
+        opened[k] = &symbols[k]; /* the bytes stay: the face reads them */
     }
-    if (!ok) fprintf(stderr, "vega: %s: %s\n", path, error);
-    return ok; /* the bytes stay: the face reads them */
+    if (!vega_face_open(&face, opened, symbols_count, size, error, sizeof(error))) {
+        fprintf(stderr, "vega: %s: %s\n", symbols_paths[0], error);
+        return false;
+    }
+    return true;
 }
 
 #ifdef VEGA_SURFACE
@@ -899,7 +915,7 @@ __attribute__((visibility("default"))) int pure_surface_run(const PureSurface *s
         fputs("vega: this surface was built for another Pure\n", stderr);
         return 2;
     }
-    const char *symbols_path = NULL, *card = "/dev/dri/card1", *recorded = NULL;
+    const char *card = "/dev/dri/card1", *recorded = NULL;
     unsigned width = 0, height = 0;
     float size = 16;
     bool on_display = argc > 1 && !strcmp(argv[1], "display"), pixels = argc > 1 && !strcmp(argv[1], "pixels");
@@ -911,7 +927,7 @@ __attribute__((visibility("default"))) int pure_surface_run(const PureSurface *s
             continue;
         }
         if (i + 1 >= argc) usage = true;
-        else if (!strcmp(argv[i], "--symbols")) symbols_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--symbols")) usage = !add_symbols(argv[i + 1]);
         else if (!strcmp(argv[i], "--size") && sscanf(argv[i + 1], "%f", &size) == 1) {}
         else if (!strcmp(argv[i], "--card") && on_display) card = argv[i + 1];
         else if (!strcmp(argv[i], "--input")) recorded = argv[i + 1];
@@ -922,15 +938,15 @@ __attribute__((visibility("default"))) int pure_surface_run(const PureSurface *s
             writeback = on_display;
         } else usage = true;
     }
-    if (usage || !symbols_path || (writeback && !frames_prefix) || (pixels && (!width || !frames_prefix)) ||
+    if (usage || !symbols_count || (writeback && !frames_prefix) || (pixels && (!width || !frames_prefix)) ||
         (live_input && recorded)) {
-        fputs("vega-surface.so display --symbols FONT.vsym [--size PX] [--card PATH] [--writeback WIDTHxHEIGHT --out PREFIX]\n"
+        fputs("vega-surface.so display --symbols FONT.vsym... [--size PX] [--card PATH] [--writeback WIDTHxHEIGHT --out PREFIX]\n"
               "                        [--live | --input EVENTS]\n"
-              "vega-surface.so pixels --symbols FONT.vsym [--size PX] --grid WIDTHxHEIGHT --out PREFIX [--input EVENTS]\n",
+              "vega-surface.so pixels --symbols FONT.vsym... [--size PX] --grid WIDTHxHEIGHT --out PREFIX [--input EVENTS]\n",
               stderr);
         return 2;
     }
-    if (!open_face(symbols_path, size)) return 2;
+    if (!open_face(size)) return 2;
     unsigned columns = width, rows = height, pixels_across = width * (unsigned)face.cell_width,
              pixels_down = height * (unsigned)face.cell_height;
     if (on_display) {
@@ -967,7 +983,7 @@ __attribute__((visibility("default"))) int pure_surface_run(const PureSurface *s
 #else
 int main(int argc, char **argv) {
     unsigned width = 0, height = 0, port = 8080;
-    const char *symbols_path = NULL, *card = "/dev/dri/card1";
+    const char *card = "/dev/dri/card1";
     float size = 16;
     bool writeback = false, live_input = false;
     const char *recorded = NULL;
@@ -1003,24 +1019,24 @@ int main(int argc, char **argv) {
             writeback = true;
         else if (!strcmp(argv[i], "--card") && !strcmp(argv[1], "display")) card = argv[i + 1];
         else if (!strcmp(argv[i], "--input") && !strcmp(argv[1], "display")) recorded = argv[i + 1];
-        else if (!strcmp(argv[i], "--symbols") && glyphed(argv[1])) symbols_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--symbols") && glyphed(argv[1])) usage = !add_symbols(argv[i + 1]);
         else if (!strcmp(argv[i], "--out") && glyphed(argv[1])) frames_prefix = argv[i + 1];
         else if (!strcmp(argv[i], "--size") && glyphed(argv[1]) && sscanf(argv[i + 1], "%f", &size) == 1) {}
         else usage = true;
     }
     bool pixels = argc > 1 && !strcmp(argv[1], "pixels"), on_display = argc > 1 && !strcmp(argv[1], "display");
     if (usage || (dumped && strcmp(argv[1], "tui") && !pixels) || (!strcmp(argv[1], "check") && argc != 3) ||
-        (pixels && (!dumped || !symbols_path || !frames_prefix)) || (on_display && (!symbols_path || (writeback && !frames_prefix)))) {
+        (pixels && (!dumped || !symbols_count || !frames_prefix)) || (on_display && (!symbols_count || (writeback && !frames_prefix)))) {
         fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
               "vega tui MODULE.pmod [--store PATH] [--watch] | --dump|--paint WIDTHxHEIGHT < script\n"
               "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
-              "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
-              "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym [--size PX] [--card PATH]\n"
+              "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
+              "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] [--card PATH]\n"
               "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [--access] [< script]\n"
               "vega check MODULE.pmod\n", stderr);
         return 2;
     }
-    if ((pixels || on_display) && !open_face(symbols_path, size)) return 2;
+    if ((pixels || on_display) && !open_face(size)) return 2;
     if (on_display) {
         char error[256];
         if (!(display = vega_display_open(card, writeback, writeback ? width : 0, writeback ? height : 0, error, sizeof(error)))) {

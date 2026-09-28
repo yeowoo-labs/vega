@@ -199,6 +199,7 @@ void vega_say(FILE *out, PureApp *app, const VegaScreen *screen, bool all) {
 /* ---- TUI ------------------------------------------------------------ */
 
 bool vega_grid(VegaGrid *grid, unsigned width, unsigned height) {
+    grid->span_count = grid->text_used = 0;
     size_t count = (size_t)width * height;
     VegaCell *cells = calloc(count ? count : 1, sizeof(*cells)), *shown = calloc(count ? count : 1, sizeof(*shown));
     struct VegaRow *rows = calloc(height ? height : 1, sizeof(*rows));
@@ -220,14 +221,73 @@ void vega_grid_free(VegaGrid *grid) {
     free(grid->cells);
     free(grid->shown);
     free(grid->rows);
+    free(grid->spans);
+    free(grid->text);
     *grid = (VegaGrid){0};
 }
 
-typedef struct { VegaGrid *grid; unsigned row, column, end; uint8_t tone; bool focus, strong; } Pen;
+/* Where text goes. reach is where the pen's last text stopped (written: it
+ * wrote some): text written there follows it. right sets its text flush
+ * with its end, when set as type. */
+typedef struct {
+    VegaGrid *grid;
+    unsigned row, column, end;
+    uint8_t tone;
+    bool focus, strong, written, right;
+    unsigned reach;
+} Pen;
+
+static Pen pen_at(VegaGrid *grid, unsigned row, unsigned column, unsigned end, uint8_t tone, bool focus, bool strong) {
+    return (Pen){grid, row, column, end, tone, focus, strong, false, false, 0};
+}
+
+/* The text as a span of the columns [pen's column, end), for a surface that
+ * sets type (the cells get it too; after them, stop() says where they
+ * reached). Out of memory, the span is lost: the cells still show it. */
+static void span(Pen *pen, const char *text, size_t length, unsigned end) {
+    VegaGrid *g = pen->grid;
+    if (!length || pen->column >= end) return;
+    if (g->span_count == g->spans_allocated) {
+        size_t n = g->spans_allocated ? 2 * g->spans_allocated : 64;
+        VegaSpan *grown = realloc(g->spans, n * sizeof(*grown));
+        if (!grown) return;
+        g->spans = grown;
+        g->spans_allocated = n;
+    }
+    if (g->text_used + length > g->text_allocated) {
+        size_t n = g->text_allocated ? g->text_allocated : 4096;
+        while (n < g->text_used + length) n *= 2;
+        char *grown = realloc(g->text, n);
+        if (!grown) return;
+        g->text = grown;
+        g->text_allocated = n;
+    }
+    memcpy(g->text + g->text_used, text, length);
+    g->spans[g->span_count++] = (VegaSpan){pen->row, pen->column, end, pen->column, (uint32_t)g->text_used,
+                                           (uint32_t)length, pen->tone, pen->focus, pen->strong,
+                                           pen->written && pen->reach == pen->column, pen->right};
+    g->text_used += length;
+}
+
+/* The pen's text was written: where its cells reached. */
+static void stop(Pen *pen, size_t spans) {
+    VegaGrid *g = pen->grid;
+    if (g->span_count > spans) g->spans[g->span_count - 1].reach = pen->column;
+    pen->written = true;
+    pen->reach = pen->column;
+}
 
 /* Write text from the pen's column up to its end; a wide character that
  * does not fit is left out, and a mark joins the character before it. */
+static void put_cells(Pen *pen, const char *text, size_t length);
 static void write_text(Pen *pen, const char *text, size_t length) {
+    size_t spans = pen->grid->span_count;
+    span(pen, text, length, pen->end);
+    put_cells(pen, text, length);
+    stop(pen, spans);
+}
+
+static void put_cells(Pen *pen, const char *text, size_t length) {
     VegaCell *line = pen->grid->cells + (size_t)pen->row * pen->grid->width;
     for (size_t at = 0; at < length;) {
         uint32_t codepoint;
@@ -261,16 +321,19 @@ static void fill(Pen *pen) {
 /* Text cut to width with an ellipsis. */
 static void write_fit(Pen *pen, const char *text, size_t length, unsigned width) {
     unsigned end = pen->end;
+    size_t spans = pen->grid->span_count;
     if (pen->column + width < end) pen->end = pen->column + width;
+    span(pen, text, length, pen->end);
     if (vega_text_width(text, length) > pen->end - pen->column && pen->end > pen->column) {
         --pen->end;
-        write_text(pen, text, length);
+        put_cells(pen, text, length);
         pen->end = end;
-        write_cstr(pen, "\xe2\x80\xa6");
+        put_cells(pen, "\xe2\x80\xa6", 3);
     } else {
-        write_text(pen, text, length);
+        put_cells(pen, text, length);
         pen->end = end;
     }
+    stop(pen, spans);
 }
 
 static const char *key_symbol(const char *key) {
@@ -294,8 +357,9 @@ static void draw_list(VegaGrid *grid, PureApp *app, const VegaPart *part, int in
         grid->rows[top + r] = (struct VegaRow){index, row};
         bool focused = row == focus;
         VegaTone tone = vega_tone(app, part, row);
-        Pen pen = {grid, top + r, 0, grid->width, (uint8_t)tone, focused, false};
+        Pen pen = pen_at(grid, top + r, 0, grid->width, (uint8_t)tone, focused, false);
         write_cstr(&pen, focused ? "> " : "  ");
+        pen.written = false; /* the label starts at its column, however wide the marker is set */
         char badge[VEGA_TEXT];
         size_t badge_length = 0;
         if (part->badge >= 0 && !vega_text(app, (uint32_t)part->badge, row, badge, &badge_length)) badge_length = 0;
@@ -314,8 +378,13 @@ static void draw_list(VegaGrid *grid, PureApp *app, const VegaPart *part, int in
         if (badge_length && grid->width >= badge_width) {
             /* The badge ends at the last column, two cells after the label at least. */
             unsigned start = grid->width - (badge_width - 2);
-            if (pen.column < start) fill(&(Pen){grid, pen.row, pen.column, start, pen.tone, focused, false});
+            if (pen.column < start) {
+                Pen gap = pen_at(grid, pen.row, pen.column, start, pen.tone, focused, false);
+                fill(&gap);
+            }
             pen.column = start > pen.column ? start : pen.column;
+            pen.written = false;
+            pen.right = true;
             write_fit(&pen, badge, badge_length, badge_width - 2);
         }
         fill(&pen);
@@ -344,7 +413,7 @@ static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, int i
         for (unsigned c = 0; c < part->column_count; ++c) if (widths[c] > share) widths[c] = share;
     }
     if (!height) return;
-    Pen head = {grid, top, 2, grid->width, VEGA_MUTED, false, true};
+    Pen head = pen_at(grid, top, 2, grid->width, VEGA_MUTED, false, true);
     for (unsigned c = 0; c < part->column_count; ++c) {
         const char *name = m->view_names[part->columns[c]];
         unsigned start = head.column;
@@ -355,13 +424,17 @@ static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, int i
         size_t row = first + r;
         bool focused = row == focus;
         grid->rows[top + 1 + r] = (struct VegaRow){index, row};
-        Pen pen = {grid, top + 1 + r, 0, grid->width, (uint8_t)vega_tone(app, part, row), focused, false};
+        Pen pen = pen_at(grid, top + 1 + r, 0, grid->width, (uint8_t)vega_tone(app, part, row), focused, false);
         write_cstr(&pen, focused ? "> " : "  ");
+        pen.written = false;
         for (unsigned c = 0; c < part->column_count; ++c) {
             unsigned start = pen.column, end = start + widths[c] + 2 < grid->width ? start + widths[c] + 2 : grid->width;
             if (vega_text(app, part->columns[c], row, text, &length)) write_fit(&pen, text, length, widths[c]);
             else write_cstr(&pen, "-");
-            if (pen.column < end) fill(&(Pen){grid, pen.row, pen.column, end, pen.tone, focused, false});
+            if (pen.column < end) {
+                Pen gap = pen_at(grid, pen.row, pen.column, end, pen.tone, focused, false);
+                fill(&gap);
+            }
             pen.column = end;
         }
         fill(&pen);
@@ -378,6 +451,7 @@ bool vega_hit(const VegaGrid *grid, unsigned line, unsigned *part, size_t *item)
 void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const char *prompt, size_t prompt_length,
                bool typing) {
     const PureModule *m = app->module;
+    grid->span_count = grid->text_used = 0;
     for (size_t i = 0; i < (size_t)grid->width * grid->height; ++i) grid->cells[i] = (VegaCell){' ', 0, 0, false, false};
     for (unsigned r = 0; r < grid->height; ++r) grid->rows[r].part = -1;
     grid->cursor_row = grid->cursor_column = -1;
@@ -386,7 +460,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
     size_t length;
     unsigned row = 0, bottom = grid->height - 1 - (screen->prompt >= 0 && grid->height > 1);
     if (screen->title >= 0 && row < bottom && vega_text(app, (uint32_t)screen->title, 0, text, &length)) {
-        Pen pen = {grid, row++, 0, grid->width, VEGA_NORMAL, false, true};
+        Pen pen = pen_at(grid, row++, 0, grid->width, VEGA_NORMAL, false, true);
         write_fit(&pen, text, length, grid->width);
     }
     unsigned groups = 0;
@@ -394,7 +468,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         const VegaPart *part = &screen->parts[i];
         if (part->kind != VEGA_FIELD) { ++groups; continue; }
         if (row >= bottom) continue;
-        Pen pen = {grid, row++, 0, grid->width, VEGA_MUTED, false, false};
+        Pen pen = pen_at(grid, row++, 0, grid->width, VEGA_MUTED, false, false);
         write_cstr(&pen, m->view_names[part->view]);
         write_cstr(&pen, "  ");
         pen.tone = VEGA_NORMAL;
@@ -411,7 +485,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         ++group;
         if (!share) continue;
         size_t rows = vega_rows(app, part), focus = vega_focus(app, part);
-        Pen head = {grid, row, 0, grid->width, VEGA_NORMAL, false, true};
+        Pen head = pen_at(grid, row, 0, grid->width, VEGA_NORMAL, false, true);
         write_cstr(&head, m->view_names[part->view]);
         char count[32];
         snprintf(count, sizeof(count), " (%zu)", rows);
@@ -426,7 +500,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         row += share;
     }
     /* Keys the app answers to, then the text being typed. */
-    Pen help = {grid, bottom, 0, grid->width, VEGA_MUTED, false, false};
+    Pen help = pen_at(grid, bottom, 0, grid->width, VEGA_MUTED, false, false);
     if (screen->prompt >= 0) write_cstr(&help, typing ? "Tab keys  " : "Tab type  ");
     for (uint32_t i = 0; i < m->inputs; ++i) {
         if (m->input[i].kind != PURE_KIND_KEY) continue;
@@ -439,7 +513,7 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
         write_cstr(&help, "  ");
     }
     if (screen->prompt >= 0 && grid->height > 1) {
-        Pen pen = {grid, grid->height - 1, 0, grid->width, typing ? VEGA_ACCENT : VEGA_MUTED, false, false};
+        Pen pen = pen_at(grid, grid->height - 1, 0, grid->width, typing ? VEGA_ACCENT : VEGA_MUTED, false, false);
         write_cstr(&pen, m->input_names[screen->prompt]);
         write_cstr(&pen, "> ");
         pen.tone = typing ? VEGA_NORMAL : VEGA_MUTED;

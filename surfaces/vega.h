@@ -1,5 +1,6 @@
 #ifndef VEGA_H
 #define VEGA_H
+#include "layout.h"
 #include "module.h"
 #include "symbols.h"
 #include <poll.h>
@@ -108,6 +109,18 @@ typedef struct {
     uint8_t tone;
     bool focus, strong;
 } VegaCell;
+/* What the layout wrote as text, for a surface that sets type rather than
+ * filling cells: a piece of UTF-8 given the columns [column, end) of a row,
+ * whose cells it filled up to reach. It follows the span before it when it
+ * goes on where that one's text stopped (the same line of text, in another
+ * tone perhaps): set as text, it starts where that one's ends, not at its
+ * column. right: flush with its end (a badge). */
+typedef struct {
+    unsigned row, column, end, reach;
+    uint32_t at, length; /* in the grid's text */
+    uint8_t tone;
+    bool focus, strong, follows, right;
+} VegaSpan;
 typedef struct {
     unsigned width, height;
     VegaCell *cells, *shown;
@@ -115,6 +128,10 @@ typedef struct {
     bool painted; /* shown holds what the terminal shows */
     size_t first[VEGA_PARTS];
     int cursor_row, cursor_column; /* where the terminal cursor goes, or -1 */
+    VegaSpan *spans;
+    size_t span_count, spans_allocated;
+    char *text;
+    size_t text_used, text_allocated;
 } VegaGrid;
 bool vega_grid(VegaGrid *, unsigned width, unsigned height);
 void vega_grid_free(VegaGrid *);
@@ -124,14 +141,38 @@ void vega_draw(VegaGrid *, PureApp *, const VegaScreen *, const char *prompt, si
 /* The part and item a line of the last drawn grid shows. */
 bool vega_hit(const VegaGrid *, unsigned line, unsigned *part, size_t *item);
 
-/* Pixels: the grid drawn with a font's glyphs (a symbol file, pixels per em).
- * A cell is as wide as a digit and as tall as the font's line; each glyph is
- * drawn once, the first time a cell shows it. */
+/* Pixels: the grid drawn in a typeface, fonts (symbol files) in order of
+ * preference at pixels per em. A cell is as wide as the first font's digit
+ * and as tall as its line; each glyph is drawn once, the first time it
+ * shows. When the first font shapes (its file has a shaping section), the
+ * pixels set type: each span the layout wrote is set as a line of text
+ * (text/layout.h: bidi, scripts, each grapheme cluster in the first of the
+ * fonts that shape and have it), from its column or from where the text it
+ * follows stopped, and cut with an ellipsis where it would pass its end or
+ * the next span's column; a text cursor after the typed text. Otherwise
+ * each cell's character is drawn in its cell, in the first font that has
+ * it. */
+enum { VEGA_FACES = 8 };
 typedef struct {
-    VegaGlyphs *glyphs;
+    unsigned count;
+    const VegaSymbols *symbols[VEGA_FACES]; /* kept by the caller while the face is open */
+    VegaGlyphs *glyphs[VEGA_FACES];
+    VegaShaping shaping[VEGA_FACES]; /* of the fonts that shape */
     int cell_width, cell_height, baseline;
+    float pixels;
+    /* Setting type: the fonts that shape (VegaFonts, each one of the
+     * faces'), and what setting works in. */
+    VegaFonts fonts;
+    unsigned font_face[VEGA_LAYOUT_FONTS];
+    VegaShaper *shaper;
+    VegaLayout layout;
+    void *work;
+    size_t work_size;
 } VegaFace;
-bool vega_face_open(VegaFace *, const VegaSymbols *, float pixels);
+/* Open count fonts as a face (it must not move while open: it points into
+ * itself); false with why. */
+bool vega_face_open(VegaFace *, const VegaSymbols *const *symbols, unsigned count, float pixels, char *error,
+                    size_t error_size);
 void vega_face_close(VegaFace *);
 /* The grid into out: 0xRRGGBB pixels, grid->width * cell_width across and
  * grid->height * cell_height down, stride pixels apart. */

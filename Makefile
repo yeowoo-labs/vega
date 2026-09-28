@@ -24,8 +24,13 @@ $(BUILD):
 $(LIBPURE): FORCE
 	$(MAKE) -C $(PURE) build/libpure.a
 
-$(BUILD)/vega: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(LIBPURE) | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c $(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
+# The pixel surfaces set type: the text modules come in (TYPE, below).
+TYPE = text/layout.c text/shape.c text/syllabic-data.c text/bidi.c text/linebreak.c text/grapheme.c text/unicode-data.c
+TYPE_HEADERS = text/layout.h text/shape.h text/text.h text/syllabic.h
+$(BUILD)/vega: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(TYPE) $(TYPE_HEADERS) \
+		$(LIBPURE) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(PURE)/core -I$(PURE)/serve -Isymbols -Itext $(SURFACES) symbols/symbols.c $(TYPE) \
+		$(LIBPURE) $(LDFLAGS) -lm $(LDLIBS) -o $@
 
 # The same host as a surface a Pure node maps (pure-serve --surface, Pure's
 # serve/surface.h): the node's display. It calls the app model pure-serve
@@ -34,10 +39,11 @@ $(BUILD)/vega: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c sym
 # when Pure's headers change: a node refuses a surface built for another
 # layout of its app and module.
 PURE_HEADERS = $(wildcard $(PURE)/core/*.h) $(PURE)/serve/surface.h
-$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(PURE_HEADERS) | $(BUILD)
+$(BUILD)/vega-surface.so: $(SURFACES) surfaces/vega.h surfaces/dbus.h symbols/symbols.c symbols/symbols.h $(TYPE) \
+		$(TYPE_HEADERS) $(PURE_HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -fPIC -shared -fvisibility=hidden -ffunction-sections \
-		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols $(SURFACES) symbols/symbols.c \
-		$(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@
+		-fdata-sections -DVEGA_SURFACE -I$(PURE)/core -I$(PURE)/serve -Isymbols -Itext $(SURFACES) symbols/symbols.c \
+		$(TYPE) $(LDFLAGS) -Wl,--gc-sections -lm $(LDLIBS) -o $@
 
 # Building symbol files reads fonts through FreeType, and compiles and checks
 # their shaping with HarfBuzz; reading them needs neither.
