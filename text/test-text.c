@@ -127,13 +127,88 @@ static size_t bidi_character_test(const char *path) {
     return cases;
 }
 
+/* NormalizationTest.txt (through bzcat): for each line c1;c2;c3;c4;c5,
+ * NFC(c1) = NFC(c2) = NFC(c3) = c2, NFC(c4) = NFC(c5) = c4, NFD(c1) =
+ * NFD(c2) = NFD(c3) = c3 and NFD(c4) = NFD(c5) = c5; and every code point
+ * part 1 does not list is its own NFC and NFD. */
+static size_t parse_codes(const char *text, uint32_t *codes) {
+    size_t n = 0;
+    for (char *end; *text && n < MAX; text = end) {
+        unsigned long code = strtoul(text, &end, 16);
+        if (end == text) break;
+        codes[n++] = (uint32_t)code;
+    }
+    return n;
+}
+
+static bool normalizes(size_t (*form)(const uint32_t *, size_t, uint32_t *), const uint32_t *in, size_t count,
+                       const uint32_t *want, size_t want_count) {
+    uint32_t out[4 * MAX];
+    size_t n = form(in, count, out);
+    return n == want_count && !memcmp(out, want, n * sizeof(*out));
+}
+
+static size_t normalization_test(const char *path, size_t *invariant) {
+    char command[1200];
+    snprintf(command, sizeof(command), "bzcat '%s'", path);
+    FILE *in = popen(command, "r");
+    if (!in) { perror(path); exit(2); }
+    static bool listed[0x110000];
+    char line[4096];
+    size_t cases = 0, number = 0;
+    int part = -1;
+    while (fgets(line, sizeof(line), in)) {
+        ++number;
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (!strncmp(line, "@Part", 5)) { part = atoi(line + 5); continue; }
+        uint32_t c[5][MAX];
+        size_t n[5];
+        char *field = line;
+        for (unsigned f = 0; f < 5; ++f) {
+            char *end = strchr(field, ';');
+            if (!end) break;
+            *end = 0;
+            n[f] = parse_codes(field, c[f]);
+            field = end + 1;
+        }
+        if (part == 1 && n[0] == 1) listed[c[0][0]] = true;
+        ++cases;
+        bool ok = true;
+        for (unsigned f = 0; f < 3; ++f) {
+            ok = ok && normalizes(vega_nfc, c[f], n[f], c[1], n[1]);
+            ok = ok && normalizes(vega_nfd, c[f], n[f], c[2], n[2]);
+        }
+        for (unsigned f = 3; f < 5; ++f) {
+            ok = ok && normalizes(vega_nfc, c[f], n[f], c[3], n[3]);
+            ok = ok && normalizes(vega_nfd, c[f], n[f], c[4], n[4]);
+        }
+        if (!ok) fail(path, number, "a form differs");
+    }
+    pclose(in);
+    *invariant = 0;
+    for (uint32_t code = 0; code < 0x110000; ++code) {
+        if (listed[code] || (code >= 0xD800 && code <= 0xDFFF)) continue;
+        ++*invariant;
+        if (!normalizes(vega_nfc, &code, 1, &code, 1) || !normalizes(vega_nfd, &code, 1, &code, 1)) {
+            char what[64];
+            snprintf(what, sizeof(what), "U+%04X is not its own normal form", code);
+            fail(path, 0, what);
+        }
+    }
+    return cases;
+}
+
 int main(int argc, char **argv) {
     const char *ucd = argc > 1 ? argv[1] : "/usr/share/unicode";
     char path[1024];
     snprintf(path, sizeof(path), "%s/BidiTest.txt", ucd);
     size_t bidi = bidi_test(path);
     snprintf(path, sizeof(path), "%s/BidiCharacterTest.txt", ucd);
-    size_t characters = bidi_character_test(path);
-    printf("{\"bidi_test_cases\":%zu,\"bidi_character_test_cases\":%zu,\"failures\":%u}\n", bidi, characters, failures);
+    size_t characters = bidi_character_test(path), invariant;
+    snprintf(path, sizeof(path), "%s/NormalizationTest.txt.bz2", ucd);
+    size_t normalized = normalization_test(path, &invariant);
+    printf("{\"bidi_test_cases\":%zu,\"bidi_character_test_cases\":%zu,\"normalization_test_cases\":%zu,"
+           "\"normalization_invariant_code_points\":%zu,\"failures\":%u}\n", bidi, characters, normalized, invariant,
+           failures);
     return failures ? 1 : 0;
 }

@@ -21,6 +21,17 @@ int vega_bracket(uint32_t code, uint32_t *pair);
 /* The character that mirrors code (Bidi_Mirroring_Glyph), or 0. */
 uint32_t vega_mirror(uint32_t code);
 
+/* Canonical_Combining_Class; a code point's full canonical decomposition
+ * (0 when it has none; Hangul syllables are left to vega_nfd); the primary
+ * composite of two code points, or 0. */
+uint8_t vega_combining_class(uint32_t code);
+size_t vega_decomposition(uint32_t code, const uint32_t **out);
+uint32_t vega_composition(uint32_t first, uint32_t second);
+/* Normalization forms D and C (UAX #15): out has room for 4 * count code
+ * points (the most one decomposes into); returns how many it holds. */
+size_t vega_nfd(const uint32_t *in, size_t count, uint32_t *out);
+size_t vega_nfc(const uint32_t *in, size_t count, uint32_t *out);
+
 /* The embedding levels of one paragraph by the Unicode Bidirectional
  * Algorithm (UAX #9, rules P2 to I2), then L1 as for one line: classes are
  * its characters' Bidi_Class; codes, when given, are the characters, so

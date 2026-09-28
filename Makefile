@@ -49,7 +49,7 @@ $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbo
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) symbols/symbols-tool.c $(SYMBOLS) $(LDFLAGS) \
 		$(FREETYPE_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
-TEXT = text/bidi.c text/unicode-data.c
+TEXT = text/bidi.c text/normalize.c text/unicode-data.c
 $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
 

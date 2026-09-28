@@ -74,9 +74,51 @@ def two_stage(name, values):
     return '\n'.join(out), len(stage1) * 2 + len(blocks) * 256
 
 
+def unicode_data():
+    """Each code point's UnicodeData.txt fields (ranges expanded)."""
+    rows, start = {}, None
+    for line in (UCD / 'UnicodeData.txt').read_text(encoding='utf-8').splitlines():
+        fields = line.split(';')
+        code = int(fields[0], 16)
+        if fields[1].endswith(', First>'):
+            start = code
+            continue
+        if fields[1].endswith(', Last>'):
+            for c in range(start, code + 1):
+                rows[c] = fields
+            continue
+        rows[code] = fields
+    return rows
+
+
+def normalization():
+    """Canonical combining classes, full canonical decompositions (Hangul
+    syllables aside: they are algorithmic) and the primary composites."""
+    rows = unicode_data()
+    ccc = [0] * (LAST + 1)
+    single = {}
+    for code, fields in rows.items():
+        ccc[code] = int(fields[3])
+        if fields[5] and not fields[5].startswith('<'):
+            single[code] = [int(x, 16) for x in fields[5].split()]
+
+    def full(code):
+        return [c for d in single[code] for c in (full(d) if d in single else [d])]
+
+    excluded = set()
+    for first, last, fields, missing in ranges('DerivedNormalizationProps.txt'):
+        if not missing and fields[0] == 'Full_Composition_Exclusion':
+            excluded.update(range(first, last + 1))
+    decompositions = {code: full(code) for code in single}
+    compositions = sorted((d[0], d[1], code) for code, d in single.items() if len(d) == 2 and code not in excluded)
+    return ccc, decompositions, compositions
+
+
 def main():
     bidi = derived('extracted/DerivedBidiClass.txt', BIDI, LONG)
     table, size = two_stage('bidi', bidi)
+    ccc, decompositions, compositions = normalization()
+    ccc_table, ccc_size = two_stage('ccc', ccc)
     brackets = []
     for first, _, fields, missing in ranges('BidiBrackets.txt'):
         if not missing:
@@ -127,6 +169,52 @@ int vega_bracket(uint32_t code, uint32_t *pair) {
 uint32_t vega_mirror(uint32_t code) {
     long row = find(&mirrors[0][0], sizeof(mirrors) / sizeof(*mirrors), 2, code);
     return row < 0 ? 0 : mirrors[row][1];
+}''')
+    print()
+    print(f'/* Canonical_Combining_Class ({ccc_size} bytes). */')
+    print(ccc_table)
+    print()
+    print('uint8_t vega_combining_class(uint32_t code) {')
+    print('    return code > 0x10FFFF ? 0 : ccc_values[ccc_blocks[code >> 8] * 256u + (code & 255)];')
+    print('}')
+    pool, rows = [], []
+    for code in sorted(decompositions):
+        rows.append((code, len(pool), len(decompositions[code])))
+        pool.extend(decompositions[code])
+    print()
+    print('/* Full canonical decompositions (Hangul syllables aside): code, start in the pool, length. */')
+    print(f'static const uint32_t decompositions[{len(rows)}][3] = {{')
+    for code, start, length in rows:
+        print(f'    {{0x{code:04X}, {start}, {length}}},')
+    print('};')
+    print(f'static const uint32_t decomposed[{len(pool)}] = {{')
+    for i in range(0, len(pool), 12):
+        print('    ' + ', '.join(f'0x{c:04X}' for c in pool[i:i + 12]) + ',')
+    print('};')
+    print()
+    print('size_t vega_decomposition(uint32_t code, const uint32_t **out) {')
+    print('    long row = find(&decompositions[0][0], sizeof(decompositions) / sizeof(*decompositions), 3, code);')
+    print('    if (row < 0) return 0;')
+    print('    *out = decomposed + decompositions[row][1];')
+    print('    return decompositions[row][2];')
+    print('}')
+    print()
+    print('/* The primary composites: first, second, composite, by first then second. */')
+    print(f'static const uint32_t compositions[{len(compositions)}][3] = {{')
+    for first, second, code in compositions:
+        print(f'    {{0x{first:04X}, 0x{second:04X}, 0x{code:04X}}},')
+    print('};')
+    print('''
+uint32_t vega_composition(uint32_t first, uint32_t second) {
+    size_t low = 0, high = sizeof(compositions) / sizeof(*compositions);
+    while (low < high) {
+        size_t middle = (low + high) / 2;
+        const uint32_t *row = compositions[middle];
+        if (row[0] < first || (row[0] == first && row[1] < second)) low = middle + 1;
+        else high = middle;
+    }
+    return low < sizeof(compositions) / sizeof(*compositions) && compositions[low][0] == first &&
+           compositions[low][1] == second ? compositions[low][2] : 0;
 }''')
 
 
