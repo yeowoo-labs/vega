@@ -8,6 +8,7 @@
  *   vega-symbols info OUT.vsym
  *   vega-symbols render OUT.vsym CODE PIXELS OUT.pgm
  *   vega-symbols gpu OUT.vsym --sizes 12,16,32,64 [--frames N] */
+#include "layout.h"
 #include "shape-build.h"
 #include "symbols-gl.h"
 #include "symbols.h"
@@ -1149,7 +1150,91 @@ static int shape_one(int argc, char **argv) {
     return 0;
 }
 
+/* UTF-8 (valid) to code points; how many. */
+static size_t decode_utf8(const char *text, uint32_t *out, size_t room) {
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p && n < room;) {
+        uint32_t c = *p;
+        int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        c &= more == 3 ? 0x07 : more == 2 ? 0x0F : more == 1 ? 0x1F : 0x7F;
+        for (++p; more-- > 0 && *p; ++p) c = c << 6 | (*p & 0x3F);
+        out[n++] = c;
+    }
+    return n;
+}
+
+/* Set text in lines at most width pixels wide and draw it: vega-symbols
+ * paragraph OUT.vsym PIXELS WIDTH OUT.pgm TEXT... (the texts are
+ * paragraphs, one after another). */
+static int paragraph(int argc, char **argv) {
+    if (argc < 7) fail("usage: vega-symbols paragraph OUT.vsym PIXELS WIDTH OUT.pgm TEXT...");
+    char *bytes, error[128];
+    VegaSymbols s = open_symbols(argv[2], &bytes);
+    VegaShaping shaping;
+    if (!s.shaping || !vega_shaping_open(&shaping, s.shaping, s.shaping_size, error, sizeof(error))) fail("no shaping");
+    double pixels = atof(argv[3]), per_unit = pixels / shaping.upem;
+    int width = atoi(argv[4]), margin = (int)pixels, line_height = (int)ceil((s.ascent - s.descent) * pixels / s.units);
+    int ascent = (int)ceil(s.ascent * pixels / s.units);
+    VegaShaper *shaper = vega_shaper_new();
+    VegaGlyphs *glyphs = vega_glyphs_open(&s, (float)(pixels / s.units));
+    VegaLayout layouts[16] = {0};
+    int paragraphs = argc - 6 < 16 ? argc - 6 : 16, height = 2 * margin;
+    for (int k = 0; k < paragraphs; ++k) {
+        uint32_t codes[4096];
+        size_t count = decode_utf8(argv[6 + k], codes, 4096);
+        if (!vega_layout(&layouts[k], shaper, &shaping, codes, count, VEGA_BIDI_AUTO, (int32_t)(width / per_unit)))
+            fail("cannot lay out");
+        height += (int)layouts[k].line_count * line_height + line_height / 2;
+    }
+    int total_width = width + 2 * margin;
+    unsigned char *image = malloc((size_t)total_width * (size_t)height);
+    memset(image, 255, (size_t)total_width * (size_t)height);
+    int top = margin;
+    for (int k = 0; k < paragraphs; ++k) {
+        const VegaLayout *l = &layouts[k];
+        for (size_t i = 0; i < l->line_count; ++i, top += line_height) {
+            const VegaLine *line = &l->lines[i];
+            int baseline = top + ascent;
+            for (size_t g = line->first; g < line->first + line->count; ++g) {
+                const VegaPlaced *placed = &l->glyphs[g];
+                const VegaBitmap *b = vega_glyph(glyphs, VEGA_GLYPH_SYMBOLS + placed->glyph);
+                if (!b) continue;
+                int pen_x = margin + (int)lround(placed->x * per_unit), pen_y = baseline - (int)lround(placed->y * per_unit);
+                for (int y = 0; y < b->place.height; ++y)
+                    for (int x = 0; x < b->place.width; ++x) {
+                        int px = pen_x + b->place.left + x, py = pen_y - b->place.top + y;
+                        if (px < 0 || py < 0 || px >= total_width || py >= height) continue;
+                        unsigned a = b->pixels[(size_t)y * (size_t)b->place.width + (size_t)x];
+                        unsigned char *out = &image[(size_t)py * (size_t)total_width + (size_t)px];
+                        *out = (unsigned char)(*out * (255 - a) / 255);
+                    }
+            }
+        }
+        top += line_height / 2;
+    }
+    FILE *f = fopen(argv[5], "wb");
+    if (!f) fail("cannot write the image");
+    fprintf(f, "P5\n%d %d\n255\n", total_width, height);
+    fwrite(image, 1, (size_t)total_width * (size_t)height, f);
+    fclose(f);
+    size_t lines = 0, glyph_count = 0;
+    for (int k = 0; k < paragraphs; ++k) {
+        lines += layouts[k].line_count;
+        glyph_count += layouts[k].glyph_count;
+        vega_layout_free(&layouts[k]);
+    }
+    printf("{\"paragraphs\":%d,\"lines\":%zu,\"glyphs\":%zu,\"width\":%d,\"height\":%d}\n", paragraphs, lines,
+           glyph_count, total_width, height);
+    free(image);
+    vega_glyphs_close(glyphs);
+    vega_shaper_free(shaper);
+    vega_shaping_close(&shaping);
+    free(bytes);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "paragraph")) return paragraph(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "shape")) return shape_one(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "build")) return build(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "shape-check")) return shape_check(argc, argv);

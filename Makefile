@@ -48,15 +48,20 @@ HARFBUZZ_LIBS ?= $(shell pkg-config --libs harfbuzz)
 # Drawing them on the GPU takes OpenGL ES 3.1 through EGL.
 GL_LIBS ?= $(shell pkg-config --libs egl glesv2)
 SYMBOLS = symbols/symbols.c symbols/symbols-gl.c
-SHAPE = text/shape.c text/unicode-data.c
+SHAPE = text/shape.c text/layout.c text/bidi.c text/linebreak.c text/unicode-data.c
 $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbols/symbols-gl.h $(SHAPE) text/shape-build.c \
-		text/shape.h text/shape-build.h text/text.h | $(BUILD)
+		text/shape.h text/shape-build.h text/layout.h text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) -Itext symbols/symbols-tool.c $(SYMBOLS) $(SHAPE) \
 		text/shape-build.c $(LDFLAGS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
 TEXT = text/bidi.c text/normalize.c text/linebreak.c text/grapheme.c text/word.c text/sentence.c text/unicode-data.c
 $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
+
+LAYOUT = text/layout.c text/shape.c text/bidi.c text/linebreak.c text/unicode-data.c
+$(BUILD)/test-layout: text/test-layout.c $(LAYOUT) text/layout.h text/shape.h text/text.h symbols/symbols.c \
+		symbols/symbols.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext -Isymbols text/test-layout.c $(LAYOUT) symbols/symbols.c $(LDFLAGS) -lm $(LDLIBS) -o $@
 
 # Unicode's conformance tests, where the UCD is installed (Debian: unicode-data);
 # and shaping, where DejaVu Sans is: the build refuses a file whose shaping
@@ -65,11 +70,11 @@ $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 UCD ?= /usr/share/unicode
 SHAPED_FONT ?= /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 SHAPED_CODES = 0x20-0x7e,0xa0-0x24f,0x300-0x36f,0x370-0x3ff,0x400-0x4ff,0x591-0x5f4,0x600-0x6ff,0x2000-0x206f
-check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text
+check: $(BUILD)/vega $(BUILD)/vega-symbols $(BUILD)/vega-surface.so $(BUILD)/test-text $(BUILD)/test-layout
 	if [ -f $(UCD)/BidiTest.txt ]; then $(BUILD)/test-text $(UCD); else echo "no UCD at $(UCD): text tests skipped"; fi
 	if [ -f $(SHAPED_FONT) ]; then $(BUILD)/vega-symbols build --font $(SHAPED_FONT) --codes $(SHAPED_CODES) \
-		--shape Latn,Grek,Cyrl,Hebr,Arab,Zyyy --runs 5000 -o $(BUILD)/shaped.vsym; \
-		else echo "no $(SHAPED_FONT): shaping tests skipped"; fi
+		--shape Latn,Grek,Cyrl,Hebr,Arab,Zyyy --runs 5000 -o $(BUILD)/shaped.vsym && \
+		$(BUILD)/test-layout $(BUILD)/shaped.vsym; else echo "no $(SHAPED_FONT): shaping tests skipped"; fi
 	$(MAKE) -C $(AUP) build/aup
 	$(MAKE) -C $(PURE) build/pure-serve
 	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve
