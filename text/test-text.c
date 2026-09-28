@@ -198,6 +198,83 @@ static size_t normalization_test(const char *path, size_t *invariant) {
     return cases;
 }
 
+/* LineBreakTest.txt (auxiliary/): code points with ÷ where a line may
+ * break and × where it may not, the ends included. */
+static size_t line_break_test(const char *path) {
+    FILE *in = fopen(path, "r");
+    if (!in) { perror(path); exit(2); }
+    static char line[65536]; /* the comments name every character */
+    size_t cases = 0, number = 0;
+    while (fgets(line, sizeof(line), in)) {
+        ++number;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        uint32_t codes[MAX];
+        uint8_t want[MAX + 1], got[MAX + 1];
+        size_t count = 0, marks = 0;
+        for (char *p = line; *p && count < MAX;) {
+            if (!strncmp(p, "\xC3\xB7", 2)) { want[marks++] = 1; p += 2; }        /* ÷ */
+            else if (!strncmp(p, "\xC3\x97", 2)) { want[marks++] = 0; p += 2; }   /* × */
+            else if ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'F')) codes[count++] = (uint32_t)strtoul(p, &p, 16);
+            else ++p;
+        }
+        if (!count) continue;
+        ++cases;
+        if (marks != count + 1) { fail(path, number, "a line not read"); continue; }
+        if (!vega_line_breaks(codes, count, got)) { fail(path, number, "no memory"); continue; }
+        for (size_t i = 0; i <= count; ++i)
+            if ((got[i] != VEGA_BREAK_NONE) != want[i]) {
+                char what[64];
+                snprintf(what, sizeof(what), "boundary %zu: %s", i, want[i] ? "a break missed" : "a break too many");
+                fail(path, number, what);
+                break;
+            }
+    }
+    fclose(in);
+    return cases;
+}
+
+/* GraphemeBreakTest.txt and WordBreakTest.txt: the same notation, for
+ * grapheme clusters and words. */
+static bool graphemes(const uint32_t *codes, size_t count, uint8_t *breaks) {
+    vega_graphemes(codes, count, breaks);
+    return true;
+}
+
+static size_t segment_test(const char *path, bool (*segment)(const uint32_t *, size_t, uint8_t *)) {
+    FILE *in = fopen(path, "r");
+    if (!in) { perror(path); exit(2); }
+    static char line[65536];
+    size_t cases = 0, number = 0;
+    while (fgets(line, sizeof(line), in)) {
+        ++number;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        uint32_t codes[MAX];
+        uint8_t want[MAX + 1], got[MAX + 1];
+        size_t count = 0, marks = 0;
+        for (char *p = line; *p && count < MAX;) {
+            if (!strncmp(p, "\xC3\xB7", 2)) { want[marks++] = 1; p += 2; }
+            else if (!strncmp(p, "\xC3\x97", 2)) { want[marks++] = 0; p += 2; }
+            else if ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'F')) codes[count++] = (uint32_t)strtoul(p, &p, 16);
+            else ++p;
+        }
+        if (!count) continue;
+        ++cases;
+        if (marks != count + 1) { fail(path, number, "a line not read"); continue; }
+        if (!segment(codes, count, got)) { fail(path, number, "no memory"); continue; }
+        for (size_t i = 0; i <= count; ++i)
+            if (got[i] != want[i]) {
+                char what[64];
+                snprintf(what, sizeof(what), "boundary %zu: %s", i, want[i] ? "a break missed" : "a break too many");
+                fail(path, number, what);
+                break;
+            }
+    }
+    fclose(in);
+    return cases;
+}
+
 int main(int argc, char **argv) {
     const char *ucd = argc > 1 ? argv[1] : "/usr/share/unicode";
     char path[1024];
@@ -207,8 +284,17 @@ int main(int argc, char **argv) {
     size_t characters = bidi_character_test(path), invariant;
     snprintf(path, sizeof(path), "%s/NormalizationTest.txt.bz2", ucd);
     size_t normalized = normalization_test(path, &invariant);
+    snprintf(path, sizeof(path), "%s/auxiliary/LineBreakTest.txt", ucd);
+    size_t line_breaks = line_break_test(path);
+    snprintf(path, sizeof(path), "%s/auxiliary/GraphemeBreakTest.txt", ucd);
+    size_t grapheme_cases = segment_test(path, graphemes);
+    snprintf(path, sizeof(path), "%s/auxiliary/WordBreakTest.txt", ucd);
+    size_t word_cases = segment_test(path, vega_words);
+    snprintf(path, sizeof(path), "%s/auxiliary/SentenceBreakTest.txt", ucd);
+    size_t sentence_cases = segment_test(path, vega_sentences);
     printf("{\"bidi_test_cases\":%zu,\"bidi_character_test_cases\":%zu,\"normalization_test_cases\":%zu,"
-           "\"normalization_invariant_code_points\":%zu,\"failures\":%u}\n", bidi, characters, normalized, invariant,
-           failures);
+           "\"normalization_invariant_code_points\":%zu,\"line_break_test_cases\":%zu,\"grapheme_test_cases\":%zu,"
+           "\"word_test_cases\":%zu,\"sentence_test_cases\":%zu,\"failures\":%u}\n", bidi, characters, normalized,
+           invariant, line_breaks, grapheme_cases, word_cases, sentence_cases, failures);
     return failures ? 1 : 0;
 }

@@ -54,7 +54,7 @@ $(BUILD)/vega-symbols: symbols/symbols-tool.c $(SYMBOLS) symbols/symbols.h symbo
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) -Itext symbols/symbols-tool.c $(SYMBOLS) $(SHAPE) \
 		text/shape-build.c $(LDFLAGS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) $(GL_LIBS) -lm $(LDLIBS) -o $@
 
-TEXT = text/bidi.c text/normalize.c text/unicode-data.c
+TEXT = text/bidi.c text/normalize.c text/linebreak.c text/grapheme.c text/word.c text/sentence.c text/unicode-data.c
 $(BUILD)/test-text: text/test-text.c $(TEXT) text/text.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Itext text/test-text.c $(TEXT) $(LDFLAGS) $(LDLIBS) -o $@
 

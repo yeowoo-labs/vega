@@ -115,6 +115,18 @@ def normalization():
 
 
 JOINING = ['U', 'D', 'R', 'L', 'C', 'T']
+LINE = ['BK', 'CR', 'LF', 'NL', 'SP', 'ZW', 'ZWJ', 'CM', 'WJ', 'GL', 'BA', 'BB', 'B2', 'HY', 'CB', 'CL', 'CP', 'EX', 'IN',
+        'NS', 'OP', 'QU', 'IS', 'NU', 'PO', 'PR', 'SY', 'AI', 'AK', 'AL', 'AP', 'AS', 'CJ', 'EB', 'EM', 'H2', 'H3', 'HL',
+        'ID', 'JL', 'JV', 'JT', 'RI', 'SA', 'SG', 'VF', 'VI', 'XX']
+WIDTHS = ['A', 'F', 'H', 'N', 'Na', 'W']
+GRAPHEME = ['Other', 'CR', 'LF', 'Control', 'Extend', 'ZWJ', 'Regional_Indicator', 'Prepend', 'SpacingMark', 'L', 'V', 'T',
+            'LV', 'LVT']
+CONJUNCT = ['None', 'Linker', 'Consonant', 'Extend']
+WORD = ['Other', 'CR', 'LF', 'Newline', 'Extend', 'ZWJ', 'Regional_Indicator', 'Format', 'Katakana', 'Hebrew_Letter',
+        'ALetter', 'Single_Quote', 'Double_Quote', 'MidNumLet', 'MidLetter', 'MidNum', 'Numeric', 'ExtendNumLet',
+        'WSegSpace']
+SENTENCE = ['Other', 'CR', 'LF', 'Extend', 'Sep', 'Format', 'Sp', 'Lower', 'Upper', 'OLetter', 'Numeric', 'ATerm',
+            'SContinue', 'STerm', 'Close']
 CATEGORIES = ['Cn', 'Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Mn', 'Mc', 'Me', 'Nd', 'Nl', 'No', 'Pc', 'Pd', 'Ps', 'Pe', 'Pi', 'Pf',
               'Po', 'Sm', 'Sc', 'Sk', 'So', 'Zs', 'Zl', 'Zp', 'Cc', 'Cf', 'Cs', 'Co']
 
@@ -132,6 +144,17 @@ def scripts():
     return values, names
 
 
+def aliases(prop):
+    """A property's long value names to its short ones (PropertyValueAliases.txt)."""
+    out = {}
+    for line in (UCD / 'PropertyValueAliases.txt').read_text(encoding='utf-8').splitlines():
+        fields = [f.strip() for f in line.split('#', 1)[0].split(';')]
+        if len(fields) >= 3 and fields[0] == prop:
+            for name in fields[2:]:
+                out[name] = fields[1]
+    return out
+
+
 def script_codes(names):
     """Each script's ISO 15924 code (Latn for Latin), in the order of names."""
     codes = {}
@@ -146,6 +169,17 @@ def main():
     bidi = derived('extracted/DerivedBidiClass.txt', BIDI, LONG)
     joining = derived('extracted/DerivedJoiningType.txt', JOINING, {'Non_Joining': 'U'})
     category = derived('extracted/DerivedGeneralCategory.txt', CATEGORIES)
+    line = derived('extracted/DerivedLineBreak.txt', LINE, aliases('lb'))
+    width = derived('extracted/DerivedEastAsianWidth.txt', WIDTHS, aliases('ea'))
+    brackets_ea = [c for c in range(LAST + 1) if LINE[line[c]] in ('OP', 'CP') and WIDTHS[width[c]] in ('F', 'W', 'H')]
+    grapheme = derived('auxiliary/GraphemeBreakProperty.txt', GRAPHEME)
+    conjunct = [0] * (LAST + 1)
+    for first, last, fields, missing in ranges('DerivedCoreProperties.txt'):
+        if not missing and fields[0] == 'InCB':
+            conjunct[first:last + 1] = [CONJUNCT.index(fields[1])] * (last - first + 1)
+    grapheme = [g | c << 4 for g, c in zip(grapheme, conjunct)]
+    word = derived('auxiliary/WordBreakProperty.txt', WORD)
+    sentence = derived('auxiliary/SentenceBreakProperty.txt', SENTENCE)
     script, script_names = scripts()
     for index, name in ((0, 'Unknown'), (1, 'Common'), (2, 'Inherited'), (3, 'Latin'), (4, 'Greek'), (5, 'Cyrillic'),
                         (7, 'Hebrew'), (8, 'Arabic'), (26, 'Hangul')):
@@ -209,6 +243,10 @@ uint32_t vega_mirror(uint32_t code) {
     print(ccc_table)
     print()
     for name, values, kind, fallback in (('joining', joining, 'VegaJoining', 'VEGA_JOINING_U'),
+                                         ('line_break', line, 'VegaLineBreak', 'VEGA_LB_XX'),
+                                         ('grapheme', grapheme, 'uint8_t', '0'),
+                                         ('word', word, 'uint8_t', '0'),
+                                         ('sentence', sentence, 'uint8_t', '0'),
                                          ('category', category, 'VegaCategory', 'VEGA_CN'),
                                          ('script', script, 'VegaScript', 'VEGA_SCRIPT_UNKNOWN')):
         table, size = two_stage(name, values)
@@ -239,6 +277,22 @@ uint32_t vega_mirror(uint32_t code) {
     print('uint32_t vega_script_code(VegaScript script) {')
     print(f'    return script_codes[(unsigned)script < {len(codes)} ? script : 0];')
     print('}')
+    print()
+    print('/* Opening and closing punctuation (OP, CP) of East_Asian_Width F, W or H. */')
+    print(f'static const uint32_t east_asian_brackets[{len(brackets_ea)}] = {{')
+    for i in range(0, len(brackets_ea), 10):
+        print('    ' + ', '.join(f'0x{c:04X}' for c in brackets_ea[i:i + 10]) + ',')
+    print('};')
+    print('''
+bool vega_east_asian_bracket(uint32_t code) {
+    size_t low = 0, high = sizeof(east_asian_brackets) / sizeof(*east_asian_brackets);
+    while (low < high) {
+        size_t middle = (low + high) / 2;
+        if (east_asian_brackets[middle] < code) low = middle + 1;
+        else high = middle;
+    }
+    return low < sizeof(east_asian_brackets) / sizeof(*east_asian_brackets) && east_asian_brackets[low] == code;
+}''')
     pictographic = [(first, last) for first, last, fields, missing in ranges('emoji/emoji-data.txt')
                     if not missing and fields[0] == 'Extended_Pictographic']
     print()

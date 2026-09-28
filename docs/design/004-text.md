@@ -51,6 +51,25 @@ U+3008·3009의 정준 동치, 바뀐 괄호 뒤의 결합 부호), 중립(N1–
 `NormalizationTest.txt`의 19,074줄(줄마다 NFC와 NFD 16가지 대조)과, 그 1부에 없는 코드 포인트 1,095,035개가 제 자신의
 NFC이자 NFD라는 것을 모두 지킨다. 적합성 시험 셋을 합쳐 Pi 5에서 0.9초다.
 
+## 줄 바꿈과 분절
+
+글줄을 채우려면 어디서 줄을 바꿀 수 있는지(UAX #14)가 필요하다. 커서와 선택, 읽어 주기에는 자소 묶음, 낱말, 문장의
+경계(UAX #29)가 필요하다. 모두 성질 표(Line_Break, Grapheme_Cluster_Break와 Indic_Conjunct_Break, Word_Break,
+Sentence_Break, 동아시아 폭이 F·W·H인 여는·닫는 괄호)와 규칙을 순서대로 적용하는 코드다. 각 경계는 규칙 가운데 그것을 처음으로
+정하는 것이 정한다.
+
+- [text/linebreak.c](../../text/linebreak.c): LB1–LB31. 결합 부호를 앞 글자에 붙이고(LB9), 공백을 건너 뒤를 보는
+  규칙(LB8, LB14, LB15a, LB16, LB17), 숫자 규칙(LB25는 유니코드의 시험처럼 8.2절 예 7로 맞춘 것), 브라흐미 계열
+  음절(LB28a), 지역 표시 짝(LB30a)을 한 번 앞에서 뒤로 훑어 만든 배열로 본다.
+- [text/grapheme.c](../../text/grapheme.c): GB1–GB999. 인도계 결합 자음(GB9c), 이모지 ZWJ 열(GB11), 지역 표시 짝(GB12–13)은
+  훑으며 상태 셋으로 본다.
+- [text/word.c](../../text/word.c): WB1–WB999. 확장·서식·ZWJ를 앞 글자에 접고(WB4), 앞뒤로 한 단위씩 더 본다.
+- [text/sentence.c](../../text/sentence.c): SB1–SB998. 문장 끝 뒤의 닫는 부호와 공백은 훑으며 기억하고, SB8의 앞보기는
+  뒤에서 앞으로 한 번 훑어 위치마다 미리 구한다. 모두 선형 시간이다.
+
+유니코드 15.1의 적합성 시험을 모두 통과한다. `LineBreakTest.txt` 10,274 경우, `GraphemeBreakTest.txt` 1,187 경우,
+`WordBreakTest.txt` 1,826 경우, `SentenceBreakTest.txt` 512 경우에서 틀린 경계가 하나도 없다.
+
 ## 셰이핑
 
 처음 계획은 HarfBuzz가 표본 문자열(글자 쌍, 부호 하나 붙은 글자, 위치별 형태)을 셰이핑한 결과를 표로 뽑는 것이었다. 글꼴을

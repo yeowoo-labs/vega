@@ -49,6 +49,50 @@ static inline bool vega_mark(uint32_t code) {
     return c == VEGA_MN || c == VEGA_MC || c == VEGA_ME;
 }
 
+/* Line_Break (UAX #14), in the order of text/unicode.py. */
+typedef enum {
+    VEGA_LB_BK, VEGA_LB_CR, VEGA_LB_LF, VEGA_LB_NL, VEGA_LB_SP, VEGA_LB_ZW, VEGA_LB_ZWJ, VEGA_LB_CM, VEGA_LB_WJ,
+    VEGA_LB_GL, VEGA_LB_BA, VEGA_LB_BB, VEGA_LB_B2, VEGA_LB_HY, VEGA_LB_CB, VEGA_LB_CL, VEGA_LB_CP, VEGA_LB_EX,
+    VEGA_LB_IN, VEGA_LB_NS, VEGA_LB_OP, VEGA_LB_QU, VEGA_LB_IS, VEGA_LB_NU, VEGA_LB_PO, VEGA_LB_PR, VEGA_LB_SY,
+    VEGA_LB_AI, VEGA_LB_AK, VEGA_LB_AL, VEGA_LB_AP, VEGA_LB_AS, VEGA_LB_CJ, VEGA_LB_EB, VEGA_LB_EM, VEGA_LB_H2,
+    VEGA_LB_H3, VEGA_LB_HL, VEGA_LB_ID, VEGA_LB_JL, VEGA_LB_JV, VEGA_LB_JT, VEGA_LB_RI, VEGA_LB_SA, VEGA_LB_SG,
+    VEGA_LB_VF, VEGA_LB_VI, VEGA_LB_XX, VEGA_LB_CLASSES
+} VegaLineBreak;
+VegaLineBreak vega_line_break(uint32_t code);
+/* Opening or closing punctuation that is East Asian (Fullwidth, Wide or
+ * Halfwidth): what rule LB30 leaves out. */
+bool vega_east_asian_bracket(uint32_t code);
+/* Where a line may break (UAX #14, with the number tailoring of its
+ * Example 7, as Unicode's tests do): breaks[i] is the boundary before
+ * codes[i], i from 0 to count (breaks has count + 1 room). */
+enum { VEGA_BREAK_NONE, VEGA_BREAK_ALLOWED, VEGA_BREAK_MANDATORY };
+bool vega_line_breaks(const uint32_t *codes, size_t count, uint8_t *breaks);
+
+/* Grapheme_Cluster_Break in the low four bits (in the order of
+ * text/unicode.py), Indic_Conjunct_Break in the high four; and where
+ * grapheme clusters begin (UAX #29): breaks[i] is 1 before codes[i], i
+ * from 0 to count. */
+enum { VEGA_GCB_OTHER, VEGA_GCB_CR, VEGA_GCB_LF, VEGA_GCB_CONTROL, VEGA_GCB_EXTEND, VEGA_GCB_ZWJ, VEGA_GCB_RI,
+       VEGA_GCB_PREPEND, VEGA_GCB_SPACING_MARK, VEGA_GCB_L, VEGA_GCB_V, VEGA_GCB_T, VEGA_GCB_LV, VEGA_GCB_LVT };
+enum { VEGA_INCB_NONE, VEGA_INCB_LINKER, VEGA_INCB_CONSONANT, VEGA_INCB_EXTEND };
+uint8_t vega_grapheme(uint32_t code);
+void vega_graphemes(const uint32_t *codes, size_t count, uint8_t *breaks);
+
+/* Word_Break (in the order of text/unicode.py), and where words begin and
+ * end (UAX #29): breaks[i] is 1 before codes[i], i from 0 to count. */
+enum { VEGA_WB_OTHER, VEGA_WB_CR, VEGA_WB_LF, VEGA_WB_NEWLINE, VEGA_WB_EXTEND, VEGA_WB_ZWJ, VEGA_WB_RI, VEGA_WB_FORMAT,
+       VEGA_WB_KATAKANA, VEGA_WB_HEBREW_LETTER, VEGA_WB_ALETTER, VEGA_WB_SINGLE_QUOTE, VEGA_WB_DOUBLE_QUOTE,
+       VEGA_WB_MIDNUMLET, VEGA_WB_MIDLETTER, VEGA_WB_MIDNUM, VEGA_WB_NUMERIC, VEGA_WB_EXTENDNUMLET, VEGA_WB_WSEGSPACE };
+uint8_t vega_word(uint32_t code);
+bool vega_words(const uint32_t *codes, size_t count, uint8_t *breaks);
+
+/* Sentence_Break (in the order of text/unicode.py), and where sentences
+ * begin (UAX #29): breaks[i] is 1 before codes[i], i from 0 to count. */
+enum { VEGA_SB_OTHER, VEGA_SB_CR, VEGA_SB_LF, VEGA_SB_EXTEND, VEGA_SB_SEP, VEGA_SB_FORMAT, VEGA_SB_SP, VEGA_SB_LOWER,
+       VEGA_SB_UPPER, VEGA_SB_OLETTER, VEGA_SB_NUMERIC, VEGA_SB_ATERM, VEGA_SB_SCONTINUE, VEGA_SB_STERM, VEGA_SB_CLOSE };
+uint8_t vega_sentence(uint32_t code);
+bool vega_sentences(const uint32_t *codes, size_t count, uint8_t *breaks);
+
 /* Canonical_Combining_Class; a code point's full canonical decomposition
  * (0 when it has none; Hangul syllables are left to vega_nfd); the primary
  * composite of two code points, or 0. */
