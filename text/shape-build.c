@@ -331,13 +331,12 @@ static int categorize(uint32_t script, hb_tag_t gsub_script) {
     if (script == TAG("Arab")) return VEGA_SHAPER_ARABIC;
     if (script == TAG("Hebr")) return VEGA_SHAPER_HEBREW;
     if (script == TAG("Hang")) return VEGA_SHAPER_HANGUL;
-    if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Khmr") ||
-        script == TAG("Qaag"))
-        return -1;
+    if (script == TAG("Khmr")) return VEGA_SHAPER_KHMER;
+    if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Qaag")) return -1;
     if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script))
         return dflt ? VEGA_SHAPER_DEFAULT : (gsub_script & 0xFF) == '3' ? -1 : VEGA_SHAPER_INDIC;
     if (listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script)) return dflt ? VEGA_SHAPER_DEFAULT : -1;
-    if (script == TAG("Mymr")) return dflt || gsub_script == TAG("mymr") ? VEGA_SHAPER_DEFAULT : -1;
+    if (script == TAG("Mymr")) return dflt || gsub_script == TAG("mymr") ? VEGA_SHAPER_DEFAULT : VEGA_SHAPER_MYANMAR;
     return VEGA_SHAPER_DEFAULT;
 }
 
@@ -515,6 +514,37 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         add_gsub_pause(m, VEGA_PAUSE_FINAL_REORDERING);
         for (int i = 11; i < 17; ++i) add_feature(m, TAG(indic_features[i].tag), indic_features[i].flags, 1);
     }
+    /* hb-ot-shaper-khmer.cc: syllables and their reordering before any
+     * lookup; the basic features together, within syllables; the rest. */
+    static const char *const khmer_basic[] = {"pref", "blwf", "abvf", "pstf", "cfar"};
+    static const char *const khmer_other[] = {"pres", "abvs", "blws", "psts"};
+    if (shaper == VEGA_SHAPER_KHMER) {
+        m->is_simple = false;
+        add_gsub_pause(m, VEGA_PAUSE_SYLLABLES);
+        add_gsub_pause(m, VEGA_PAUSE_INITIAL_REORDERING);
+        enable_feature(m, TAG("locl"), F_PER_SYLLABLE, 1);
+        enable_feature(m, TAG("ccmp"), F_PER_SYLLABLE, 1);
+        for (int i = 0; i < 5; ++i) add_feature(m, TAG(khmer_basic[i]), F_MANUAL_ZWNJ | F_MANUAL_ZWJ | F_PER_SYLLABLE, 1);
+        add_gsub_pause(m, VEGA_PAUSE_CLEAR_SYLLABLES);
+        for (int i = 0; i < 4; ++i) add_feature(m, TAG(khmer_other[i]), F_GLOBAL | F_MANUAL_ZWNJ | F_MANUAL_ZWJ, 1);
+    }
+    /* hb-ot-shaper-myanmar.cc: syllables; locl and ccmp; the reordering;
+     * the basic features one stage each; the rest. */
+    static const char *const myanmar_basic[] = {"rphf", "pref", "blwf", "pstf"};
+    static const char *const myanmar_other[] = {"pres", "abvs", "blws", "psts"};
+    if (shaper == VEGA_SHAPER_MYANMAR) {
+        m->is_simple = false;
+        add_gsub_pause(m, VEGA_PAUSE_SYLLABLES);
+        enable_feature(m, TAG("locl"), F_PER_SYLLABLE, 1);
+        enable_feature(m, TAG("ccmp"), F_PER_SYLLABLE, 1);
+        add_gsub_pause(m, VEGA_PAUSE_INITIAL_REORDERING);
+        for (int i = 0; i < 4; ++i) {
+            enable_feature(m, TAG(myanmar_basic[i]), F_MANUAL_ZWJ | F_PER_SYLLABLE, 1);
+            add_gsub_pause(m, 0);
+        }
+        add_gsub_pause(m, VEGA_PAUSE_CLEAR_SYLLABLES);
+        for (int i = 0; i < 4; ++i) enable_feature(m, TAG(myanmar_other[i]), F_MANUAL_ZWJ, 1);
+    }
     if (shaper == VEGA_SHAPER_HANGUL) {
         m->is_simple = false;
         add_feature(m, TAG("ljmo"), F_NONE, 1);
@@ -535,6 +565,11 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         add_feature(m, TAG("liga"), F_GLOBAL, 0);
         add_gsub_pause(m, VEGA_PAUSE_CLEAR_SYLLABLES);
     }
+    /* Khmer asks for clig, and turns liga off. */
+    if (shaper == VEGA_SHAPER_KHMER) {
+        enable_feature(m, TAG("clig"), F_NONE, 1);
+        add_feature(m, TAG("liga"), F_GLOBAL, 0);
+    }
     if (!compile_map(m)) FAIL("out of memory, or more than %d stages", MAX_STAGES);
 
     /* hb_ot_shape_planner_t::compile */
@@ -545,9 +580,10 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     bool apply_kern = (!has_gpos_kern || !apply_gpos) && kern_table.data;
     if (apply_kern && (kern_table.other || kern_table.cross))
         FAIL("%s: the font's kern table has more than pairs (state machines, classes, cross-stream kerning)", name);
-    /* Hangul's and Indic's shapers neither zero marks nor place them
-     * without GPOS. */
-    bool script_marks = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC;
+    /* Hangul's, Indic's and Khmer's shapers zero no marks (Myanmar's does,
+     * before GPOS); none of these places marks without GPOS. */
+    bool zeroes = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC && shaper != VEGA_SHAPER_KHMER;
+    bool script_marks = zeroes && shaper != VEGA_SHAPER_MYANMAR;
     bool adjust = !apply_gpos && (!apply_kern || !kern_table.cross), fallback_marks = adjust && script_marks;
     if (shaper == VEGA_SHAPER_ARABIC) {
         if (one_mask(m, "stch")) FAIL("%s: the font stretches (stch)", name);
@@ -563,7 +599,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     uint32_t frac = one_mask(m, "frac"), numr = one_mask(m, "numr"), dnom = one_mask(m, "dnom");
     *plan = (Plan){script_tag, direction, native == HB_DIRECTION_LTR ? VEGA_SHAPE_LTR : native == HB_DIRECTION_RTL ? VEGA_SHAPE_RTL : 0,
                    shaper,
-                   (apply_gpos ? VEGA_PLAN_GPOS : 0) | (script_marks ? VEGA_PLAN_ZERO_MARKS : 0) |
+                   (apply_gpos ? VEGA_PLAN_GPOS : 0) | (zeroes ? VEGA_PLAN_ZERO_MARKS : 0) |
                        (hb_ot_layout_has_glyph_classes(face) ? 0 : VEGA_PLAN_GUESS_CLASSES) |
                        (one_mask(m, "mark") ? VEGA_PLAN_GPOS_MARK : 0) | (frac || (numr && dnom) ? VEGA_PLAN_FRACTIONS : 0) |
                        (apply_kern ? VEGA_PLAN_KERN : 0) | (fallback_marks ? VEGA_PLAN_FALLBACK_MARKS : 0) |
@@ -589,6 +625,8 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
         for (int i = 0; i < VEGA_PLAN_STAGES; ++i) plan->stages[i] = stage_of(m, staged[i]);
         if ((m->chosen_script[0] & 0xFF) != '2') plan->shaper_flags |= VEGA_INDIC_OLD_SPEC;
     }
+    if (shaper == VEGA_SHAPER_KHMER)
+        for (int i = 0; i < 5; ++i) plan->masks[VEGA_MASK_KHMER_PREF + i] = one_mask(m, khmer_basic[i]);
     free(m);
     return true;
 fail:
@@ -937,7 +975,8 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
      * punctuation), and those whose glyphs some substitution starts from. */
     Pool letters = {0}, marks = {0}, others = {0}, hot = {0}, jamo_pools[3] = {{0}}, indic[INDIC_POOLS] = {{0}};
     bool hangul = script == HB_TAG('H', 'a', 'n', 'g');
-    bool syllabic = listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script);
+    bool syllabic = listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script) ||
+                    script == HB_TAG('K', 'h', 'm', 'r') || script == HB_TAG('M', 'y', 'm', 'r');
     hb_set_t *inputs = hb_set_create();
     uint32_t common = HB_TAG('Z', 'y', 'y', 'y'), inherited = HB_TAG('Z', 'i', 'n', 'h');
     for (unsigned t = 0; t < s->lookup_count[0]; ++t)
@@ -958,8 +997,11 @@ void vega_shaping_check(hb_font_t *font, const VegaShaping *s, uint32_t script, 
             case VEGA_OT_RA: pool = INDIC_RA; break;
             case VEGA_OT_H: pool = INDIC_HALANTS; break;
             case VEGA_OT_N: pool = INDIC_NUKTAS; break;
-            case VEGA_OT_M: case VEGA_OT_MPST: pool = INDIC_MATRAS; break;
-            case VEGA_OT_SM: case VEGA_OT_A: pool = INDIC_MODIFIERS; break;
+            case VEGA_OT_M: case VEGA_OT_MPST: case VEGA_OT_VABV: case VEGA_OT_VBLW: case VEGA_OT_VPRE:
+            case VEGA_OT_VPST: pool = INDIC_MATRAS; break;
+            case VEGA_OT_SM: case VEGA_OT_A: case VEGA_OT_SMPST: case VEGA_OT_ROBATIC: case VEGA_OT_XGROUP:
+            case VEGA_OT_YGROUP: case VEGA_OT_AS: case VEGA_OT_MH: case VEGA_OT_MR: case VEGA_OT_MW: case VEGA_OT_MY:
+            case VEGA_OT_ML: case VEGA_OT_PT: case VEGA_OT_VS: pool = INDIC_MODIFIERS; break;
             case VEGA_OT_V: pool = INDIC_VOWELS; break;
             }
             if (pool >= 0) pool_add(&indic[pool], code);

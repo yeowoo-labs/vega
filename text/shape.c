@@ -227,7 +227,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
         uint32_t ranges[2][2] = {{le32(p + 80), le32(p + 84)}, {le32(p + 88), le32(p + 92)}};
-        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_INDIC)
+        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_MYANMAR)
             REFUSE("plan %u", i);
         if ((p[7] & VEGA_PLAN_FALLBACK_MARKS) && !s->extents) REFUSE("plan %u: marks placed without extents", i);
         for (int table = 0; table < 2; ++table) {
@@ -823,6 +823,7 @@ static bool compose(const Normalizer *c, uint32_t a, uint32_t b, uint32_t *ab) {
     switch (c->plan->shaper) {
     case VEGA_SHAPER_HEBREW: return compose_hebrew(c, a, b, ab);
     case VEGA_SHAPER_INDIC: return compose_indic(a, b, ab);
+    case VEGA_SHAPER_KHMER: return !is_mark_category(vega_category(a)) && compose_unicode(a, b, ab);
     default: return compose_unicode(a, b, ab);
     }
 }
@@ -845,6 +846,13 @@ static void next_char(VegaShaper *b, uint32_t glyph) {
 static bool decompose_char(const Normalizer *c, uint32_t ab, uint32_t *a, uint32_t *b) {
     if (c->plan->shaper == VEGA_SHAPER_INDIC && (ab == 0x0931 || ab == 0x09DC || ab == 0x09DD || ab == 0x0B94))
         return false;
+    /* Khmer's split matras, which Unicode does not decompose */
+    if (c->plan->shaper == VEGA_SHAPER_KHMER &&
+        (ab == 0x17BE || ab == 0x17BF || ab == 0x17C0 || ab == 0x17C4 || ab == 0x17C5)) {
+        *a = 0x17C1;
+        *b = ab;
+        return true;
+    }
     return decompose_unicode(ab, a, b);
 }
 
@@ -1026,7 +1034,9 @@ static void normalize(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
      * none: what the font has stays, and nothing is composed again;
      * Indic's decomposes what decomposes even when the font has it whole. */
     const bool none = plan->shaper == VEGA_SHAPER_HANGUL;
-    const bool always_short_circuit = none, might_short_circuit = none || plan->shaper != VEGA_SHAPER_INDIC;
+    const bool syllabic = plan->shaper == VEGA_SHAPER_INDIC || plan->shaper == VEGA_SHAPER_KHMER ||
+                          plan->shaper == VEGA_SHAPER_MYANMAR;
+    const bool always_short_circuit = none, might_short_circuit = none || !syllabic;
     bool all_simple = true;
     clear_output(b);
     size_t count = b->len;
@@ -2574,11 +2584,12 @@ static size_t next_syllable(const VegaShaper *b, size_t start) {
 /* A dotted circle at the start of each broken syllable (after a repha that
  * starts it), for its marks to sit on; false when none went in. */
 static bool insert_dotted_circles(const VegaShaping *s, VegaShaper *b, unsigned broken, unsigned category, int repha,
-                                  unsigned position) {
+                                  int position) {
     uint32_t glyph;
     if (!(b->scratch & HAS_BROKEN_SYLLABLE) || !nominal(s, 0x25CC, &glyph)) return false;
     /* All of it zero but these: HarfBuzz's is a fresh glyph_info. */
-    Info circle = {.codepoint = glyph, .uprops = VEGA_CC, .position = (uint8_t)position, .category = (uint8_t)category};
+    Info circle = {.codepoint = glyph, .uprops = VEGA_CC, .position = (uint8_t)(position >= 0 ? position : 0),
+                   .category = (uint8_t)category};
     clear_output(b);
     unsigned last = 0;
     while (b->idx < b->len && b->successful) {
@@ -3186,15 +3197,153 @@ static void indic_final_reordering(const Indic *d, VegaShaper *b) {
     }
 }
 
+/* ---- Khmer (hb-ot-shaper-khmer.cc): a coeng and Ro moved before the base
+ * and masked for pref, what follows them for cfar; a left matra moved
+ * first; the post-base features on all but the first glyph. */
+
+static void setup_masks_category(VegaShaper *b) {
+    for (size_t i = 0; i < b->len; ++i) b->info[i].category = vega_indic_categories(b->info[i].codepoint) & 0xFF;
+}
+
+static void khmer_reorder_syllable(const Plan *plan, VegaShaper *b, size_t start, size_t end) {
+    Info *info = b->info;
+    const uint32_t *masks = plan->masks;
+    uint32_t post = masks[VEGA_MASK_KHMER_BLWF] | masks[VEGA_MASK_KHMER_ABVF] | masks[VEGA_MASK_KHMER_PSTF];
+    for (size_t i = start + 1; i < end; ++i) info[i].mask |= post;
+    unsigned coengs = 0;
+    for (size_t i = start + 1; i < end; ++i)
+        if (info[i].category == VEGA_OT_H && coengs <= 2 && i + 1 < end) {
+            coengs++;
+            if (info[i + 1].category == VEGA_OT_RA) {
+                info[i].mask |= masks[VEGA_MASK_KHMER_PREF];
+                info[i + 1].mask |= masks[VEGA_MASK_KHMER_PREF];
+                merge_clusters(b, start, i + 2);
+                Info t0 = info[i], t1 = info[i + 1];
+                memmove(&info[start + 2], &info[start], (i - start) * sizeof(Info));
+                info[start] = t0;
+                info[start + 1] = t1;
+                if (masks[VEGA_MASK_KHMER_CFAR])
+                    for (size_t j = i + 2; j < end; ++j) info[j].mask |= masks[VEGA_MASK_KHMER_CFAR];
+                coengs = 2;
+            }
+        } else if (info[i].category == VEGA_OT_VPRE) {
+            merge_clusters(b, start, i + 1);
+            Info t = info[i];
+            memmove(&info[start + 1], &info[start], (i - start) * sizeof(Info));
+            info[start] = t;
+        }
+}
+
+static bool khmer_reorder(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
+    bool changed = insert_dotted_circles(s, b, 1, VEGA_OT_DOTTEDCIRCLE, -1, -1);
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        if ((b->info[start].syllable & 0x0F) <= 1) khmer_reorder_syllable(plan, b, start, end);
+    }
+    return changed;
+}
+
+/* ---- Myanmar (hb-ot-shaper-myanmar.cc): the base (after a kinzi), each
+ * glyph given its place around it, and the syllable sorted by place. */
+
+#define CONSONANT_FLAGS_MYANMAR \
+    (FLAG(VEGA_OT_C) | FLAG(VEGA_OT_CS) | FLAG(VEGA_OT_RA) | FLAG(VEGA_OT_V) | FLAG(VEGA_OT_PLACEHOLDER) | \
+     FLAG(VEGA_OT_DOTTEDCIRCLE))
+
+/* hb_buffer_t::sort by position: stable; a glyph that moves back merges
+ * the clusters it passes. */
+static void sort_by_position(VegaShaper *b, size_t start, size_t end) {
+    for (size_t i = start + 1; i < end; ++i) {
+        size_t j = i;
+        while (j > start && b->info[j - 1].position > b->info[i].position) j--;
+        if (i == j) continue;
+        merge_clusters(b, j, i + 1);
+        Info t = b->info[i];
+        memmove(&b->info[j + 1], &b->info[j], (i - j) * sizeof(Info));
+        b->info[j] = t;
+    }
+}
+
+static void myanmar_reorder_syllable(VegaShaper *b, size_t start, size_t end) {
+    Info *info = b->info;
+    size_t base = end, limit = start;
+    bool has_reph = false;
+    if (start + 3 <= end && info[start].category == VEGA_OT_RA && info[start + 1].category == VEGA_OT_AS &&
+        info[start + 2].category == VEGA_OT_H) {
+        limit += 3;
+        base = start;
+        has_reph = true;
+    }
+    if (!has_reph) base = limit;
+    for (size_t i = limit; i < end; ++i)
+        if (is_one_of(&info[i], CONSONANT_FLAGS_MYANMAR)) {
+            base = i;
+            break;
+        }
+    size_t i = start;
+    for (; i < start + (has_reph ? 3 : 0); ++i) info[i].position = VEGA_POS_AFTER_MAIN;
+    for (; i < base; ++i) info[i].position = VEGA_POS_PRE_C;
+    if (i < end) info[i++].position = VEGA_POS_BASE_C;
+    uint8_t pos = VEGA_POS_AFTER_MAIN;
+    for (; i < end; ++i) {
+        unsigned c = info[i].category;
+        if (c == VEGA_OT_MR) info[i].position = VEGA_POS_PRE_C;       /* pre-base reordering */
+        else if (c == VEGA_OT_VPRE) info[i].position = VEGA_POS_PRE_M; /* left matra */
+        else if (c == VEGA_OT_VS) info[i].position = info[i - 1].position;
+        else if (pos == VEGA_POS_AFTER_MAIN && c == VEGA_OT_VBLW) info[i].position = pos = VEGA_POS_BELOW_C;
+        else if (pos == VEGA_POS_BELOW_C && c == VEGA_OT_A) info[i].position = VEGA_POS_BEFORE_SUB;
+        else if (pos == VEGA_POS_BELOW_C && c == VEGA_OT_VBLW) info[i].position = pos;
+        else if (pos == VEGA_POS_BELOW_C) info[i].position = pos = VEGA_POS_AFTER_SUB;
+        else info[i].position = pos;
+    }
+    sort_by_position(b, start, end);
+    /* A run of left matras back in their order (variation selectors after
+     * theirs). */
+    size_t first_left_matra = end, last_left_matra = end;
+    for (size_t k = start; k < end; ++k)
+        if (info[k].position == VEGA_POS_PRE_M) {
+            if (first_left_matra == end) first_left_matra = k;
+            last_left_matra = k;
+        }
+    if (first_left_matra < last_left_matra) {
+        reverse_range(b, first_left_matra, last_left_matra + 1, false);
+        size_t k = first_left_matra;
+        for (size_t j = k; j <= last_left_matra; ++j)
+            if (info[j].category == VEGA_OT_VPRE) {
+                reverse_range(b, k, j + 1, false);
+                k = j + 1;
+            }
+    }
+}
+
+static bool myanmar_reorder(const VegaShaping *s, VegaShaper *b) {
+    bool changed = insert_dotted_circles(s, b, 1, VEGA_OT_DOTTEDCIRCLE, -1, -1);
+    for (size_t start = 0, end; start < b->len; start = end) {
+        end = next_syllable(b, start);
+        if ((b->info[start].syllable & 0x0F) <= 1) myanmar_reorder_syllable(b, start, end);
+    }
+    return changed;
+}
+
 /* The shaper's part of the work at a pause in GSUB; whether it changed the
  * buffer. */
 static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause) {
-    if (plan->shaper != VEGA_SHAPER_INDIC) return false;
-    Indic d = indic_of(s, plan);
-    switch (pause) {
-    case VEGA_PAUSE_SYLLABLES: find_syllables(b, &vega_indic_machine); return false;
-    case VEGA_PAUSE_INITIAL_REORDERING: return indic_initial_reordering(&d, b);
-    case VEGA_PAUSE_FINAL_REORDERING: indic_final_reordering(&d, b); return false;
+    switch (plan->shaper) {
+    case VEGA_SHAPER_INDIC: {
+        Indic d = indic_of(s, plan);
+        switch (pause) {
+        case VEGA_PAUSE_SYLLABLES: find_syllables(b, &vega_indic_machine); return false;
+        case VEGA_PAUSE_INITIAL_REORDERING: return indic_initial_reordering(&d, b);
+        case VEGA_PAUSE_FINAL_REORDERING: indic_final_reordering(&d, b); return false;
+        default: return false;
+        }
+    }
+    case VEGA_SHAPER_KHMER:
+        if (pause == VEGA_PAUSE_SYLLABLES) find_syllables(b, &vega_khmer_machine);
+        return pause == VEGA_PAUSE_INITIAL_REORDERING && khmer_reorder(s, plan, b);
+    case VEGA_SHAPER_MYANMAR:
+        if (pause == VEGA_PAUSE_SYLLABLES) find_syllables(b, &vega_myanmar_machine);
+        return pause == VEGA_PAUSE_INITIAL_REORDERING && myanmar_reorder(s, b);
     default: return false;
     }
 }
@@ -3256,6 +3405,17 @@ static void propagate_attachment_offsets(Position *pos, size_t len, size_t i, in
         }
 }
 
+static void zero_mark_widths(VegaShaper *b, bool adjust) {
+    for (size_t i = 0; i < b->len; ++i)
+        if (b->info[i].gprops & MARK) {
+            if (adjust) {
+                b->pos[i].x_offset -= b->pos[i].x_advance;
+                b->pos[i].y_offset -= b->pos[i].y_advance;
+            }
+            b->pos[i].x_advance = b->pos[i].y_advance = 0;
+        }
+}
+
 static void position(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     b->have_output = false;
     b->out_len = 0;
@@ -3263,17 +3423,12 @@ static void position(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
     for (size_t i = 0; i < b->len; ++i) b->pos[i].x_advance = advance_of(s, b->info[i].codepoint);
     if (b->scratch & HAS_SPACE_FALLBACK) fallback_spaces(s, b);
     bool adjust = (plan->flags & VEGA_PLAN_ADJUST_ZEROING) && b->direction == VEGA_SHAPE_LTR;
+    /* Marks' advances go by GDEF: before GPOS (Myanmar's shaper) or after. */
+    bool early = plan->shaper == VEGA_SHAPER_MYANMAR;
+    if ((plan->flags & VEGA_PLAN_ZERO_MARKS) && early) zero_mark_widths(b, adjust);
     if (plan->flags & VEGA_PLAN_GPOS) apply_table(s, plan, b, 1);
     if (plan->flags & VEGA_PLAN_KERN) kern_table(s, b, plan);
-    if (plan->flags & VEGA_PLAN_ZERO_MARKS)
-        for (size_t i = 0; i < b->len; ++i)
-            if (b->info[i].gprops & MARK) {
-                if (adjust) {
-                    b->pos[i].x_offset -= b->pos[i].x_advance;
-                    b->pos[i].y_offset -= b->pos[i].y_advance;
-                }
-                b->pos[i].x_advance = b->pos[i].y_advance = 0;
-            }
+    if ((plan->flags & VEGA_PLAN_ZERO_MARKS) && !early) zero_mark_widths(b, adjust);
     if (b->scratch & HAS_DEFAULT_IGNORABLES)
         for (size_t i = 0; i < b->len; ++i)
             if (is_default_ignorable(&b->info[i]))
@@ -3318,6 +3473,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     setup_masks_fraction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_ARABIC) setup_masks_arabic(b, &plan);
     if (plan.shaper == VEGA_SHAPER_INDIC) setup_masks_indic(b);
+    if (plan.shaper == VEGA_SHAPER_KHMER || plan.shaper == VEGA_SHAPER_MYANMAR) setup_masks_category(b);
     if (plan.shaper == VEGA_SHAPER_HANGUL)
         for (size_t i = 0; i < b->len; ++i)
             if (b->info[i].action >= LJMO && b->info[i].action <= TJMO)

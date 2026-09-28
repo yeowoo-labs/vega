@@ -6,8 +6,8 @@
 
 /* Shaping (docs/design/004-text.md): a run of characters (one script, one
  * direction) to glyphs and their positions, as HarfBuzz 10 shapes it with
- * its default, Arabic, Hebrew, Hangul and Indic shapers, glyph for glyph and
- * unit for unit.
+ * its default, Arabic, Hebrew, Hangul, Indic, Khmer and Myanmar shapers,
+ * glyph for glyph and unit for unit.
  *
  * What a font's shaping needs travels in a symbol file (its shaping
  * section), written by the build tool:
@@ -47,7 +47,8 @@
 enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEGA_PLAN_MASKS = 16,
        VEGA_PLAN_STAGES = 5 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
-enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC };
+enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC,
+       VEGA_SHAPER_KHMER, VEGA_SHAPER_MYANMAR };
 /* Plan flags: GPOS runs; mark advances are zeroed after it (by GDEF); glyph
  * classes come from Unicode (the font has none); the font positions marks
  * (a 'mark' feature); automatic fractions; the kern table kerns; marks are
@@ -63,6 +64,8 @@ enum { VEGA_MASK_ISOL = VEGA_MASK_SHAPER, VEGA_MASK_FINA, VEGA_MASK_FIN2, VEGA_M
 enum { VEGA_MASK_LJMO = VEGA_MASK_SHAPER, VEGA_MASK_VJMO, VEGA_MASK_TJMO };      /* Hangul */
 enum { VEGA_MASK_RPHF = VEGA_MASK_SHAPER, VEGA_MASK_PREF, VEGA_MASK_BLWF, VEGA_MASK_ABVF, VEGA_MASK_HALF,
        VEGA_MASK_PSTF, VEGA_MASK_INDIC_INIT };                                /* Indic */
+enum { VEGA_MASK_KHMER_PREF = VEGA_MASK_SHAPER, VEGA_MASK_KHMER_BLWF, VEGA_MASK_KHMER_ABVF, VEGA_MASK_KHMER_PSTF,
+       VEGA_MASK_KHMER_CFAR };                                                /* Khmer */
 /* The stages a plan names: Indic's, whose features decide a consonant's
  * position by whether they would substitute it. */
 enum { VEGA_STAGE_RPHF, VEGA_STAGE_PREF, VEGA_STAGE_BLWF, VEGA_STAGE_PSTF, VEGA_STAGE_VATU };
