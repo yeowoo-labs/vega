@@ -1,4 +1,4 @@
-/* Line breaking (UAX #14, Unicode 15.1): text/text.h. Each boundary is
+/* Line breaking (UAX #14, Unicode 16.0): text/text.h. Each boundary is
  * decided by the first rule, in the standard's order, that matches it; the
  * rules that look back over spaces, marks or numbers read what a pass
  * before them worked out for every position. */
@@ -73,7 +73,7 @@ static uint8_t decide(const Text *t, size_t i) {
     if (A == WJ || B == WJ) return NONE;                                   /* LB11 */
     if (A == GL) return NONE;                                              /* LB12 */
     if (B == GL && A != SP && A != BA && A != HY) return NONE;             /* LB12a */
-    if (B == CL || B == CP || B == EX || B == IS || B == SY) return NONE;  /* LB13 */
+    if (B == CL || B == CP || B == EX || B == SY) return NONE;             /* LB13 */
     if (before != NO_UNIT && t->eff[before] == OP) return NONE;            /* LB14: OP SP* × */
     /* LB15a: an initial quotation mark after a start, opening or space,
      * then spaces, and no break */
@@ -91,13 +91,35 @@ static uint8_t decide(const Text *t, size_t i) {
             n == BK || n == CR || n == LF || n == NL || n == ZW)
             return NONE;
     }
+    /* LB15c: a decimal mark after a space, as in 'subtract .5'; LB15d:
+     * otherwise none before ';', ',' or '.' */
+    if (A == SP && B == IS) {
+        size_t j = next_unit(t, i);
+        if (j < t->count && t->eff[j] == NU) return ALLOWED;
+    }
+    if (B == IS) return NONE;
     if (B == NS && before != NO_UNIT && one_of(t->eff[before], CL, CP)) return NONE; /* LB16 */
     if (B == B2 && before != NO_UNIT && t->eff[before] == B2) return NONE;            /* LB17 */
     if (A == SP) return ALLOWED;                                           /* LB18 */
-    if (B == QU || A == QU) return NONE;                                   /* LB19 */
+    /* LB19: none before a quotation mark but an initial one, nor after one
+     * but a final one; LB19a: nor either side of any unless East Asian
+     * characters are there */
+    if (B == QU && vega_category(t->codes[i]) != VEGA_PI) return NONE;
+    if (A == QU && vega_category(base) != VEGA_PF) return NONE;
+    if (B == QU) {
+        size_t j = next_unit(t, i);
+        if (!vega_east_asian(base) || j == t->count || !vega_east_asian(t->codes[j])) return NONE;
+    }
+    if (A == QU && (!vega_east_asian(t->codes[i]) || !unit || !vega_east_asian(t->codes[t->start[unit - 1]]))) return NONE;
     if (B == CB || A == CB) return ALLOWED;                                /* LB20 */
+    /* LB20a: none after a word-initial hyphen */
+    if ((A == HY || base == 0x2010) && B == AL) {
+        unsigned w = unit ? t->eff[unit - 1] : SP;
+        if (w == BK || w == CR || w == LF || w == NL || w == SP || w == ZW || w == CB || w == GL) return NONE;
+    }
     if (B == BA || B == HY || B == NS || A == BB) return NONE;             /* LB21 */
-    if (one_of(A, HY, BA) && unit && t->eff[unit - 1] == HL) return NONE;  /* LB21a */
+    /* LB21a: none after the hyphen in Hebrew + hyphen + non-Hebrew */
+    if ((A == HY || (A == BA && !vega_east_asian(base))) && unit && t->eff[unit - 1] == HL && B != HL) return NONE;
     if (A == SY && B == HL) return NONE;                                   /* LB21b */
     if (B == IN) return NONE;                                              /* LB22 */
     if (one_of(A, AL, HL) && B == NU) return NONE;                         /* LB23 */
@@ -106,17 +128,19 @@ static uint8_t decide(const Text *t, size_t i) {
     if ((A == ID || A == EB || A == EM) && B == PO) return NONE;
     if (one_of(A, PR, PO) && one_of(B, AL, HL)) return NONE;               /* LB24 */
     if (one_of(A, AL, HL) && one_of(B, PR, PO)) return NONE;
-    /* LB25, as Example 7 of section 8.2 tailors it: numbers */
-    if (one_of(A, PR, PO)) {
+    /* LB25: numbers (the rules before it keep ',', '.', '/' and closing
+     * punctuation to what they follow) */
+    if (one_of(B, PO, PR) && (t->number[i - 1] || (one_of(A, CL, CP) && unit && t->number[unit - 1]))) return NONE;
+    if (one_of(A, PO, PR)) {
         if (B == NU) return NONE;
-        if (one_of(B, OP, HY)) {
+        if (B == OP) { /* OP NU, OP IS NU */
             size_t j = next_unit(t, i);
+            if (j < t->count && t->eff[j] == IS) j = next_unit(t, j);
             if (j < t->count && t->eff[j] == NU) return NONE;
         }
     }
-    if (one_of(A, OP, HY) && B == NU) return NONE;
-    if (t->number[i - 1] && (B == NU || B == SY || B == IS || B == CL || B == CP)) return NONE;
-    if (one_of(B, PO, PR) && (t->number[i - 1] || (one_of(A, CL, CP) && unit && t->number[unit - 1]))) return NONE;
+    if (one_of(A, HY, IS) && B == NU) return NONE;
+    if (t->number[i - 1] && B == NU) return NONE;
     if (A == JL && (B == JL || B == JV || B == H2 || B == H3)) return NONE; /* LB26 */
     if (one_of(A, JV, H2) && one_of(B, JV, JT)) return NONE;
     if (one_of(A, JT, H3) && B == JT) return NONE;
@@ -133,8 +157,8 @@ static uint8_t decide(const Text *t, size_t i) {
         if (j < t->count && t->eff[j] == VF) return NONE;
     }
     if (A == IS && one_of(B, AL, HL)) return NONE;                         /* LB29 */
-    if ((A == AL || A == HL || A == NU) && B == OP && !vega_east_asian_bracket(t->codes[i])) return NONE; /* LB30 */
-    if (A == CP && !vega_east_asian_bracket(base) && (B == AL || B == HL || B == NU)) return NONE;
+    if ((A == AL || A == HL || A == NU) && B == OP && !vega_east_asian(t->codes[i])) return NONE; /* LB30 */
+    if (A == CP && !vega_east_asian(base) && (B == AL || B == HL || B == NU)) return NONE;
     if (A == RI && B == RI && t->ri[i - 1] % 2) return NONE;               /* LB30a */
     if (B == EM && (A == EB || (vega_extended_pictographic(base) && vega_category(base) == VEGA_CN))) return NONE; /* LB30b */
     return ALLOWED;                                                        /* LB31 */

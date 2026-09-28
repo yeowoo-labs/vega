@@ -8,6 +8,9 @@
  * it needs (tables generated from the UCD by text/unicode.py) and the
  * algorithms over them, checked against Unicode's conformance tests. */
 
+/* The version of the Unicode Character Database the tables came from. */
+const char *vega_unicode_version(void);
+
 /* Bidi_Class (UAX #9), in the order of text/unicode.py. */
 typedef enum {
     VEGA_BIDI_L, VEGA_BIDI_R, VEGA_BIDI_AL, VEGA_BIDI_EN, VEGA_BIDI_ES, VEGA_BIDI_ET, VEGA_BIDI_AN, VEGA_BIDI_CS,
@@ -59,9 +62,8 @@ typedef enum {
     VEGA_LB_VF, VEGA_LB_VI, VEGA_LB_XX, VEGA_LB_CLASSES
 } VegaLineBreak;
 VegaLineBreak vega_line_break(uint32_t code);
-/* Opening or closing punctuation that is East Asian (Fullwidth, Wide or
- * Halfwidth): what rule LB30 leaves out. */
-bool vega_east_asian_bracket(uint32_t code);
+/* $EastAsian of UAX #14: East_Asian_Width Fullwidth, Wide or Halfwidth. */
+bool vega_east_asian(uint32_t code);
 /* Where a line may break (UAX #14, with the number tailoring of its
  * Example 7, as Unicode's tests do): breaks[i] is the boundary before
  * codes[i], i from 0 to count (breaks has count + 1 room). */

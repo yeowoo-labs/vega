@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum { MAX = 512 };
 static unsigned failures;
@@ -127,7 +128,7 @@ static size_t bidi_character_test(const char *path) {
     return cases;
 }
 
-/* NormalizationTest.txt (through bzcat): for each line c1;c2;c3;c4;c5,
+/* NormalizationTest.txt (as it is, or through bzcat as Debian keeps it): for each line c1;c2;c3;c4;c5,
  * NFC(c1) = NFC(c2) = NFC(c3) = c2, NFC(c4) = NFC(c5) = c4, NFD(c1) =
  * NFD(c2) = NFD(c3) = c3 and NFD(c4) = NFD(c5) = c5; and every code point
  * part 1 does not list is its own NFC and NFD. */
@@ -150,8 +151,10 @@ static bool normalizes(size_t (*form)(const uint32_t *, size_t, uint32_t *), con
 
 static size_t normalization_test(const char *path, size_t *invariant) {
     char command[1200];
+    size_t length = strlen(path);
+    bool compressed = length > 4 && !strcmp(path + length - 4, ".bz2");
     snprintf(command, sizeof(command), "bzcat '%s'", path);
-    FILE *in = popen(command, "r");
+    FILE *in = compressed ? popen(command, "r") : fopen(path, "r");
     if (!in) { perror(path); exit(2); }
     static bool listed[0x110000];
     char line[4096];
@@ -184,7 +187,8 @@ static size_t normalization_test(const char *path, size_t *invariant) {
         }
         if (!ok) fail(path, number, "a form differs");
     }
-    pclose(in);
+    if (compressed) pclose(in);
+    else fclose(in);
     *invariant = 0;
     for (uint32_t code = 0; code < 0x110000; ++code) {
         if (listed[code] || (code >= 0xD800 && code <= 0xDFFF)) continue;
@@ -277,12 +281,30 @@ static size_t segment_test(const char *path, bool (*segment)(const uint32_t *, s
 
 int main(int argc, char **argv) {
     const char *ucd = argc > 1 ? argv[1] : "/usr/share/unicode";
-    char path[1024];
+    char path[1024], line[256], version[32] = "";
+    /* The tests of another Unicode than the tables' would fail for that alone. */
+    snprintf(path, sizeof(path), "%s/ReadMe.txt", ucd);
+    FILE *readme = fopen(path, "r");
+    while (readme && fgets(line, sizeof(line), readme) && !version[0])
+        for (const char *at = line; *at && !version[0]; ++at) { /* the first x.y.z, as text/unicode.py reads it */
+            unsigned major, minor, update;
+            int used = 0;
+            if ((at == line || at[-1] < '0' || at[-1] > '9') && *at >= '0' && *at <= '9' &&
+                sscanf(at, "%u.%u.%u%n", &major, &minor, &update, &used) == 3 && used)
+                snprintf(version, sizeof(version), "%u.%u.%u", major, minor, update);
+        }
+    if (readme) fclose(readme);
+    if (version[0] && strcmp(version, vega_unicode_version())) {
+        printf("{\"skipped\":\"the UCD at %s is %s, the tables %s (text/upstream.py fetches theirs)\"}\n", ucd,
+               version, vega_unicode_version());
+        return 0;
+    }
     snprintf(path, sizeof(path), "%s/BidiTest.txt", ucd);
     size_t bidi = bidi_test(path);
     snprintf(path, sizeof(path), "%s/BidiCharacterTest.txt", ucd);
     size_t characters = bidi_character_test(path), invariant;
-    snprintf(path, sizeof(path), "%s/NormalizationTest.txt.bz2", ucd);
+    snprintf(path, sizeof(path), "%s/NormalizationTest.txt", ucd);
+    if (access(path, R_OK)) snprintf(path, sizeof(path), "%s/NormalizationTest.txt.bz2", ucd);
     size_t normalized = normalization_test(path, &invariant);
     snprintf(path, sizeof(path), "%s/auxiliary/LineBreakTest.txt", ucd);
     size_t line_breaks = line_break_test(path);
