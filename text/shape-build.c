@@ -33,6 +33,7 @@ typedef struct {
     hb_face_t *face;
     unsigned script_index[2], language_index[2];
     hb_tag_t chosen_script[2];
+    bool found_script[2]; /* one of the script's own tags, not DFLT or latn */
     FeatureInfo infos[MAX_FEATURES];
     unsigned info_count, current_stage[2];
     unsigned pause[2][MAX_STAGES]; /* what ends each stage: VEGA_PAUSE_..., or 0 */
@@ -332,7 +333,8 @@ static int categorize(uint32_t script, hb_tag_t gsub_script) {
     if (script == TAG("Hebr")) return VEGA_SHAPER_HEBREW;
     if (script == TAG("Hang")) return VEGA_SHAPER_HANGUL;
     if (script == TAG("Khmr")) return VEGA_SHAPER_KHMER;
-    if (script == TAG("Syrc") || script == TAG("Thai") || script == TAG("Laoo") || script == TAG("Qaag")) return -1;
+    if (script == TAG("Thai") || script == TAG("Laoo")) return VEGA_SHAPER_THAI;
+    if (script == TAG("Syrc") || script == TAG("Qaag")) return -1;
     if (listed(indic_scripts, sizeof(indic_scripts) / sizeof(*indic_scripts), script))
         return dflt ? VEGA_SHAPER_DEFAULT : (gsub_script & 0xFF) == '3' ? VEGA_SHAPER_USE : VEGA_SHAPER_INDIC;
     if (listed(use_scripts, sizeof(use_scripts) / sizeof(*use_scripts), script))
@@ -430,8 +432,8 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     hb_ot_tags_from_script_and_language(script, HB_LANGUAGE_INVALID, &script_count, script_tags, &language_count,
                                         language_tags);
     for (int t = 0; t < 2; ++t) {
-        hb_ot_layout_table_select_script(face, table_tags[t], script_count, script_tags, &m->script_index[t],
-                                         &m->chosen_script[t]);
+        m->found_script[t] = hb_ot_layout_table_select_script(face, table_tags[t], script_count, script_tags,
+                                                              &m->script_index[t], &m->chosen_script[t]);
         hb_ot_layout_script_select_language(face, table_tags[t], m->script_index[t], language_count, language_tags,
                                             &m->language_index[t]);
     }
@@ -610,7 +612,7 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     /* Hangul's, Indic's and Khmer's shapers zero no marks (Myanmar's does,
      * before GPOS); none of these places marks without GPOS. */
     bool zeroes = shaper != VEGA_SHAPER_HANGUL && shaper != VEGA_SHAPER_INDIC && shaper != VEGA_SHAPER_KHMER;
-    bool script_marks = zeroes && shaper != VEGA_SHAPER_MYANMAR && shaper != VEGA_SHAPER_USE;
+    bool script_marks = zeroes && shaper != VEGA_SHAPER_MYANMAR && shaper != VEGA_SHAPER_USE && shaper != VEGA_SHAPER_THAI;
     bool adjust = !apply_gpos && (!apply_kern || !kern_table.cross), fallback_marks = adjust && script_marks;
     if (shaper == VEGA_SHAPER_ARABIC) {
         if (one_mask(m, "stch")) FAIL("%s: the font stretches (stch)", name);
@@ -655,6 +657,8 @@ static bool plan_for(hb_face_t *face, uint32_t script_tag, int direction, Plan *
     }
     if (shaper == VEGA_SHAPER_KHMER)
         for (int i = 0; i < 5; ++i) plan->masks[VEGA_MASK_KHMER_PREF + i] = one_mask(m, khmer_basic[i]);
+    if (shaper == VEGA_SHAPER_THAI && script == HB_SCRIPT_THAI && !m->found_script[0])
+        plan->shaper_flags |= VEGA_THAI_PUA;
     free(m);
     return true;
 fail:

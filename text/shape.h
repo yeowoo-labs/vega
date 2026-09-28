@@ -6,8 +6,8 @@
 
 /* Shaping (docs/design/004-text.md): a run of characters (one script, one
  * direction) to glyphs and their positions, as HarfBuzz 10 shapes it with
- * its default, Arabic, Hebrew, Hangul, Indic, Khmer, Myanmar and Universal
- * (USE) shapers, glyph for glyph and unit for unit.
+ * its default, Arabic, Hebrew, Hangul, Indic, Khmer, Myanmar, Universal
+ * (USE) and Thai shapers, glyph for glyph and unit for unit.
  *
  * What a font's shaping needs travels in a symbol file (its shaping
  * section), written by the build tool:
@@ -48,7 +48,7 @@ enum { VEGA_SHAPING_HEADER = 80, VEGA_PLAN_BYTES = 144, VEGA_STEP_BYTES = 8, VEG
        VEGA_PLAN_STAGES = 5 };
 enum { VEGA_SHAPE_LTR = 1, VEGA_SHAPE_RTL = 2 };
 enum { VEGA_SHAPER_DEFAULT, VEGA_SHAPER_ARABIC, VEGA_SHAPER_HEBREW, VEGA_SHAPER_HANGUL, VEGA_SHAPER_INDIC,
-       VEGA_SHAPER_KHMER, VEGA_SHAPER_MYANMAR, VEGA_SHAPER_USE };
+       VEGA_SHAPER_KHMER, VEGA_SHAPER_MYANMAR, VEGA_SHAPER_USE, VEGA_SHAPER_THAI };
 /* Plan flags: GPOS runs; mark advances are zeroed after it (by GDEF); glyph
  * classes come from Unicode (the font has none); the font positions marks
  * (a 'mark' feature); automatic fractions; the kern table kerns; marks are
@@ -71,8 +71,9 @@ enum { VEGA_MASK_USE_RPHF = VEGA_MASK_INIT + 1 };         /* USE: that, and Arab
  * position by whether they would substitute it. */
 enum { VEGA_STAGE_RPHF, VEGA_STAGE_PREF, VEGA_STAGE_BLWF, VEGA_STAGE_PSTF, VEGA_STAGE_VATU };
 /* Shaper flags: Indic's font follows the old specification (deva, not
- * dev2). */
-enum { VEGA_INDIC_OLD_SPEC = 1 };
+ * dev2); Thai's font has no Thai script of its own, so its marks take the
+ * font's private-use glyphs where it has them. */
+enum { VEGA_INDIC_OLD_SPEC = 1, VEGA_THAI_PUA = 2 };
 /* Step flags; pauses, which the shaper tells apart. */
 enum { VEGA_STEP_AUTO_ZWNJ = 1, VEGA_STEP_AUTO_ZWJ = 2, VEGA_STEP_RANDOM = 4, VEGA_STEP_PER_SYLLABLE = 8 };
 enum { VEGA_STEP_PAUSE = 0xFFFF };

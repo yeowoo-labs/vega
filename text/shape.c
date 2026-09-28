@@ -227,7 +227,7 @@ bool vega_shaping_open(VegaShaping *s, const unsigned char *bytes, size_t size, 
     for (uint32_t i = 0; i < s->plan_count; ++i) {
         const unsigned char *p = s->plans + (size_t)i * VEGA_PLAN_BYTES;
         uint32_t ranges[2][2] = {{le32(p + 80), le32(p + 84)}, {le32(p + 88), le32(p + 92)}};
-        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_USE)
+        if ((p[4] != VEGA_SHAPE_LTR && p[4] != VEGA_SHAPE_RTL) || p[5] > VEGA_SHAPE_RTL || p[6] > VEGA_SHAPER_THAI)
             REFUSE("plan %u", i);
         if ((p[7] & VEGA_PLAN_FALLBACK_MARKS) && !s->extents) REFUSE("plan %u: marks placed without extents", i);
         for (int table = 0; table < 2; ++table) {
@@ -3510,6 +3510,122 @@ static bool use_reorder(const VegaShaping *s, VegaShaper *b) {
     return changed;
 }
 
+/* ---- Thai and Lao (hb-ot-shaper-thai.cc): SARA AM taken apart into
+ * NIKHAHIT and SARA AA, the NIKHAHIT moved back over the above-base marks;
+ * in a font with no Thai script, marks shifted by the font's private-use
+ * glyphs (Windows' or the Mac's) as the stacking around the base asks. */
+
+enum { THAI_NC, THAI_AC, THAI_RC, THAI_DC, THAI_NOT_CONSONANT };
+enum { THAI_AV, THAI_BV, THAI_T, THAI_NOT_MARK };
+enum { THAI_NOP, THAI_SD, THAI_SL, THAI_SDL, THAI_RD };
+
+static unsigned thai_consonant_type(uint32_t u) {
+    if (u == 0x0E1B || u == 0x0E1D || u == 0x0E1F) return THAI_AC;
+    if (u == 0x0E0D || u == 0x0E10) return THAI_RC;
+    if (u == 0x0E0E || u == 0x0E0F) return THAI_DC;
+    if (u >= 0x0E01 && u <= 0x0E2E) return THAI_NC;
+    return THAI_NOT_CONSONANT;
+}
+
+static unsigned thai_mark_type(uint32_t u) {
+    if (u == 0x0E31 || (u >= 0x0E34 && u <= 0x0E37) || u == 0x0E47 || (u >= 0x0E4D && u <= 0x0E4E)) return THAI_AV;
+    if (u >= 0x0E38 && u <= 0x0E3A) return THAI_BV;
+    if (u >= 0x0E48 && u <= 0x0E4C) return THAI_T;
+    return THAI_NOT_MARK;
+}
+
+/* The private-use code point the font has for u shifted by action
+ * (Windows' before the Mac's), or u. */
+static uint32_t thai_pua_shape(const VegaShaping *s, uint32_t u, unsigned action) {
+    static const uint16_t sd[][3] = {{0x0E48, 0xF70A, 0xF88B}, {0x0E49, 0xF70B, 0xF88E}, {0x0E4A, 0xF70C, 0xF891},
+                                     {0x0E4B, 0xF70D, 0xF894}, {0x0E4C, 0xF70E, 0xF897}, {0x0E38, 0xF718, 0xF89B},
+                                     {0x0E39, 0xF719, 0xF89C}, {0x0E3A, 0xF71A, 0xF89D}, {0, 0, 0}};
+    static const uint16_t sdl[][3] = {{0x0E48, 0xF705, 0xF88C}, {0x0E49, 0xF706, 0xF88F}, {0x0E4A, 0xF707, 0xF892},
+                                      {0x0E4B, 0xF708, 0xF895}, {0x0E4C, 0xF709, 0xF898}, {0, 0, 0}};
+    static const uint16_t sl[][3] = {{0x0E48, 0xF713, 0xF88A}, {0x0E49, 0xF714, 0xF88D}, {0x0E4A, 0xF715, 0xF890},
+                                     {0x0E4B, 0xF716, 0xF893}, {0x0E4C, 0xF717, 0xF896}, {0x0E31, 0xF710, 0xF884},
+                                     {0x0E34, 0xF701, 0xF885}, {0x0E35, 0xF702, 0xF886}, {0x0E36, 0xF703, 0xF887},
+                                     {0x0E37, 0xF704, 0xF888}, {0x0E47, 0xF712, 0xF889}, {0x0E4D, 0xF711, 0xF899},
+                                     {0, 0, 0}};
+    static const uint16_t rd[][3] = {{0x0E0D, 0xF70F, 0xF89A}, {0x0E10, 0xF700, 0xF89E}, {0, 0, 0}};
+    const uint16_t(*mappings)[3] = action == THAI_SD ? sd : action == THAI_SDL ? sdl : action == THAI_SL ? sl
+                                   : action == THAI_RD ? rd : NULL;
+    if (!mappings) return u;
+    uint32_t glyph;
+    for (; mappings[0][0]; mappings++)
+        if (mappings[0][0] == u) {
+            if (nominal(s, mappings[0][1], &glyph)) return mappings[0][1];
+            if (nominal(s, mappings[0][2], &glyph)) return mappings[0][2];
+            break;
+        }
+    return u;
+}
+
+static void thai_pua_shaping(const VegaShaping *s, VegaShaper *b) {
+    /* above: T0..T3; below: B0..B2 (hb-ot-shaper-thai.cc's state machines) */
+    static const uint8_t above_start[5] = {0, 1, 0, 0, 3}, below_start[5] = {0, 0, 1, 2, 2};
+    static const uint8_t above[4][3][2] = {{{THAI_NOP, 3}, {THAI_NOP, 0}, {THAI_SD, 3}},
+                                           {{THAI_SL, 2}, {THAI_NOP, 1}, {THAI_SDL, 2}},
+                                           {{THAI_NOP, 3}, {THAI_NOP, 2}, {THAI_SL, 3}},
+                                           {{THAI_NOP, 3}, {THAI_NOP, 3}, {THAI_NOP, 3}}};
+    static const uint8_t below[3][3][2] = {{{THAI_NOP, 0}, {THAI_NOP, 2}, {THAI_NOP, 0}},
+                                           {{THAI_NOP, 1}, {THAI_RD, 2}, {THAI_NOP, 1}},
+                                           {{THAI_NOP, 2}, {THAI_SD, 2}, {THAI_NOP, 2}}};
+    unsigned above_state = above_start[THAI_NOT_CONSONANT], below_state = below_start[THAI_NOT_CONSONANT];
+    size_t base = 0;
+    for (size_t i = 0; i < b->len; ++i) {
+        unsigned mt = thai_mark_type(b->info[i].codepoint);
+        if (mt == THAI_NOT_MARK) {
+            unsigned ct = thai_consonant_type(b->info[i].codepoint);
+            above_state = above_start[ct];
+            below_state = below_start[ct];
+            base = i;
+            continue;
+        }
+        const uint8_t *a = above[above_state][mt], *w = below[below_state][mt];
+        above_state = a[1];
+        below_state = w[1];
+        unsigned action = a[0] != THAI_NOP ? a[0] : w[0];
+        if (action == THAI_RD) b->info[base].codepoint = thai_pua_shape(s, b->info[base].codepoint, action);
+        else b->info[i].codepoint = thai_pua_shape(s, b->info[i].codepoint, action);
+    }
+}
+
+static bool thai_above_base_mark(uint32_t u) {
+    u &= ~0x80u;
+    return (u >= 0x0E34 && u <= 0x0E37) || (u >= 0x0E47 && u <= 0x0E4E) || u == 0x0E31 || u == 0x0E3B;
+}
+
+static void preprocess_thai(const VegaShaping *s, const Plan *plan, VegaShaper *b) {
+    clear_output(b);
+    size_t count = b->len;
+    while (b->idx < count && b->successful) {
+        uint32_t u = b->info[b->idx].codepoint;
+        if ((u & ~0x80u) != 0x0E33) { /* not SARA AM */
+            next_glyph(b);
+            continue;
+        }
+        output_glyph(b, u - 0x0E33 + 0x0E4D); /* NIKHAHIT, continuing the character before */
+        if (b->out_len) b->out[b->out_len - 1].uprops |= UPROPS_CONTINUATION;
+        replace_glyph(b, u - 1); /* SARA AA */
+        if (!b->successful) break;
+        size_t end = b->out_len;
+        /* The NIKHAHIT counts as a mark (of class 0) when widths are zeroed. */
+        b->out[end - 2].uprops = (uint16_t)((b->out[end - 2].uprops & ~0x1Fu) | VEGA_MN);
+        size_t start = end - 2;
+        while (start > 0 && thai_above_base_mark(b->out[start - 1].codepoint)) start--;
+        if (start + 2 < end) {
+            merge_out_clusters(b, start, end);
+            Info t = b->out[end - 2];
+            memmove(b->out + start + 1, b->out + start, (end - start - 2) * sizeof(Info));
+            b->out[start] = t;
+        } else if (start)
+            merge_out_clusters(b, start - 1, end);
+    }
+    sync(b);
+    if (plan->shaper_flags & VEGA_THAI_PUA) thai_pua_shaping(s, b);
+}
+
 /* The shaper's part of the work at a pause in GSUB; whether it changed the
  * buffer. */
 static bool shaper_pause(const VegaShaping *s, const Plan *plan, VegaShaper *b, unsigned pause) {
@@ -3656,6 +3772,7 @@ long vega_shape(VegaShaper *b, const VegaShaping *s, const uint32_t *codes, size
     ensure_native_direction(b, &plan);
     if (plan.shaper == VEGA_SHAPER_HANGUL) preprocess_hangul(s, b);
     if (plan.shaper == VEGA_SHAPER_INDIC || plan.shaper == VEGA_SHAPER_USE) preprocess_vowel_constraints(&plan, b);
+    if (plan.shaper == VEGA_SHAPER_THAI) preprocess_thai(s, &plan, b);
 
     /* Mirror what the font mirrors; mark the rest for rtlm. */
     if (direction == VEGA_SHAPE_RTL)
