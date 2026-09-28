@@ -111,13 +111,47 @@ def normalization():
             excluded.update(range(first, last + 1))
     decompositions = {code: full(code) for code in single}
     compositions = sorted((d[0], d[1], code) for code, d in single.items() if len(d) == 2 and code not in excluded)
-    return ccc, decompositions, compositions
+    return ccc, decompositions, compositions, single
+
+
+JOINING = ['U', 'D', 'R', 'L', 'C', 'T']
+CATEGORIES = ['Cn', 'Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Mn', 'Mc', 'Me', 'Nd', 'Nl', 'No', 'Pc', 'Pd', 'Ps', 'Pe', 'Pi', 'Pf',
+              'Po', 'Sm', 'Sc', 'Sk', 'So', 'Zs', 'Zl', 'Zp', 'Cc', 'Cf', 'Cs', 'Co']
+
+
+def scripts():
+    """Each code point's Script (Unknown by default), and the scripts' names in order."""
+    names = ['Unknown', 'Common', 'Inherited']
+    values = [0] * (LAST + 1)
+    for first, last, fields, missing in ranges('Scripts.txt'):
+        if missing:
+            continue
+        if fields[0] not in names:
+            names.append(fields[0])
+        values[first:last + 1] = [names.index(fields[0])] * (last - first + 1)
+    return values, names
+
+
+def script_codes(names):
+    """Each script's ISO 15924 code (Latn for Latin), in the order of names."""
+    codes = {}
+    for line in (UCD / 'PropertyValueAliases.txt').read_text(encoding='utf-8').splitlines():
+        fields = [f.strip() for f in line.split('#', 1)[0].split(';')]
+        if len(fields) >= 3 and fields[0] == 'sc':
+            codes[fields[2]] = fields[1]
+    return [codes[name] for name in names]
 
 
 def main():
     bidi = derived('extracted/DerivedBidiClass.txt', BIDI, LONG)
+    joining = derived('extracted/DerivedJoiningType.txt', JOINING, {'Non_Joining': 'U'})
+    category = derived('extracted/DerivedGeneralCategory.txt', CATEGORIES)
+    script, script_names = scripts()
+    for index, name in ((0, 'Unknown'), (1, 'Common'), (2, 'Inherited'), (3, 'Latin'), (4, 'Greek'), (5, 'Cyrillic'),
+                        (7, 'Hebrew'), (8, 'Arabic'), (26, 'Hangul')):
+        assert script_names[index] == name, f'text.h names {name} {index}: now {script_names.index(name)}'
     table, size = two_stage('bidi', bidi)
-    ccc, decompositions, compositions = normalization()
+    ccc, decompositions, compositions, single = normalization()
     ccc_table, ccc_size = two_stage('ccc', ccc)
     brackets = []
     for first, _, fields, missing in ranges('BidiBrackets.txt'):
@@ -174,6 +208,56 @@ uint32_t vega_mirror(uint32_t code) {
     print(f'/* Canonical_Combining_Class ({ccc_size} bytes). */')
     print(ccc_table)
     print()
+    for name, values, kind, fallback in (('joining', joining, 'VegaJoining', 'VEGA_JOINING_U'),
+                                         ('category', category, 'VegaCategory', 'VEGA_CN'),
+                                         ('script', script, 'VegaScript', 'VEGA_SCRIPT_UNKNOWN')):
+        table, size = two_stage(name, values)
+        print()
+        print(f'/* {name} ({size} bytes). */')
+        print(table)
+        print()
+        print(f'{kind} vega_{name}(uint32_t code) {{')
+        print(f'    return code > 0x10FFFF ? {fallback} : ({kind}){name}_values[{name}_blocks[code >> 8] * 256u + (code & 255)];')
+        print('}')
+    print()
+    print(f'static const char *const script_names[{len(script_names)}] = {{')
+    for i in range(0, len(script_names), 6):
+        print('    ' + ', '.join(f'"{n}"' for n in script_names[i:i + 6]) + ',')
+    print('};')
+    print()
+    print('const char *vega_script_name(VegaScript script) {')
+    print(f'    return (unsigned)script < {len(script_names)} ? script_names[script] : "Unknown";')
+    print('}')
+    codes = script_codes(script_names)
+    print()
+    print('/* Their ISO 15924 codes, as tags (the first letter in the high byte). */')
+    print(f'static const uint32_t script_codes[{len(codes)}] = {{')
+    for i in range(0, len(codes), 8):
+        print('    ' + ', '.join('0x%08X' % int.from_bytes(c.encode(), 'big') for c in codes[i:i + 8]) + ',')
+    print('};')
+    print()
+    print('uint32_t vega_script_code(VegaScript script) {')
+    print(f'    return script_codes[(unsigned)script < {len(codes)} ? script : 0];')
+    print('}')
+    pictographic = [(first, last) for first, last, fields, missing in ranges('emoji/emoji-data.txt')
+                    if not missing and fields[0] == 'Extended_Pictographic']
+    print()
+    print('/* Extended_Pictographic (emoji-data.txt), as sorted ranges. */')
+    print(f'static const uint32_t pictographic[{len(pictographic)}][2] = {{')
+    for i in range(0, len(pictographic), 6):
+        print('    ' + ', '.join('{0x%04X, 0x%04X}' % r for r in pictographic[i:i + 6]) + ',')
+    print('};')
+    print('''
+bool vega_extended_pictographic(uint32_t code) {
+    size_t low = 0, high = sizeof(pictographic) / sizeof(*pictographic);
+    while (low < high) {
+        size_t middle = (low + high) / 2;
+        if (pictographic[middle][1] < code) low = middle + 1;
+        else high = middle;
+    }
+    return low < sizeof(pictographic) / sizeof(*pictographic) && pictographic[low][0] <= code;
+}''')
+    print()
     print('uint8_t vega_combining_class(uint32_t code) {')
     print('    return code > 0x10FFFF ? 0 : ccc_values[ccc_blocks[code >> 8] * 256u + (code & 255)];')
     print('}')
@@ -197,6 +281,21 @@ uint32_t vega_mirror(uint32_t code) {
     print('    if (row < 0) return 0;')
     print('    *out = decomposed + decompositions[row][1];')
     print('    return decompositions[row][2];')
+    print('}')
+    print()
+    print('/* Canonical decomposition mappings, one step (UnicodeData.txt): code, first, second (0 for one). */')
+    print(f'static const uint32_t steps[{len(single)}][3] = {{')
+    for code in sorted(single):
+        parts = single[code] + [0]
+        print(f'    {{0x{code:04X}, 0x{parts[0]:04X}, 0x{parts[1]:04X}}},')
+    print('};')
+    print()
+    print('bool vega_decomposition_step(uint32_t code, uint32_t *first, uint32_t *second) {')
+    print('    long row = find(&steps[0][0], sizeof(steps) / sizeof(*steps), 3, code);')
+    print('    if (row < 0) return false;')
+    print('    *first = steps[row][1];')
+    print('    *second = steps[row][2];')
+    print('    return true;')
     print('}')
     print()
     print('/* The primary composites: first, second, composite, by first then second. */')
