@@ -801,11 +801,15 @@ def scores(vega, module):
     return len(out)
 
 
-def interactive(vega, module, store=None, replace=None):
+def interactive(vega, module, store=None, replace=None, cut=False):
     """The terminal surface on a real pseudo-terminal: typed text commits
     with Enter, arrow keys and letters reach the app after Tab, Ctrl-C leaves
     and restores the terminal. With replace, it runs with --watch and replace
-    is then written over module: the terminal shows it, with the same tasks."""
+    is then written over module: the terminal shows it, with the same tasks.
+    With cut, every key comes a byte at a time, 50 ms apart, and an arrow's
+    escape sequence 150 ms after its first two bytes: the terminal's reads
+    are not its keys (a UTF-8 character or a sequence cut short waits for
+    its rest)."""
     import fcntl, pty, select, struct, termios, time
     pid, fd = pty.fork()
     if pid == 0:
@@ -827,7 +831,16 @@ def interactive(vega, module, store=None, replace=None):
     screen = read_for(0.3)
     # Then a click on line 5 (béton's row): a mouse report, press and release.
     for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u', b'\x1b[<0;3;5M\x1b[<0;3;5m'):
-        os.write(fd, keys)
+        if not cut:
+            os.write(fd, keys)
+        elif keys == b'\x1b[A':
+            os.write(fd, keys[:2])
+            screen += read_for(0.15)
+            os.write(fd, keys[2:])
+        else:
+            for k in range(len(keys)):
+                os.write(fd, keys[k:k + 1])
+                screen += read_for(0.05)
         screen += read_for(0.2)
     if replace:
         shutil.copy(replace, module.with_suffix('.tmp'))
@@ -1723,7 +1736,8 @@ def main():
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))
         report['browser_steps'] = browser(vega, modules['todo'], work)
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
-            interactive(vega, modules['todo'], work / 'interactive-store')
+            interactive(vega, modules['todo'], work / 'interactive-store') + \
+            interactive(vega, modules['todo'], cut=True)
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
         report['hangul'] = hangul(vega, modules['todo'])
         report['convention_findings'] = conventions(vega, aup, work, modules)

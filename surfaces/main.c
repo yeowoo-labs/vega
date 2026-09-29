@@ -426,53 +426,83 @@ static void handle_text(const char *bytes, size_t length) {
     handle_key(name);
 }
 
-/* Parse terminal input: escape sequences, control keys and UTF-8 text. */
-static bool handle_input(const unsigned char *in, size_t length) {
+/* Terminal input: escape sequences, control keys and UTF-8 text. A read may
+ * end inside a key (the terminal's reads are not its keys): an escape
+ * sequence, a mouse report or a character cut short waits in pending for
+ * the next read. An escape alone that nothing follows within ESCAPE_WAIT ms
+ * (vim's ttimeoutlen) is the Escape key; the rest of a key already begun
+ * waits up to SEQUENCE_WAIT ms (interactive gives up waiting). */
+enum { PENDING_MOST = 64, ESCAPE_WAIT = 100, SEQUENCE_WAIT = 1000 };
+static unsigned char pending[PENDING_MOST];
+static size_t pending_length;
+static double pending_since; /* vega_clock, when what waits began to */
+
+static double pending_wait(void) { return pending_length == 1 && pending[0] == 0x1B ? ESCAPE_WAIT : SEQUENCE_WAIT; }
+
+/* The key at an escape (length bytes from it): the bytes it took, or 0 when
+ * it may be cut short and more may come (final: none will). */
+static size_t escape(const unsigned char *in, size_t length, bool final) {
     static const struct { const char *sequence, *key; } sequences[] = {
         {"[A", "ArrowUp"}, {"[B", "ArrowDown"}, {"[C", "ArrowRight"}, {"[D", "ArrowLeft"}, {"[H", "Home"},
         {"[F", "End"}, {"OA", "ArrowUp"}, {"OB", "ArrowDown"}, {"OC", "ArrowRight"}, {"OD", "ArrowLeft"},
         {"OH", "Home"}, {"OF", "End"}, {"[1~", "Home"}, {"[7~", "Home"}, {"[4~", "End"}, {"[8~", "End"},
         {"[3~", "Delete"}, {"[5~", "PageUp"}, {"[6~", "PageDown"}};
-    for (size_t at = 0; at < length;) {
-        unsigned char c = in[at];
+    if (length >= 3 && in[1] == '[' && in[2] == '<') {
+        /* A mouse report: ESC [ < button ; column ; line, M on press, m on release. */
+        unsigned fields[3] = {0, 0, 0}, field = 0;
+        size_t end = 3;
+        for (; end < length && field < 3; ++end) {
+            if (in[end] >= '0' && in[end] <= '9') fields[field] = fields[field] * 10 + (unsigned)(in[end] - '0');
+            else if (in[end] == ';') ++field;
+            else break;
+        }
+        if (end == length) return final || length == PENDING_MOST ? length : 0; /* cut short (or no report: let go) */
+        if (in[end] == 'M' && field == 2 && fields[2]) mouse(fields[0], fields[2] - 1);
+        return end + 1;
+    }
+    bool longer = false; /* what came begins a sequence still to come whole */
+    for (size_t i = 0; i < sizeof(sequences) / sizeof(*sequences); ++i) {
+        size_t n = strlen(sequences[i].sequence);
+        if (1 + n <= length && !memcmp(in + 1, sequences[i].sequence, n)) {
+            handle_key(sequences[i].key);
+            return 1 + n;
+        }
+        longer = longer || (1 + n > length && !memcmp(in + 1, sequences[i].sequence, length - 1));
+    }
+    if (longer && !final) return 0;
+    handle_key("Escape");
+    return 1;
+}
+
+/* What came (after what waited): false on Ctrl-C or Ctrl-Q. */
+static bool handle_input(const unsigned char *in, size_t length, bool final) {
+    unsigned char bytes[PENDING_MOST + 256];
+    size_t total = pending_length;
+    memcpy(bytes, pending, pending_length);
+    if (length > sizeof(bytes) - total) length = sizeof(bytes) - total;
+    if (length) memcpy(bytes + total, in, length);
+    total += length;
+    pending_length = 0;
+    for (size_t at = 0; at < total;) {
+        unsigned char c = bytes[at];
+        size_t left = total - at, used = 1;
         if (c == 0x03 || c == 0x11) return false; /* Ctrl-C, Ctrl-Q */
-        if (c == 0x1B && at + 2 < length && in[at + 1] == '[' && in[at + 2] == '<') {
-            /* A mouse report: ESC [ < button ; column ; line, M on press, m on release. */
-            unsigned fields[3] = {0, 0, 0}, field = 0;
-            size_t end = at + 3;
-            for (; end < length && field < 3; ++end) {
-                if (in[end] >= '0' && in[end] <= '9') fields[field] = fields[field] * 10 + (unsigned)(in[end] - '0');
-                else if (in[end] == ';') ++field;
-                else break;
-            }
-            if (end < length && in[end] == 'M' && field == 2 && fields[2]) mouse(fields[0], fields[2] - 1);
-            at = end + 1;
-            continue;
-        }
-        if (c == 0x1B) {
-            size_t matched = 0;
-            for (size_t i = 0; i < sizeof(sequences) / sizeof(*sequences) && !matched; ++i) {
-                size_t n = strlen(sequences[i].sequence);
-                if (at + 1 + n <= length && !memcmp(in + at + 1, sequences[i].sequence, n)) {
-                    handle_key(sequences[i].key);
-                    matched = 1 + n;
-                }
-            }
-            if (!matched) { handle_key("Escape"); matched = 1; }
-            at += matched;
-            continue;
-        }
-        if (c == '\r' || c == '\n') handle_key("Enter");
+        if (c == 0x1B) used = escape(bytes + at, left, final);
+        else if (c == '\r' || c == '\n') handle_key("Enter");
         else if (c == 0x7F || c == 0x08) handle_key("Backspace");
         else if (c == '\t') handle_key("Tab");
         else if (c >= 0x20) {
-            size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
-            if (at + n > length) n = length - at;
-            handle_text((const char *)in + at, n);
-            at += n;
-            continue;
+            used = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            if (used > left) used = final ? left : 0;
+            if (used) handle_text((const char *)bytes + at, used);
         }
-        ++at;
+        if (!used) { /* the rest waits for the next read */
+            memcpy(pending, bytes + at, left < PENDING_MOST ? left : PENDING_MOST);
+            pending_length = left < PENDING_MOST ? left : PENDING_MOST;
+            pending_since = vega_clock();
+            return true;
+        }
+        at += used;
     }
     return true;
 }
@@ -501,8 +531,16 @@ static int interactive(void) {
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
         int timeout = screen.ticks ? 16 : watched ? 200 : -1;
         if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
+        if (pending_length) { /* a key begun waits for its rest (an escape: or is the Escape key) */
+            double left = pending_since + pending_wait() - vega_clock();
+            if (left < 0) left = 0;
+            if (timeout < 0 || left < timeout) timeout = (int)left + 1;
+        }
         int ready = poll(&wait, 1, timeout);
         app.now = vega_now();
+        if (ready == 0 && pending_length && vega_clock() - pending_since >= pending_wait() &&
+            !handle_input(NULL, 0, true))
+            break;
         if (ready == 0) {
             if (screen.ticks) pure_app_frame(&app);
             if (module_changed()) vega_timers_start(&timers, app.module, vega_clock());
@@ -511,7 +549,7 @@ static int interactive(void) {
         if (ready < 0) continue; /* a signal, such as a resize */
         unsigned char in[256];
         ssize_t got = read(STDIN_FILENO, in, sizeof(in));
-        if (got <= 0 || !handle_input(in, (size_t)got)) break;
+        if (got <= 0 || !handle_input(in, (size_t)got, false)) break;
     }
     restore_terminal();
     drawn = NULL;
