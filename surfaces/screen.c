@@ -11,23 +11,29 @@ double vega_now(void) {
     return floor((double)t.tv_sec * 1000 + (double)t.tv_nsec / 1e6);
 }
 
-void vega_timers_start(VegaTimers *timers, const PureModule *m, double now) {
-    for (uint32_t i = 0; i < m->inputs; ++i)
-        timers->next[i] = m->input[i].kind == PURE_KIND_TIMER ? now + m->input[i].period : 0;
+double vega_clock(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return floor((double)t.tv_sec * 1000 + (double)t.tv_nsec / 1e6);
 }
 
-long vega_timers_run(VegaTimers *timers, PureApp *app, double now, bool *ticked) {
+void vega_timers_start(VegaTimers *timers, const PureModule *m, double clock) {
+    for (uint32_t i = 0; i < m->inputs; ++i)
+        timers->next[i] = m->input[i].kind == PURE_KIND_TIMER ? clock + m->input[i].period : 0;
+}
+
+long vega_timers_run(VegaTimers *timers, PureApp *app, double clock, bool *ticked) {
     const PureModule *m = app->module;
     double soonest = -1;
     for (uint32_t i = 0; i < m->inputs; ++i) {
         if (m->input[i].kind != PURE_KIND_TIMER) continue;
-        if (timers->next[i] <= now) {
-            app->now = now;
+        if (timers->next[i] <= clock) {
+            app->now = vega_now();
             pure_app_tick(app, i); /* a failed tick changes nothing, as any failed event */
             *ticked = true;
-            timers->next[i] = now + m->input[i].period;
+            timers->next[i] = clock + m->input[i].period;
         }
-        if (soonest < 0 || timers->next[i] - now < soonest) soonest = timers->next[i] - now;
+        if (soonest < 0 || timers->next[i] - clock < soonest) soonest = timers->next[i] - clock;
     }
     return soonest < 0 ? -1 : (long)ceil(soonest);
 }

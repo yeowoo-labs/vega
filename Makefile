@@ -99,5 +99,6 @@ check-text: $(BUILD)/vega-symbols $(BUILD)/test-text $(BUILD)/test-layout check-
 
 check: $(BUILD)/vega $(BUILD)/vega-surface.so check-text
 	$(MAKE) -C $(AUP) build/aup
-	$(MAKE) -C $(PURE) build/pure-serve
-	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve
+	$(MAKE) -C $(PURE) build/pure-serve build/clock-back.so
+	python3 tests/check.py --vega $(BUILD)/vega --symbols $(BUILD)/vega-symbols --aup $(AUP)/build/aup --serve $(PURE)/build/pure-serve \
+		--clock-back $(PURE)/build/clock-back.so

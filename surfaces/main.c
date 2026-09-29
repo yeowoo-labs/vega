@@ -483,7 +483,7 @@ static int interactive(void) {
     VegaGrid grid = {0};
     drawn = &grid;
     VegaTimers timers;
-    vega_timers_start(&timers, app.module, vega_now());
+    vega_timers_start(&timers, app.module, vega_clock());
     for (;;) {
         if (resized) {
             struct winsize size;
@@ -494,7 +494,7 @@ static int interactive(void) {
         }
         /* Tick what is due, draw, then wait for input, a frame or the next tick. */
         bool ticked = false;
-        long due = vega_timers_run(&timers, &app, vega_now(), &ticked);
+        long due = vega_timers_run(&timers, &app, vega_clock(), &ticked);
         char line[VEGA_TEXT + 4];
         vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
         paint_terminal(&grid);
@@ -505,7 +505,7 @@ static int interactive(void) {
         app.now = vega_now();
         if (ready == 0) {
             if (screen.ticks) pure_app_frame(&app);
-            if (module_changed()) vega_timers_start(&timers, app.module, app.now);
+            if (module_changed()) vega_timers_start(&timers, app.module, vega_clock());
             continue;
         }
         if (ready < 0) continue; /* a signal, such as a resize */
@@ -647,7 +647,7 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         signal(SIGTERM, on_stop);
     }
     VegaTimers timers;
-    vega_timers_start(&timers, app.module, vega_now());
+    vega_timers_start(&timers, app.module, vega_clock());
     char path[512] = "";
     unsigned long differing = 0;
     bool open_input = true, printed = false;
@@ -664,7 +664,7 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
     bool dirty = true;
     while (!stopping && !(node && node->stopping(node->host))) {
         bool ticked = false;
-        long due = node ? -1 : vega_timers_run(&timers, &app, vega_now(), &ticked);
+        long due = node ? -1 : vega_timers_run(&timers, &app, vega_clock(), &ticked);
         PureSnapshot *snapshot = node ? node->read(node->host, &app) : NULL;
         dirty = dirty || ticked || snapshot || access_acted;
         access_acted = false;

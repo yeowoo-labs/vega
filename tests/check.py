@@ -690,6 +690,46 @@ def timing(vega, module):
     return len(out), heard
 
 
+BEATS_SPEC = """state beats = 0
+input beat = every 20 ms
+on beat { beats = beats + 1 }
+view count = beats
+"""
+
+
+def clock_set_back(vega, aup, work, clock_back):
+    """The terminal's timers wait on the monotonic clock: with the wall clock
+    set back an hour 0.2 s in (Pure's build/clock-back.so, LD_PRELOAD), a
+    timer of 20 ms goes on ticking (review 004: it stopped until the wall
+    clock came back to the tick it had waited for). The ticks are the
+    app's, in its store."""
+    import pty, select, time
+    source, module, store = work / 'beats.aup', work / 'beats.pmod', work / 'beats-store'
+    source.write_text(BEATS_SPEC)
+    built = run(aup, 'build', source, '-o', module)
+    assert built.returncode == 0, built.stderr
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ['LD_PRELOAD'] = str(clock_back)
+        os.execv(str(vega), [str(vega), 'tui', str(module), '--store', str(store)])
+    end = time.time() + 0.8
+    while time.time() < end:
+        if select.select([fd], [], [], 0.05)[0]:
+            try:
+                os.read(fd, 65536)
+            except OSError:
+                break
+    os.write(fd, b'\x03')
+    time.sleep(0.2)
+    _, status = os.waitpid(pid, 0)
+    os.close(fd)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    shown_lines = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
+    beats = next(int(line.split(':')[1]) for line in shown_lines if line.startswith('count'))
+    assert beats >= 20, shown_lines
+    return beats
+
+
 def hosts(vega, serve, module, work):
     """examples/board.aup, one app and one store for people and programs: the
     CLI adds and moves cards, pure-serve serves the same store as a JSON API
@@ -1653,6 +1693,7 @@ def main():
     parser.add_argument('--vega', type=Path, required=True)
     parser.add_argument('--aup', type=Path, required=True)
     parser.add_argument('--serve', type=Path, required=True)
+    parser.add_argument('--clock-back', type=Path, help="Pure's build/clock-back.so: the wall clock set back")
     parser.add_argument('--symbols', type=Path)
     parser.add_argument('--seeds', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=3)
@@ -1672,6 +1713,8 @@ def main():
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])
         report['table_lines'] = scores(vega, modules['scores'])
         report['timed_lines'], report['ticks_heard'] = timing(vega, modules['stopwatch'])
+        if args.clock_back:
+            report['beats_with_clock_set_back'] = clock_set_back(vega, aup, work, args.clock_back.resolve())
         report['board_rows_across_hosts'] = hosts(vega, args.serve.resolve(), modules['board'], work)
         report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))

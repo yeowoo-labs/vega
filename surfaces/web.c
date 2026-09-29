@@ -418,11 +418,11 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
     static Client clients[CLIENTS];
     for (unsigned i = 0; i < CLIENTS; ++i) clients[i].fd = -1;
     VegaTimers timers;
-    vega_timers_start(&timers, app->module, vega_now());
+    vega_timers_start(&timers, app->module, vega_clock());
     while (!stopping) {
         /* Tick what is due; every page hears of it this round, without waiting. */
         bool ticked = false;
-        long due = vega_timers_run(&timers, app, vega_now(), &ticked);
+        long due = vega_timers_run(&timers, app, vega_clock(), &ticked);
         struct pollfd fds[CLIENTS + 1];
         unsigned slot[CLIENTS + 1], count = 1;
         fds[0] = (struct pollfd){listener, POLLIN, 0};
@@ -441,7 +441,7 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
         if (ready == 0 && screen->ticks) changed = pure_app_frame(app) == PURE_OK;
         if (reload && reload()) { /* a new module: every page draws it */
             changed = true;
-            vega_timers_start(&timers, app->module, app->now);
+            vega_timers_start(&timers, app->module, vega_clock());
         }
         if (fds[0].revents & POLLIN)
             for (int fd; (fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)) >= 0;) {
