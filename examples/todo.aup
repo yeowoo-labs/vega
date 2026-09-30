@@ -4,8 +4,8 @@ use vega
 
 record Task {
   title: text
-  done = 0
-  urgent = 0
+  done = false
+  urgent = false
 }
 
 state tasks: list of Task

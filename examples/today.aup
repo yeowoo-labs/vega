@@ -5,7 +5,7 @@ use vega
 
 record Task {
   title: text
-  done = 0
+  done = false
 }
 
 state tasks: list of Task

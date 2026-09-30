@@ -95,7 +95,7 @@ class Todo:
             self.at = text
             return True
         if name == 'add':
-            self.tasks.append({'title': text, 'done': 0, 'urgent': 0})
+            self.tasks.append({'title': text, 'done': False, 'urgent': False})
             self.at = len(self.tasks) - 1
             return True
         last = max(len(self.tasks) - 1, 0)
@@ -103,8 +103,8 @@ class Todo:
             return False
         if name == 'up': self.at = max(self.at - 1, 0)
         elif name == 'down': self.at = min(self.at + 1, last)
-        elif name == 'toggle': self.tasks[self.at]['done'] = int(not self.tasks[self.at]['done'])
-        elif name == 'urgent': self.tasks[self.at]['urgent'] = int(not self.tasks[self.at]['urgent'])
+        elif name == 'toggle': self.tasks[self.at]['done'] = not self.tasks[self.at]['done']
+        elif name == 'urgent': self.tasks[self.at]['urgent'] = not self.tasks[self.at]['urgent']
         elif name == 'drop':
             del self.tasks[self.at]
             self.at = min(self.at, max(len(self.tasks) - 1, 0))
@@ -527,7 +527,7 @@ def split(vega, module, work, seeds, steps=200):
             if roll < 0.3:
                 word = rng.choice(WORDS)
                 script.append('text ' + (word.encode().hex() or '-'))
-                tasks.append({'title': word, 'done': 0})
+                tasks.append({'title': word, 'done': False})
                 at = len(tasks) - 1
             elif roll < 0.5:
                 name, rows = rng.choice([('open', opened), ('done', closed)])
@@ -539,7 +539,7 @@ def split(vega, module, work, seeds, steps=200):
                 script.append(f'key {key}')
                 if key == 'ArrowUp': at = max(at - 1, 0)
                 elif key == 'ArrowDown': at = min(at + 1, max(len(tasks) - 1, 0))
-                elif tasks: tasks[at]['done'] = int(not tasks[at]['done'])
+                elif tasks: tasks[at]['done'] = not tasks[at]['done']
             if rng.random() < 0.3:
                 script.append('show')
                 opened = [i for i, t in enumerate(tasks) if not t['done']]
@@ -1898,6 +1898,53 @@ def screen_meaning(vega, aup, work):
     return {'values': len(SCREEN_TEXTS), 'surfaces': 4}
 
 
+BOOL_APP = """use vega
+record Row {
+  n = 0
+}
+state lit = false
+state rows: list of Row
+input flip = key Space
+input add = text
+on flip.down { lit = !lit }
+on add { rows.append(Row { n: add.chars }) }
+view shown = lit
+view sizes = each r in rows {
+  n = r.n
+  over = r.n > 2
+}
+"""
+
+
+def bools(vega, aup, work):
+    """A bool shows as true or false on every surface (the CLI, the TUI's
+    cells, speech and the web surface's JSON), as a string shows it: never
+    as 1 or 0."""
+    source, module = work / 'bools.aup', work / 'bools.pmod'
+    source.write_text(BOOL_APP)
+    built = run(aup, 'build', source, '-o', module, env=dict(os.environ, AUP_PATH=str(ROOT / 'lib')))
+    assert built.returncode == 0, built.stderr
+    script = 'show\nkey Space\ntext 61\ntext 61626364\nshow\n'  # a has one character, abcd four
+    out = run(vega, 'cli', module, stdin=script).stdout.splitlines()
+    assert out == ['shown: false', 'sizes (0)', '  n  over', 'shown: true', 'sizes (2)', '  n  over', '> 1  false',
+                   '  4  true'], out
+    dump = run(vega, 'tui', module, '--dump', '30x8', stdin=script).stdout.splitlines()
+    assert all(line in dump for line in ['|shown  false\tmuted', '|shown  true\tmuted', '>> 1  false', '|  4  true']), dump
+    said = run(vega, 'say', module, stdin=script).stdout.splitlines()
+    assert all(line in said for line in ['shown: false.', 'shown: true.', 'Item 1 of 2: n 1, over false.']), said
+    surface = WebSurface(vega, module)
+    try:
+        surface.call('POST', '/key', 'Space')
+        for text in ('a', 'abcd'): surface.call('POST', '/text', text)
+        screen = json.loads(surface.call('GET', '/screen?rows=5')[1])
+    finally:
+        surface.stop()
+    assert screen['fields'] == [{'name': 'shown', 'text': 'true'}], screen['fields']
+    table = screen['parts'][0]
+    assert table['columns'] == ['n', 'over'] and [item['cells'] for item in table['items']] == [['1', 'false'], ['4', 'true']], table
+    return len(out) + len(dump) + len(said)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -1928,6 +1975,7 @@ def main():
         report['board_rows_across_hosts'] = hosts(vega, args.serve.resolve(), modules['board'], work)
         report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
+        report['bool_lines'] = bools(vega, aup, work)
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))

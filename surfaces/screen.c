@@ -163,10 +163,13 @@ bool vega_text(PureApp *app, uint32_t view, size_t row, char out[VEGA_TEXT], siz
     ++evaluations;
     *length = 0;
     out[0] = 0;
-    if (m->view_type[view] == PURE_VIEW_NUM) {
+    if (m->view_type[view] == PURE_VIEW_NUM || m->view_type[view] == PURE_VIEW_BOOL) {
         double value;
         if (!(column ? pure_app_cell(app, view, row, &value) : pure_app_view(app, view, &value))) return false;
-        *length = pure_format_number(value, out);
+        if (m->view_type[view] == PURE_VIEW_BOOL) { /* a bool is written true or false, as a string shows it */
+            *length = value ? 4 : 5;
+            memcpy(out, value ? "true" : "false", *length);
+        } else *length = pure_format_number(value, out);
         out[*length] = 0;
         return true;
     }

@@ -6,7 +6,7 @@ record Lap {
   at = 0
 }
 
-state running = 0
+state running = false
 state started = 0
 state elapsed = 0
 state laps: list of Lap
