@@ -1701,6 +1701,112 @@ def width_of(character):
     return width(character) or 0
 
 
+
+def shared_board(serve, module, work):
+    """Two nodes of examples/shared-board.aup, Alice's and Bob's, each with a
+    key of its own, linked both ways over pure:// (sealed, each taking the
+    other as its sender). Cards added, moved and given on either reach the
+    other, and both boards end the same. Then Bob's node is cut off (it
+    listens and sends where no one is) while both give one card to someone,
+    Bob first and Alice after, and Bob adds a card; joined again, both
+    boards take Alice's, the later change, and Bob's card."""
+    import http.client
+    import select
+    import signal
+    import socket
+    import time
+    nodes, keys = {}, {}
+
+    def udp_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(('127.0.0.1', 0))
+            return probe.getsockname()[1]
+
+    ports = {'alice': udp_port(), 'bob': udp_port()}
+
+    def launch(args):
+        process = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ready, _, _ = select.select([process.stdout], [], [], 10)
+        line = process.stdout.readline() if ready else b''
+        assert line, 'node did not start'
+        return process, json.loads(line)
+
+    def stop(name):
+        process = nodes.pop(name)[0]
+        process.send_signal(signal.SIGTERM)
+        _, error = process.communicate(timeout=30)
+        assert process.returncode == 0, error[-800:]
+
+    for name in ('alice', 'bob'):  # the keys first
+        process, first = launch([serve, '--module', module, '--store', work / f'board-{name}', '--port', 0,
+                                 '--key', work / f'board-{name}.key'])
+        keys[name] = first['public_key']
+        nodes[name] = (process, 0)
+        stop(name)
+
+    def start(name, cut=False):
+        other = 'bob' if name == 'alice' else 'alice'
+        listen, to = (udp_port(), udp_port()) if cut else (ports[name], ports[other])
+        process, first = launch([serve, '--module', module, '--store', work / f'board-{name}', '--port', 0,
+                                 '--key', work / f'board-{name}.key', '--name', name, '--link-port', listen,
+                                 '--send', f'changed=pure://127.0.0.1:{to}/remote', '--seal', f'changed={keys[other]}',
+                                 '--sender', f'{other}.changed={keys[other]}'])
+        assert first['name'] == name, first
+        nodes[name] = (process, first['port'])
+
+    def call(name, path, body=None):
+        connection = http.client.HTTPConnection('127.0.0.1', nodes[name][1], timeout=10)
+        headers = {}
+        if body is not None:
+            data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+            headers = {'Content-Length': str(len(data)),
+                       'Content-Type': 'text/plain' if isinstance(body, str) else 'application/json'}
+        connection.request('POST' if body is not None else 'GET', path, data if body is not None else None, headers)
+        answer = connection.getresponse()
+        text = answer.read().decode()
+        connection.close()
+        return answer.status, text
+
+    def board(name):
+        return sorted((c['label'], c['badge']) for c in json.loads(call(name, '/views/cards_list')[1])['items'])
+
+    def agree(expected=None, seconds=20):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            a, b = board('alice'), board('bob')
+            if a == b and (expected is None or a == expected):
+                return a
+            time.sleep(0.05)
+        raise AssertionError((board('alice'), board('bob'), expected))
+
+    try:
+        for name in ('alice', 'bob'):
+            start(name)
+            assert call(name, '/inputs/name', {'name': name})[0] == 200
+        for title in ('plan the week', 'write the tests'):
+            assert call('alice', '/inputs/add', title)[0] == 200
+        assert call('bob', '/inputs/add', 'fix the build')[0] == 200
+        assert call('alice', '/inputs/forward', '')[0] == 200  # write the tests: doing
+        agree(seconds=20)
+        assert call('bob', '/inputs/assign', {'title': 'plan the week', 'who': 'bob'})[0] == 200
+        together = agree([('fix the build', 'to do'), ('plan the week', 'bob, to do'), ('write the tests', 'doing')])
+        stop('bob')
+        start('bob', cut=True)
+        assert call('bob', '/inputs/assign', {'title': 'fix the build', 'who': 'bob'})[0] == 200
+        time.sleep(0.05)  # Alice's is the later change
+        assert call('alice', '/inputs/assign', {'title': 'fix the build', 'who': 'alice'})[0] == 200
+        assert call('bob', '/inputs/add', 'made while cut off')[0] == 200
+        time.sleep(0.5)
+        assert ('fix the build', 'bob, to do') in board('bob') and ('fix the build', 'alice, to do') in board('alice')
+        stop('bob')
+        start('bob')
+        joined = agree([('fix the build', 'alice, to do'), ('made while cut off', 'to do'), ('plan the week', 'bob, to do'),
+                        ('write the tests', 'doing')])
+    finally:
+        for name in list(nodes):
+            stop(name)
+    return {'cards': len(together), 'after_joining': len(joined)}
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -1717,7 +1823,7 @@ def main():
         work = Path(directory)
         env = dict(os.environ, AUP_PATH=str(ROOT / 'lib'))
         modules = {}
-        for name in ('todo', 'scores', 'today', 'stopwatch', 'board', 'messenger'):
+        for name in ('todo', 'scores', 'today', 'stopwatch', 'board', 'messenger', 'shared-board'):
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
@@ -1751,6 +1857,7 @@ def main():
             report['live_display'] = live_display(vega, modules['todo'], work)
             report['node_display'] = node_display(vega, args.serve.resolve(), modules['todo'], work)
             report['messenger'] = messenger(vega, args.serve.resolve(), modules['messenger'], work)
+        report['shared_board'] = shared_board(args.serve.resolve(), modules['shared-board'], work)
     print(json.dumps(report))
 
 

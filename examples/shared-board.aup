@@ -1,0 +1,96 @@
+# A board two nodes share. A change to a card goes whole to the other node
+# (send changed { ..at }), and a card the other node sends is taken whole
+# (cards[k] = Card { ..remote }) when it is the later change: by its time,
+# then by the node's name. So both boards end the same, whatever order the
+# changes come in, and after the nodes were cut apart and joined again.
+#
+# Each node runs it with a key of its own and links to the other, sealed:
+#   pure-serve --module shared-board.pmod --store a --key a.key --name a \
+#       --link-port 7001 --send changed=pure://127.0.0.1:7002/remote \
+#       --seal changed=B_KEY --sender b.changed=B_KEY
+# then tells the app its name: POST /inputs/name {"name": "a"}. Upgraded
+# one node after the other, a node takes the other's changes by field name
+# (Pure docs/design/014-fields-by-name.md): add a field to the card and the
+# output, nowhere else.
+use vega
+
+record Card {
+  title: text
+  who: text  # whose card it is
+  lane = 0   # 0 to do, 1 doing, 2 done
+  node: text # the node that changed it last
+  since = 0  # when: milliseconds since 1970
+}
+
+state cards: list of Card by title
+state at: index of cards
+state me: text = "me"
+
+input add = text
+input forward = key ArrowRight
+input back = key ArrowLeft
+input up = key ArrowUp
+input down = key ArrowDown
+input name = message {
+  name: text
+}
+input assign = message {
+  title: text
+  who: text
+}
+output changed = message {
+  title: text
+  who: text
+  lane: u32
+  node: text
+  since: number
+}
+input remote = message like changed
+
+fn lane_name(lane) = if lane == 0 { "to do" } else if lane == 1 { "doing" } else { "done" }
+
+on add {
+  cards.add(Card { title: add, since: now, node: me })
+  at = cards[add]
+  send changed { ..at }
+}
+on forward.down {
+  at.lane = min(at.lane + 1, 2)
+  at.since = now
+  at.node = me
+  send changed { ..at }
+}
+on back.down {
+  at.lane = max(at.lane - 1, 0)
+  at.since = now
+  at.node = me
+  send changed { ..at }
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on name { me = name.name }
+on assign {
+  require cards.has(assign.title)
+  cards[assign.title].who = assign.who
+  cards[assign.title].since = now
+  cards[assign.title].node = me
+  send changed { ..cards[assign.title] }
+}
+on remote {
+  if !cards.has(remote.title) {
+    cards.add(Card { ..remote })
+  } else if (remote.since > cards[remote.title].since ||
+             (remote.since == cards[remote.title].since && remote.node > cards[remote.title].node)) {
+    cards[remote.title] = Card { ..remote }
+  }
+}
+
+view title = "{me}'s board"
+view counts = "{count(c in cards where c.lane == 0)} to do, {count(c in cards where c.lane == 1)} doing, {count(c in cards where c.lane == 2)} done"
+
+view cards_list = each c in cards {
+  label = c.title
+  badge = if c.who == "" { lane_name(c.lane) } else { "{c.who}, {lane_name(c.lane)}" }
+  tone = if c.lane == 2 { vega.muted } else { vega.when(c.lane == 1, vega.accent) }
+}
+view cards_list_focus = at.position
