@@ -59,8 +59,9 @@ long vega_timers_run(VegaTimers *, PureApp *, double clock, bool *ticked);
  * returns how many there were. */
 unsigned vega_check(const PureModule *, void (*report)(void *, const char *name, const char *message), void *context);
 
-/* A view (row ignored) or a column at a row as text; numbers in Pure's
- * shortest form. false when it has no value (for example a missing item). */
+/* A view (row ignored) or a column at a row as text: numbers in Pure's
+ * shortest form, bools as true or false, i64s with every digit. false when
+ * it has no value (for example a missing item). */
 bool vega_text(PureApp *, uint32_t view, size_t row, char out[VEGA_TEXT], size_t *length);
 bool vega_number(PureApp *, uint32_t view, size_t row, double *out);
 size_t vega_rows(PureApp *, const VegaPart *);

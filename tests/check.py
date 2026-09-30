@@ -1945,6 +1945,50 @@ def bools(vega, aup, work):
     return len(out) + len(dump) + len(said)
 
 
+I64_APP = """use vega
+record Row {
+  id: i64
+}
+state rows: list of Row by id
+state next: i64 = 9007199254740992
+input add = key Space
+on add.down {
+  rows.add(Row { id: next })
+  next = next + 1
+}
+view last = next
+view ids = each r in rows {
+  id = r.id
+}
+"""
+
+
+def integers(vega, aup, work):
+    """An i64 shows every digit on every surface (the CLI, the TUI's cells,
+    speech and the web surface's JSON): past 2^53 too, where a number would
+    round."""
+    source, module = work / 'integers.aup', work / 'integers.pmod'
+    source.write_text(I64_APP)
+    built = run(aup, 'build', source, '-o', module, env=dict(os.environ, AUP_PATH=str(ROOT / 'lib')))
+    assert built.returncode == 0, built.stderr
+    script = 'key Space\nkey Space\nshow\n'
+    out = run(vega, 'cli', module, stdin=script).stdout.splitlines()
+    assert out == ['last: 9007199254740994', 'ids (2)', '  id', '> 9007199254740992', '  9007199254740993'], out
+    dump = run(vega, 'tui', module, '--dump', '30x8', stdin=script).stdout.splitlines()
+    assert all(line in dump for line in ['|last  9007199254740994\tmuted', '>> 9007199254740992', '|  9007199254740993']), dump
+    said = run(vega, 'say', module, stdin=script).stdout.splitlines()
+    assert all(line in said for line in ['last: 9007199254740994.', 'Item 1 of 2: id 9007199254740992.']), said
+    surface = WebSurface(vega, module)
+    try:
+        for _ in range(2): surface.call('POST', '/key', 'Space')
+        screen = json.loads(surface.call('GET', '/screen?rows=5')[1])
+    finally:
+        surface.stop()
+    assert screen['fields'] == [{'name': 'last', 'text': '9007199254740994'}], screen['fields']
+    assert [item['cells'] for item in screen['parts'][0]['items']] == [['9007199254740992'], ['9007199254740993']], screen
+    return len(out) + len(dump) + len(said)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -1976,6 +2020,7 @@ def main():
         report['hot_swap_lines'] = hot_swap(vega, aup, work)
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['bool_lines'] = bools(vega, aup, work)
+        report['i64_lines'] = integers(vega, aup, work)
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))

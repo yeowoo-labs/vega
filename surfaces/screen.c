@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "vega.h"
 #include "module-text.h"
+#include <inttypes.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
@@ -163,6 +164,12 @@ bool vega_text(PureApp *app, uint32_t view, size_t row, char out[VEGA_TEXT], siz
     ++evaluations;
     *length = 0;
     out[0] = 0;
+    if (m->view_type[view] == PURE_VIEW_I64) { /* every digit */
+        int64_t value;
+        if (!(column ? pure_app_cell_i64(app, view, row, &value) : pure_app_view_i64(app, view, &value))) return false;
+        *length = (size_t)snprintf(out, VEGA_TEXT, "%" PRId64, value);
+        return true;
+    }
     if (m->view_type[view] == PURE_VIEW_NUM || m->view_type[view] == PURE_VIEW_BOOL) {
         double value;
         if (!(column ? pure_app_cell(app, view, row, &value) : pure_app_view(app, view, &value))) return false;
