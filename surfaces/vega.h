@@ -91,8 +91,16 @@ unsigned long vega_evaluations(void);
 unsigned vega_width(uint32_t codepoint);
 /* The code point at text[at] (valid UTF-8) and the bytes it takes. */
 size_t vega_decode(const char *text, size_t length, size_t at, uint32_t *codepoint);
-/* A control character shown as its control picture (U+2400 block), else itself. */
+/* What a value's code point is shown as, on every surface: a control
+ * character as its control picture (the U+2400 block, DEL too), a C1 control
+ * as U+FFFD, a line or paragraph separator as U+2424 (a value never breaks
+ * its line), else itself. */
 uint32_t vega_visible(uint32_t codepoint);
+/* In a terminal's cell (the TUI, the CLI) also the controls that would turn
+ * the rest of the terminal's line around (embeddings, overrides, isolates),
+ * as U+FFFD: pixels lay a value's text out themselves, within its place. */
+uint32_t vega_cell(uint32_t codepoint);
+/* The cells text takes, as vega_cell shows it. */
 unsigned vega_text_width(const char *text, size_t length);
 
 /* CLI: everything, as plain lines for pipes; color only when asked. */

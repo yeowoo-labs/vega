@@ -6,15 +6,16 @@ static const char *const tone_names[VEGA_TONES] = {"normal", "muted", "accent", 
 
 /* ---- CLI ------------------------------------------------------------ */
 
-/* Text for a pipe: control characters become their pictures so a value never
- * breaks a line. */
+/* Text for a pipe: what would act on the output instead of being shown
+ * becomes its picture (vega_cell), so a value never breaks a line nor turns
+ * one around. */
 static void put_text(FILE *out, const char *text, size_t length) {
     for (size_t at = 0; at < length;) {
         uint32_t codepoint;
         size_t size = vega_decode(text, length, at, &codepoint);
-        if (vega_visible(codepoint) == codepoint) fwrite(text + at, 1, size, out);
+        if (vega_cell(codepoint) == codepoint) fwrite(text + at, 1, size, out);
         else {
-            uint32_t picture = vega_visible(codepoint);
+            uint32_t picture = vega_cell(codepoint);
             fputc(0xE0 | (int)(picture >> 12), out);
             fputc(0x80 | (int)(picture >> 6 & 0x3F), out);
             fputc(0x80 | (int)(picture & 0x3F), out);
@@ -125,10 +126,29 @@ void vega_print(FILE *out, PureApp *app, const VegaScreen *screen, bool color) {
 
 /* ---- NUI ------------------------------------------------------------ */
 
-/* Spoken text: control characters become spaces, and trailing ones go. */
+/* A code point as it is said: what would act on the output (controls, line
+ * and paragraph separators) as a space, the controls that turn text around
+ * not at all (0), else itself. */
+static uint32_t spoken(uint32_t codepoint) {
+    if (vega_visible(codepoint) != codepoint) return ' ';
+    return vega_cell(codepoint) != codepoint ? 0 : codepoint;
+}
+
+/* Spoken text: as spoken says, without the spaces it ends with. */
 static void speak(FILE *out, const char *text, size_t length) {
-    while (length && ((unsigned char)text[length - 1] <= 0x20)) --length;
-    for (size_t i = 0; i < length; ++i) fputc((unsigned char)text[i] < 0x20 ? ' ' : text[i], out);
+    size_t end = 0;
+    for (size_t at = 0; at < length;) {
+        uint32_t codepoint, said;
+        at += vega_decode(text, length, at, &codepoint);
+        if ((said = spoken(codepoint)) && said != ' ') end = at;
+    }
+    for (size_t at = 0; at < end;) {
+        uint32_t codepoint, said;
+        size_t size = vega_decode(text, end, at, &codepoint);
+        if ((said = spoken(codepoint)) == ' ') fputc(' ', out);
+        else if (said) fwrite(text + at, 1, size, out);
+        at += size;
+    }
 }
 
 /* "Item 2 of 3: milk, done." Tones other than normal and muted are said. */
@@ -292,7 +312,7 @@ static void put_cells(Pen *pen, const char *text, size_t length) {
     for (size_t at = 0; at < length;) {
         uint32_t codepoint;
         at += vega_decode(text, length, at, &codepoint);
-        codepoint = vega_visible(codepoint);
+        codepoint = vega_cell(codepoint);
         unsigned width = vega_width(codepoint);
         if (!width) {
             if (pen->column && !line[pen->column - 1].mark) {

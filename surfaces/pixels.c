@@ -312,8 +312,7 @@ static bool set_type(const VegaGrid *grid, VegaFace *face, uint32_t *out, size_t
             for (size_t at = 0; at < t->length;) {
                 uint32_t code;
                 at += vega_decode(grid->text + t->at, t->length, at, &code);
-                code = vega_visible(code);
-                w.codes[count++] = code == 0x2028 || code == 0x2029 ? ' ' : code; /* one line: no breaks in it */
+                w.codes[count++] = vega_visible(code); /* one line: no breaks in it */
             }
         }
         if (j < n && grid->spans[w.order[j]].row == s->row && grid->spans[w.order[j]].column < end)

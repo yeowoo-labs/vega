@@ -193,6 +193,8 @@ static const char *const page_parts[] = {
 "ul{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:8px;overflow:hidden}"
 "li,tbody tr{cursor:pointer}li{display:flex;gap:10px;padding:7px 12px;border-top:1px solid var(--line)}"
 "li:first-child{border-top:0}.label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:pre}"
+/* Each value its own paragraph as bidi goes: what turns text around stays in it. */
+".label,.detail,.badge,td,th,dd,dt,h1,h2 span{unicode-bidi:isolate}"
 ".detail{color:var(--muted);white-space:pre}.badge{font-size:12px;padding:1px 8px;border:1px solid currentColor;"
 "border-radius:10px;align-self:center}[aria-selected=true]{background:var(--focus);color:#fff}"
 "table{width:100%;border-collapse:collapse;border:1px solid var(--line)}th{text-align:left;color:var(--muted);"
@@ -229,7 +231,10 @@ static const char *const page_parts[] = {
 "finally{busy=false;if(again){again=false;refresh()}}}"
 "function fit(parent,count,make){while(parent.children.length>count)parent.lastChild.remove();"
 "while(parent.children.length<count)parent.append(make());return[...parent.children]}"
-"function text(node,value){if(node.textContent!==value)node.textContent=value}"
+/* A value shown as the other surfaces show it (vega_visible): controls as their pictures. */
+"function visible(value){return String(value).replace(/[\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029]/g,c=>{const n=c.charCodeAt(0);"
+"return String.fromCharCode(n<32?0x2400+n:n===127?0x2421:n<160?0xfffd:0x2424)})}"
+"function text(node,value){value=visible(value);if(node.textContent!==value)node.textContent=value}"
 "function attr(node,name,value){if(value==null)node.removeAttribute(name);"
 "else if(node.getAttribute(name)!==String(value))node.setAttribute(name,value)}"
 "const views=new Map();"

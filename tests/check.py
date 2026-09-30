@@ -493,7 +493,7 @@ class WebSurface:
 
 
 def browser(vega, module, work):
-    """The page in headless Chromium: keys, a click on a row, typed text."""
+    """The page in headless Chromium: keys, a click on a row, typed text, a value holding controls."""
     import shutil
     if not shutil.which('node') or not shutil.which('chromium'):
         return 'skipped'
@@ -507,7 +507,8 @@ def browser(vega, module, work):
     outcome = json.loads(result.stdout)
     assert result.returncode == 0 and outcome['ok'], outcome
     after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
-    assert after == ['To do', 'left: 3 of 4', 'tasks_list (4)', '  a [done] (muted)', '  b', '  c', '> 브라우저'], after
+    assert after == ['To do', 'left: 4 of 5', 'tasks_list (5)', '  a [done] (muted)', '  b', '  c', '  브라우저',
+                     '> esc \u241b[31m sep \u2424 rlo \ufffd.'], after
     return len(outcome['steps'])
 
 
@@ -1807,6 +1808,96 @@ def shared_board(serve, module, work):
             stop(name)
     return {'cards': len(together), 'after_joining': len(joined)}
 
+SCREEN_APP = """use vega
+record Line {
+  t: text
+}
+state lines: list of Line
+state at: index of lines
+input add = text
+input up = key ArrowUp
+input down = key ArrowDown
+on add {
+  lines.append(Line { t: add })
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+view lines_list = each l in lines {
+  label = l.t
+}
+view lines_list_focus = at.position
+"""
+# What would act on a screen instead of being shown: escape sequences, C0 and C1 controls, DEL, line and paragraph
+# separators, the controls that turn text around (embeddings, overrides, isolates); and what is shown as it is.
+SCREEN_TEXTS = ['plain', 'esc \x1b[31mred\x1b[0m \x1b]0;title\x07', 'csi8 \u009b31m c1', 'nel \u0085 x', 'del \x7f x',
+                'nul \x00 bell \x07', 'tab\tnl\nx\rcr', 'sep \u2028 x \u2029 y', 'rlo \u202e abc', 'lre \u202a x \u202c',
+                'isolate \u2068abc\u2069', 'rlm \u200f x', 'zwj \U0001f469\u200d\U0001f4bb', 'bom \ufeff', '한글 שלום',
+                'trail  \x01 ']
+
+
+def screen_visible(c):
+    """As Vega's vega_visible: a control as its picture, a C1 control as U+FFFD, a line or paragraph separator as U+2424."""
+    n = ord(c)
+    return (chr(0x2400 + n) if n < 0x20 else '␡' if n == 0x7f else '�' if 0x80 <= n < 0xa0 else
+            '␤' if n in (0x2028, 0x2029) else c)
+
+
+def screen_cell(c):
+    """As vega_cell: in a terminal's cell, the controls that turn text around as U+FFFD too."""
+    n = ord(c)
+    return '�' if 0x202a <= n <= 0x202e or 0x2066 <= n <= 0x2069 else screen_visible(c)
+
+
+def screen_meaning(vega, aup, work):
+    """A value is shown within its place, as itself, on every surface; what
+    would act on the screen instead is shown as a picture (the CLI and the
+    TUI's cells), said as a space or not at all (speech), and kept as it is
+    in the web surface's JSON, whose page shows the pictures and keeps each
+    value's bidi within it. No byte a value holds reaches a terminal as a
+    control."""
+    source = work / 'screen.aup'
+    source.write_text(SCREEN_APP)
+    module = work / 'screen.pmod'
+    built = run(aup, 'build', source, '-o', module, env=dict(os.environ, AUP_PATH=str(ROOT / 'lib')))
+    assert built.returncode == 0, built.stderr
+    script = ''.join('text ' + t.encode().hex() + '\n' for t in SCREEN_TEXTS)
+    cells = [''.join(map(screen_cell, t)) for t in SCREEN_TEXTS]
+    acting = {chr(n) for n in [*range(0x20), 0x7f, *range(0x80, 0xa0), 0x2028, 0x2029, *range(0x202a, 0x202f),
+                               *range(0x2066, 0x206a)]} - {'\n'}
+
+    def output(*surface, stdin):
+        result = subprocess.run([str(vega), *map(str, surface)], input=stdin.encode(), capture_output=True, timeout=60)
+        assert result.returncode == 0, (surface, result.stderr[-400:])
+        shown = result.stdout.decode('utf-8')
+        stray = {hex(ord(c)) for c in shown if c in acting}
+        assert not stray or (surface[0] == 'tui' and stray == {'0x9'}), (surface, stray)  # the dump's own tabs
+        return shown.splitlines()
+
+    lines = output('cli', module, stdin=script + 'show\n')
+    listed = lines[lines.index(f'lines_list ({len(cells)})') + 1:][:len(cells)]
+    assert [line[2:] for line in listed] == cells, [(a[2:], b) for a, b in zip(listed, cells) if a[2:] != b]
+    dump = output('tui', module, '--dump', f'120x{len(cells) + 6}', stdin=script + 'show\n')
+    rows = dump[dump.index(f'|lines_list ({len(cells)})') + 1:][:len(cells)]
+    assert [row[3:].rstrip(' ') for row in rows] == [c.rstrip(' ') for c in cells], (rows, cells)
+    said = output('say', module, stdin=script + 'key ArrowDown\n' * len(cells))
+    spoken = [''.join(' ' if screen_visible(c) != c else '' if screen_cell(c) != c else c for c in t).rstrip(' ')
+              for t in SCREEN_TEXTS]
+    heard = {line.split(': ', 1)[0]: line.split(': ', 1)[1] for line in said if line.startswith('Item ')}
+    for k, words in enumerate(spoken):
+        assert heard[f'Item {k + 1} of {len(cells)}'] == words + '.', (k, heard[f'Item {k + 1} of {len(cells)}'], words)
+    surface = WebSurface(vega, module)
+    try:
+        for text in SCREEN_TEXTS:
+            assert surface.call('POST', '/text', text.encode())[0] == 200
+        status, body = surface.call('GET', f'/screen?rows={len(cells)}&first=0')
+        assert status == 200
+        labels = [item['label'] for item in json.loads(body)['parts'][0]['items']]
+        assert labels == SCREEN_TEXTS, [(a, b) for a, b in zip(labels, SCREEN_TEXTS) if a != b]
+    finally:
+        surface.stop()
+    return {'values': len(SCREEN_TEXTS), 'surfaces': 4}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -1857,6 +1948,7 @@ def main():
             report['live_display'] = live_display(vega, modules['todo'], work)
             report['node_display'] = node_display(vega, args.serve.resolve(), modules['todo'], work)
             report['messenger'] = messenger(vega, args.serve.resolve(), modules['messenger'], work)
+        report['screen_meaning'] = screen_meaning(vega, aup, work)
         report['shared_board'] = shared_board(args.serve.resolve(), modules['shared-board'], work)
     print(json.dumps(report))
 

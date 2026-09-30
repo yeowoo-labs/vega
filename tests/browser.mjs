@@ -129,6 +129,10 @@ try {
     [a.options.map(name), await evaluate(places)]);
   const entry = a.nodes.find(n => role(n) === 'textbox');
   check('the text input is named for its input', entry && name(entry) === 'add', entry);
+  // A value holding what would act on a screen: shown as the other surfaces show it, its bidi kept within it.
+  await evaluate(`post('/text', 'esc \\u001b[31m sep \\u2028 rlo \\u202e.')`);
+  await until('a value is shown as the other surfaces show it', `document.querySelectorAll('li')[4]?.querySelector('.label').textContent === 'esc \\u241b[31m sep \\u2424 rlo \\u202e.'`);
+  check('its bidi stays within it', await evaluate(`getComputedStyle(document.querySelectorAll('li')[4].querySelector('.label')).unicodeBidi`) === 'isolate', null);
   await finish(true);
 } catch (error) {
   await finish(false, String(error.message || error));

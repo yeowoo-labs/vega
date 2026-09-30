@@ -46,7 +46,13 @@ uint32_t vega_visible(uint32_t codepoint) {
     if (codepoint < 0x20) return 0x2400 + codepoint;
     if (codepoint == 0x7F) return 0x2421;
     if (codepoint >= 0x80 && codepoint < 0xA0) return 0xFFFD;
+    if (codepoint == 0x2028 || codepoint == 0x2029) return 0x2424;
     return codepoint;
+}
+
+uint32_t vega_cell(uint32_t codepoint) {
+    if ((codepoint >= 0x202A && codepoint <= 0x202E) || (codepoint >= 0x2066 && codepoint <= 0x2069)) return 0xFFFD;
+    return vega_visible(codepoint);
 }
 
 size_t vega_decode(const char *text, size_t length, size_t at, uint32_t *codepoint) {
@@ -64,7 +70,7 @@ unsigned vega_text_width(const char *text, size_t length) {
     for (size_t at = 0; at < length;) {
         uint32_t codepoint;
         at += vega_decode(text, length, at, &codepoint);
-        width += vega_width(vega_visible(codepoint));
+        width += vega_width(vega_cell(codepoint));
     }
     return width;
 }
