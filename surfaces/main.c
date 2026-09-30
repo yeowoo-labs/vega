@@ -121,7 +121,10 @@ static bool load(const char *path, const char *store) {
     if (!load_module(path, &modules[current])) return false;
     if (store && pure_store_init(store) != PURE_OK) { fprintf(stderr, "vega: cannot open store %s\n", store); return false; }
     PureResult started = pure_app_start(&app, &modules[current], store ? pure_tree_data(store) : (PureData){0});
-    if (started != PURE_OK) { fprintf(stderr, "vega: cannot start (%d)\n", (int)started); return false; }
+    if (started != PURE_OK) {
+        fprintf(stderr, "vega: cannot start (%d%s%s)\n", (int)started, app.why[0] ? ": " : "", app.why);
+        return false;
+    }
     vega_screen(&screen, &modules[current]);
     typing = screen.prompt >= 0;
     return true;
@@ -135,7 +138,8 @@ static bool swap(const char *path, long size) {
     if (!decode(path, size, next)) return false;
     PureResult replaced = pure_app_replace(&app, next);
     if (replaced != PURE_OK) {
-        fprintf(stderr, "vega: keeping the running module: cannot replace it (%d)\n", (int)replaced);
+        fprintf(stderr, "vega: keeping the running module: cannot replace it (%d%s%s)\n", (int)replaced,
+                app.why[0] ? ": " : "", app.why);
         return false;
     }
     bool had_prompt = screen.prompt >= 0;
