@@ -1989,6 +1989,55 @@ def integers(vega, aup, work):
     return len(out) + len(dump) + len(said)
 
 
+LISTS_APP = """use vega
+record Tag {
+  v: i64
+}
+record Note {
+  name: text
+  raw: bytes
+  tags: list of Tag
+}
+state notes: list of Note
+input add = key Space
+on add.down {
+  let tags: list of Tag
+  for i in 0 .. notes.count + 1 {
+    tags.append(Tag { v: i64(i) })
+  }
+  notes.append(Note { name: "n{notes.count}", raw: bytes("a{notes.count}"), tags: tags })
+}
+view mark = bytes("zz")
+view all = notes
+"""
+
+
+def lists_and_bytes(vega, aup, work):
+    """Views of any value (Pure 027's 4e) on every surface: a list state as it
+    is is a table of its record's fields, a list in a cell shows how many
+    items it holds, bytes their hex digits."""
+    source, module = work / 'lists.aup', work / 'lists.pmod'
+    source.write_text(LISTS_APP)
+    built = run(aup, 'build', source, '-o', module, env=dict(os.environ, AUP_PATH=str(ROOT / 'lib')))
+    assert built.returncode == 0, built.stderr
+    script = 'key Space\nkey Space\nshow\n'
+    out = run(vega, 'cli', module, stdin=script).stdout.splitlines()
+    assert out == ['mark: 7a7a', 'all (2)', '  name  raw   tags', '> n0    6130  1 item', '  n1    6131  2 items'], out
+    dump = run(vega, 'tui', module, '--dump', '40x8', stdin=script).stdout.splitlines()
+    assert all(line in dump for line in ['|mark  7a7a\tmuted', '>> n0    6130  1 item', '|  n1    6131  2 items']), dump
+    said = run(vega, 'say', module, stdin=script).stdout.splitlines()
+    assert all(line in said for line in ['mark: 7a7a.', 'Item 1 of 2: name n0, raw 6130, tags 1 item.']), said
+    surface = WebSurface(vega, module)
+    try:
+        for _ in range(2): surface.call('POST', '/key', 'Space')
+        screen = json.loads(surface.call('GET', '/screen?rows=5')[1])
+    finally:
+        surface.stop()
+    assert screen['fields'] == [{'name': 'mark', 'text': '7a7a'}], screen['fields']
+    assert [item['cells'] for item in screen['parts'][0]['items']] == [['n0', '6130', '1 item'], ['n1', '6131', '2 items']], screen
+    return len(out) + len(dump) + len(said)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -2021,6 +2070,7 @@ def main():
         report['split_list_lines'] = split(vega, modules['today'], work, range(args.seeds))
         report['bool_lines'] = bools(vega, aup, work)
         report['i64_lines'] = integers(vega, aup, work)
+        report['list_and_bytes_lines'] = lists_and_bytes(vega, aup, work)
         report['painted_frames'], report['first_paint_bytes'], report['later_paint_bytes'] = \
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))

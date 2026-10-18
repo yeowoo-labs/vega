@@ -61,7 +61,7 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
     /* A <table>_focus view belongs to its table, not to the fields. */
     bool focus_view[PURE_MODULE_VIEWS] = {false};
     for (uint32_t i = 0; i < m->views; ++i) {
-        if (m->view_type[i] != PURE_VIEW_TABLE) continue;
+        if (m->view_type[i] != PURE_VIEW_LIST || m->view_table[i]) continue;
         char name[PURE_MODULE_NAME + 8];
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         int focus = pure_module_view(m, name);
@@ -72,7 +72,7 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
         VegaPart *part = &screen->parts[screen->count++];
         *part = (VegaPart){.kind = VEGA_FIELD, .view = i, .focus = -1, .pointer = -1, .label = -1, .tone = -1, .detail = -1,
                            .badge = -1};
-        if (m->view_type[i] != PURE_VIEW_TABLE) continue;
+        if (m->view_type[i] != PURE_VIEW_LIST) continue;
         char name[PURE_MODULE_NAME + 8];
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         part->focus = pure_module_view(m, name);
@@ -111,11 +111,11 @@ unsigned vega_check(const PureModule *m, void (*report)(void *, const char *name
             char table[PURE_MODULE_NAME];
             snprintf(table, sizeof(table), "%.*s", (int)(length - 6), view);
             int owner = pure_module_view(m, table);
-            if (!is_view(m, owner, PURE_VIEW_TABLE))
+            if (!is_view(m, owner, PURE_VIEW_LIST))
                 FIND("names no list or table %s; it shows as a field", table);
             else if (m->view_type[i] != PURE_VIEW_NUM) FIND("the focused row is a number; %s shows no focus", table);
         }
-        if (m->view_type[i] != PURE_VIEW_TABLE) continue;
+        if (m->view_type[i] != PURE_VIEW_LIST) continue;
         int label = pure_module_column(m, i, "label"), tone = pure_module_column(m, i, "tone");
         bool list = is_view(m, label, PURE_VIEW_TEXT);
         unsigned shown = 0;
@@ -149,6 +149,15 @@ unsigned vega_check(const PureModule *m, void (*report)(void *, const char *name
 
 typedef struct { char *out; size_t used; } Collect;
 
+/* Bytes, as many as their hex digits fit in a value's text. */
+static bool collect_bytes(void *context, PureSpan span) {
+    Collect *c = context;
+    size_t room = (VEGA_TEXT - 1) / 2 - c->used, take = span.size < room ? span.size : room;
+    if (take) memcpy(c->out + c->used, span.data, take);
+    c->used += take;
+    return true;
+}
+
 static bool collect(void *context, PureSpan span) {
     Collect *c = context;
     size_t room = VEGA_TEXT - 1 - c->used;
@@ -171,6 +180,25 @@ bool vega_text(PureApp *app, uint32_t view, size_t row, char out[VEGA_TEXT], siz
         if (!(column ? pure_app_cell_i64(app, view, row, &value) : pure_app_view_i64(app, view, &value))) return false;
         *length = (size_t)snprintf(out, VEGA_TEXT, "%" PRId64, value);
         return true;
+    }
+    if (m->view_type[view] == PURE_VIEW_LIST) { /* a list cell (027's 4e): how many items it holds */
+        PureSpan items;
+        PureCell cells[PURE_RECORD_FIELDS];
+        size_t count = 0, at = 0;
+        if (!column || pure_app_cell_items(app, view, row, &items) != PURE_OK) return false;
+        while (pure_items_next(m, m->view_record[view] - 1u, items, &at, cells)) ++count;
+        *length = (size_t)snprintf(out, VEGA_TEXT, "%zu item%s", count, count == 1 ? "" : "s");
+        return true;
+    }
+    if (m->view_type[view] == PURE_VIEW_BYTES) { /* as hex digits, as Pure's tools write bytes */
+        char bytes[VEGA_TEXT / 2];
+        Collect c = {bytes, 0};
+        PureResult result = column ? pure_app_cell_text(app, view, row, collect_bytes, &c)
+                                   : pure_app_view_text(app, view, collect_bytes, &c);
+        for (size_t i = 0; i < c.used; ++i) snprintf(out + 2 * i, 3, "%02x", (unsigned char)bytes[i]);
+        *length = 2 * c.used;
+        out[*length] = 0;
+        return result == PURE_OK;
     }
     if (m->view_type[view] == PURE_VIEW_NUM || m->view_type[view] == PURE_VIEW_BOOL) {
         double value;
