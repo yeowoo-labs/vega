@@ -523,9 +523,9 @@ void vega_draw(VegaGrid *grid, PureApp *app, const VegaScreen *screen, const cha
     Pen help = pen_at(grid, bottom, 0, grid->width, VEGA_MUTED, false, false);
     if (screen->prompt >= 0) write_cstr(&help, typing ? "Tab keys  " : "Tab type  ");
     for (uint32_t i = 0; i < m->inputs; ++i) {
-        if (m->input[i].kind != PURE_KIND_KEY) continue;
+        if (m->input[i].binding != PURE_BIND_PRESS) continue;
         bool bound = false;
-        for (uint32_t h = 0; h < m->handlers && !bound; ++h) bound = m->handler[h].event == 1 + 2 * i;
+        for (uint32_t h = 0; h < m->handlers && !bound; ++h) bound = m->handler[h].event == i;
         if (!bound) continue;
         write_cstr(&help, key_symbol(m->input_keys[i]));
         write_cstr(&help, " ");

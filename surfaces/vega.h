@@ -23,7 +23,7 @@ typedef struct {
     VegaKind kind;
     uint32_t view;
     int focus;                      /* number view with the focused row, or -1 */
-    int pointer;                    /* the index state that view shows, or -1: a surface may move it */
+    int pointer;                    /* the input pointing at this table's rows (focus = at.position), or -1 */
     int label, tone, detail, badge; /* columns, or -1 */
     uint32_t columns[PURE_MODULE_VIEWS]; /* a table's shown columns, in order */
     unsigned column_count;
@@ -33,7 +33,7 @@ typedef struct {
     const PureModule *module;
     int title;  /* text view, or -1 */
     int prompt; /* the first text input, or -1 */
-    bool ticks; /* it handles frames: a surface runs them, about 60 a second */
+    int frame;  /* the input frames go to, or -1: a surface sends them, about 60 a second (vega_frame) */
     VegaPart parts[VEGA_PARTS];
     unsigned count;
 } VegaScreen;
@@ -83,6 +83,9 @@ int vega_key_input(const PureModule *, const char *key);
 bool vega_press(PureApp *, const char *key);
 /* Commit text to the screen's text input. */
 bool vega_commit(PureApp *, const VegaScreen *, const char *text, size_t length);
+/* A frame (1/60 s) to the screen's frame input, stored with the next event or a save; false without one or when its
+ * event fails. */
+bool vega_frame(PureApp *, const VegaScreen *);
 VegaTone vega_tone(PureApp *, const VegaPart *, size_t row);
 /* Values evaluated so far, for checking that surfaces stay lazy. */
 unsigned long vega_evaluations(void);

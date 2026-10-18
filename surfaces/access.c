@@ -76,7 +76,7 @@ static Object parse_path(const VegaAccess *a, const char *path) {
     if (o.kind == ROW && s->parts[o.part].kind == VEGA_FIELD) o.kind = NONE;
     if (o.kind == TITLE && s->title < 0) o.kind = NONE;
     if (o.kind == ENTRY && s->prompt < 0) o.kind = NONE;
-    if (o.kind == KEY && (o.key >= a->app->module->inputs || a->app->module->input[o.key].kind != PURE_KIND_KEY)) o.kind = NONE;
+    if (o.kind == KEY && (o.key >= a->app->module->inputs || a->app->module->input[o.key].binding != PURE_BIND_PRESS)) o.kind = NONE;
     return o;
 }
 
@@ -98,9 +98,9 @@ static void path_of(const Object *o, char *out, size_t size) {
 
 /* The keys the screen answers: key inputs a handler takes. */
 static bool bound_key(const PureModule *m, uint32_t input) {
-    if (m->input[input].kind != PURE_KIND_KEY) return false;
+    if (m->input[input].binding != PURE_BIND_PRESS) return false;
     for (uint32_t h = 0; h < m->handlers; ++h)
-        if (m->handler[h].event == 1 + 2 * input) return true;
+        if (m->handler[h].event == input) return true;
     return false;
 }
 

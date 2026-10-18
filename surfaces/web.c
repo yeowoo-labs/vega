@@ -160,9 +160,9 @@ static void screen_json(Buffer *b, PureApp *app, const VegaScreen *screen, size_
     puts_(b, "],\"keys\":[");
     comma = false;
     for (uint32_t i = 0; i < m->inputs; ++i) {
-        if (m->input[i].kind != PURE_KIND_KEY) continue;
+        if (m->input[i].binding != PURE_BIND_PRESS) continue;
         bool bound = false;
-        for (uint32_t h = 0; h < m->handlers && !bound; ++h) bound = m->handler[h].event == 1 + 2 * i;
+        for (uint32_t h = 0; h < m->handlers && !bound; ++h) bound = m->handler[h].event == i;
         if (!bound) continue;
         puts_(b, comma ? ",{\"input\":" : "{\"input\":");
         json_name(b, m->input_names[i]);
@@ -437,13 +437,13 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
             fds[count] = (struct pollfd){c->fd, (short)(POLLIN | (c->out_at < c->out.used ? POLLOUT : 0)), 0};
             slot[count++] = i;
         }
-        int timeout = ticked ? 0 : screen->ticks ? 33 : reload ? 200 : 1000;
+        int timeout = ticked ? 0 : screen->frame >= 0 ? 33 : reload ? 200 : 1000;
         if (due >= 0 && due < timeout) timeout = (int)due;
         int ready = poll(fds, count, timeout);
         if (ready < 0 && errno != EINTR) break;
         bool changed = ticked;
         app->now = vega_now(); /* what the events of this round see */
-        if (ready == 0 && screen->ticks) changed = pure_app_frame(app) == PURE_OK;
+        if (ready == 0 && screen->frame >= 0) changed = vega_frame(app, screen);
         if (reload && reload()) { /* a new module: every page draws it */
             changed = true;
             vega_timers_start(&timers, app->module, vega_clock());

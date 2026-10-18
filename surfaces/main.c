@@ -533,7 +533,7 @@ static int interactive(void) {
         vega_draw(&grid, &app, &screen, line, shown_entry(line), typing);
         paint_terminal(&grid);
         struct pollfd wait = {STDIN_FILENO, POLLIN, 0};
-        int timeout = screen.ticks ? 16 : watched ? 200 : -1;
+        int timeout = screen.frame >= 0 ? 16 : watched ? 200 : -1;
         if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
         if (pending_length) { /* a key begun waits for its rest (an escape: or is the Escape key) */
             double left = pending_since + pending_wait() - vega_clock();
@@ -546,7 +546,7 @@ static int interactive(void) {
             !handle_input(NULL, 0, true))
             break;
         if (ready == 0) {
-            if (screen.ticks) pure_app_frame(&app);
+            vega_frame(&app, &screen);
             if (module_changed()) vega_timers_start(&timers, app.module, vega_clock());
             continue;
         }
@@ -740,12 +740,12 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         unsigned count = open_input ? vega_input_fds(input, waits, 32) : 0;
         if (node) waits[count++] = (struct pollfd){node->changes, POLLIN, 0}; /* the node saved: draw again */
         if (access) waits[count++] = (struct pollfd){vega_access_fd(access), POLLIN, 0}; /* a screen reader asks */
-        int timeout = screen.ticks && !node ? 16 : -1;
+        int timeout = screen.frame >= 0 && !node ? 16 : -1;
         if (due >= 0 && (timeout < 0 || due < timeout)) timeout = (int)due;
         if (poll(waits, count, timeout) <= 0) {
             if (node) continue;
             app.now = vega_now();
-            if (screen.ticks) pure_app_frame(&app), dirty = true;
+            if (screen.frame >= 0) vega_frame(&app, &screen), dirty = true;
             continue;
         }
         if (!node) app.now = vega_now();
@@ -848,17 +848,17 @@ static int script(Surface surface, unsigned width, unsigned height, bool paintin
         } else if (!strcmp(command, "tick")) {
             input = pure_module_input(app.module, argument);
             verb = "tick";
-            if (input < 0 || app.module->input[input].kind != PURE_KIND_TIMER) {
+            if (input < 0 || app.module->input[input].binding != PURE_BIND_TIMER) {
                 fprintf(stderr, "vega: no timer %s\n", argument);
                 input = -1;
                 ok = false;
-            } else ok = pure_app_tick(&app, (uint32_t)input) == PURE_OK;
+            } else ok = pure_app_message(&app, (uint32_t)input, (PureSpan){0}) == PURE_OK;
         } else if (!strcmp(command, "swap")) {
             acted = false;
             if (!swap(argument, read_module(argument))) fprintf(stderr, "vega: kept the running module\n");
         } else if (!strcmp(command, "frame")) {
             long count = *argument ? strtol(argument, NULL, 10) : 1;
-            for (long i = 0; i < count && i < 600; ++i) ok = pure_app_frame(&app) == PURE_OK && ok;
+            for (long i = 0; i < count && i < 600; ++i) ok = (screen.frame < 0 || vega_frame(&app, &screen)) && ok;
         } else if (!strcmp(command, "show")) {
             acted = false;
             if (surface == SURFACE_CLI) vega_print(stdout, &app, &screen, color);

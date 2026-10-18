@@ -20,17 +20,17 @@ double vega_clock(void) {
 
 void vega_timers_start(VegaTimers *timers, const PureModule *m, double clock) {
     for (uint32_t i = 0; i < m->inputs; ++i)
-        timers->next[i] = m->input[i].kind == PURE_KIND_TIMER ? clock + m->input[i].period : 0;
+        timers->next[i] = m->input[i].binding == PURE_BIND_TIMER ? clock + m->input[i].period : 0;
 }
 
 long vega_timers_run(VegaTimers *timers, PureApp *app, double clock, bool *ticked) {
     const PureModule *m = app->module;
     double soonest = -1;
     for (uint32_t i = 0; i < m->inputs; ++i) {
-        if (m->input[i].kind != PURE_KIND_TIMER) continue;
+        if (m->input[i].binding != PURE_BIND_TIMER) continue;
         if (timers->next[i] <= clock) {
             app->now = vega_now();
-            pure_app_tick(app, i); /* a failed tick changes nothing, as any failed event */
+            pure_app_message(app, i, (PureSpan){0}); /* a failed tick changes nothing, as any failed event */
             *ticked = true;
             timers->next[i] = clock + m->input[i].period;
         }
@@ -53,10 +53,11 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
     screen->module = m;
     screen->title = pure_module_view(m, "title");
     if (screen->title >= 0 && m->view_type[screen->title] != PURE_VIEW_TEXT) screen->title = -1;
-    screen->prompt = -1;
-    for (uint32_t i = 0; i < m->inputs && screen->prompt < 0; ++i)
-        if (m->input[i].kind == PURE_KIND_TEXT) screen->prompt = (int)i;
-    for (uint32_t h = 0; h < m->handlers; ++h) screen->ticks = screen->ticks || m->handler[h].event == 0;
+    screen->prompt = screen->frame = -1;
+    for (uint32_t i = 0; i < m->inputs; ++i) {
+        if (m->input[i].binding == PURE_BIND_TEXT && screen->prompt < 0) screen->prompt = (int)i;
+        if (m->input[i].binding == PURE_BIND_FRAME) screen->frame = (int)i;
+    }
     /* A <table>_focus view belongs to its table, not to the fields. */
     bool focus_view[PURE_MODULE_VIEWS] = {false};
     for (uint32_t i = 0; i < m->views; ++i) {
@@ -76,7 +77,8 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         part->focus = pure_module_view(m, name);
         if (part->focus >= 0 && !focus_view[part->focus]) part->focus = -1;
-        part->pointer = part->focus >= 0 ? pure_module_position(m, (uint32_t)part->focus) : -1;
+        for (uint32_t k = 0; part->focus >= 0 && k < m->inputs; ++k)
+            if (m->input[k].binding == PURE_BIND_POINT && m->input[k].view == i) part->pointer = (int)k;
         part->label = column(m, i, "label", PURE_VIEW_TEXT);
         part->tone = column(m, i, "tone", PURE_VIEW_NUM);
         part->kind = part->label >= 0 ? VEGA_LIST : VEGA_TABLE;
@@ -136,7 +138,7 @@ unsigned vega_check(const PureModule *m, void (*report)(void *, const char *name
     }
     int prompt = -1;
     for (uint32_t i = 0; i < m->inputs; ++i) {
-        if (m->input[i].kind != PURE_KIND_TEXT) continue;
+        if (m->input[i].binding != PURE_BIND_TEXT) continue;
         snprintf(name, sizeof(name), "%s", m->input_names[i]);
         if (prompt >= 0) FIND("only the first text input (%s) has a place to type into", m->input_names[prompt]);
         else prompt = (int)i;
@@ -213,29 +215,43 @@ size_t vega_scroll(size_t first, size_t focus, size_t visible, size_t rows) {
     return first;
 }
 
-int vega_key_input(const PureModule *m, const char *key) {
+static int bound(const PureModule *m, uint8_t binding, const char *key) {
     for (uint32_t i = 0; i < m->inputs; ++i)
-        if (m->input[i].kind == PURE_KIND_KEY && !strcmp(m->input_keys[i], key)) return (int)i;
+        if (m->input[i].binding == binding && !strcmp(m->input_keys[i], key)) return (int)i;
     return -1;
 }
 
+int vega_key_input(const PureModule *m, const char *key) { return bound(m, PURE_BIND_PRESS, key); }
+
 bool vega_press(PureApp *app, const char *key) {
-    int input = vega_key_input(app->module, key);
+    int input = vega_key_input(app->module, key), up = bound(app->module, PURE_BIND_RELEASE, key);
     if (input < 0) return false;
-    bool ok = pure_app_input(app, (uint32_t)input, PURE_EDGE_DOWN) == PURE_OK;
-    pure_app_input(app, (uint32_t)input, PURE_EDGE_UP);
+    bool ok = pure_app_message(app, (uint32_t)input, (PureSpan){0}) == PURE_OK;
+    if (up >= 0) pure_app_message(app, (uint32_t)up, (PureSpan){0});
     return ok;
 }
 
 bool vega_commit(PureApp *app, const VegaScreen *screen, const char *text, size_t length) {
     return screen->prompt >= 0 &&
-           pure_app_text(app, (uint32_t)screen->prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
+           pure_app_message(app, (uint32_t)screen->prompt, (PureSpan){(const unsigned char *)text, length}) == PURE_OK;
 }
 
 bool vega_point(PureApp *app, const VegaPart *part, size_t row) {
     size_t item; /* a filtered list's row shows some item of the list */
-    return part->pointer >= 0 && pure_app_row_item(app, part->view, row, &item) &&
-           pure_app_point(app, (uint32_t)part->pointer, item) == PURE_OK;
+    if (part->pointer < 0 || !pure_app_row_item(app, part->view, row, &item) || item > UINT32_MAX) return false;
+    unsigned char position[4] = {(unsigned char)item, (unsigned char)(item >> 8), (unsigned char)(item >> 16),
+                                 (unsigned char)(item >> 24)};
+    return pure_app_message(app, (uint32_t)part->pointer, (PureSpan){position, 4}) == PURE_OK;
+}
+
+bool vega_frame(PureApp *app, const VegaScreen *screen) {
+    static const double dt = 1.0 / 60.0;
+    if (screen->frame < 0) return false;
+    bool deferred = app->deferred;
+    pure_app_defer(app, true); /* a frame's changes are stored by the next event or a save, as before (027's 4d) */
+    bool ok = pure_app_message(app, (uint32_t)screen->frame, (PureSpan){(const unsigned char *)&dt, sizeof(dt)}) == PURE_OK;
+    pure_app_defer(app, deferred);
+    return ok;
 }
 
 VegaTone vega_tone(PureApp *app, const VegaPart *part, size_t row) {
