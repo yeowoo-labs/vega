@@ -64,7 +64,7 @@ static void print_list(FILE *out, PureApp *app, const VegaPart *part, bool color
 static void print_table(FILE *out, PureApp *app, const VegaPart *part, bool color) {
     const PureModule *m = app->module;
     size_t rows = vega_rows(app, part), focus = vega_focus(app, part);
-    unsigned widths[PURE_MODULE_VIEWS];
+    unsigned widths[VEGA_COLUMNS];
     char text[VEGA_TEXT];
     size_t length;
     for (unsigned c = 0; c < part->column_count; ++c) {
@@ -416,7 +416,7 @@ static void draw_table(VegaGrid *grid, PureApp *app, const VegaPart *part, int i
     const PureModule *m = app->module;
     char text[VEGA_TEXT];
     size_t length, rows = vega_rows(app, part), focus = vega_focus(app, part);
-    unsigned visible = height ? height - 1 : 0, widths[PURE_MODULE_VIEWS], total = 2;
+    unsigned visible = height ? height - 1 : 0, widths[VEGA_COLUMNS], total = 2;
     /* Columns as wide as their header and the rows on screen, shared out when too wide. */
     for (unsigned c = 0; c < part->column_count; ++c) {
         const char *name = m->view_names[part->columns[c]];

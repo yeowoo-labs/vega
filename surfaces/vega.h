@@ -15,7 +15,8 @@
  *  - every other number or text view is a field.
  * A tone says what a value means (lib/vega.aup); each surface decides how it
  * looks or sounds. Surfaces evaluate only the cells they present. */
-enum { VEGA_PARTS = 64, VEGA_TEXT = 1024 };
+/* The parts a screen shows and the columns a table shows, at most: a surface's own counts (not a module's). */
+enum { VEGA_PARTS = 64, VEGA_COLUMNS = 64, VEGA_TEXT = 1024 };
 typedef enum { VEGA_NORMAL, VEGA_MUTED, VEGA_ACCENT, VEGA_GOOD, VEGA_WARNING, VEGA_DANGER, VEGA_TONES } VegaTone;
 typedef enum { VEGA_FIELD, VEGA_LIST, VEGA_TABLE } VegaKind;
 
@@ -25,7 +26,7 @@ typedef struct {
     int focus;                      /* number view with the focused row, or -1 */
     int pointer;                    /* the input pointing at this table's rows (focus = at.position), or -1 */
     int label, tone, detail, badge; /* columns, or -1 */
-    uint32_t columns[PURE_MODULE_VIEWS]; /* a table's shown columns, in order */
+    uint32_t columns[VEGA_COLUMNS]; /* a table's shown columns, in order (its first VEGA_COLUMNS) */
     unsigned column_count;
 } VegaPart;
 
@@ -50,7 +51,7 @@ double vega_clock(void);
  * at clock (a tick sees the wall clock, vega_now) and gives the
  * milliseconds until the next, or -1 without timers; ticked says whether
  * any did. Missed ticks are not made up. */
-typedef struct { double next[PURE_MODULE_INPUTS]; } VegaTimers;
+typedef struct { double *next; uint32_t count; } VegaTimers; /* zeroed before its first start; one an input */
 void vega_timers_start(VegaTimers *, const PureModule *, double clock);
 long vega_timers_run(VegaTimers *, PureApp *, double clock, bool *ticked);
 /* What a module seems to mean but does not meet: a list label that is not

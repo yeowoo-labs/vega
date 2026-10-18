@@ -516,7 +516,7 @@ static int interactive(void) {
     signal(SIGWINCH, on_resize);
     VegaGrid grid = {0};
     drawn = &grid;
-    VegaTimers timers;
+    VegaTimers timers = {0};
     vega_timers_start(&timers, app.module, vega_clock());
     for (;;) {
         if (resized) {
@@ -688,7 +688,7 @@ static int live(VegaInput *input, unsigned columns, unsigned rows, bool recorded
         signal(SIGINT, on_stop);
         signal(SIGTERM, on_stop);
     }
-    VegaTimers timers;
+    VegaTimers timers = {0};
     vega_timers_start(&timers, app.module, vega_clock());
     char path[512] = "";
     unsigned long differing = 0;

@@ -422,7 +422,7 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
     signal(SIGPIPE, SIG_IGN);
     static Client clients[CLIENTS];
     for (unsigned i = 0; i < CLIENTS; ++i) clients[i].fd = -1;
-    VegaTimers timers;
+    VegaTimers timers = {0};
     vega_timers_start(&timers, app->module, vega_clock());
     while (!stopping) {
         /* Tick what is due; every page hears of it this round, without waiting. */

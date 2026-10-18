@@ -3,6 +3,7 @@
 #include "module-text.h"
 #include <inttypes.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -19,14 +20,18 @@ double vega_clock(void) {
 }
 
 void vega_timers_start(VegaTimers *timers, const PureModule *m, double clock) {
-    for (uint32_t i = 0; i < m->inputs; ++i)
+    if (timers->count < m->inputs) {
+        double *grown = realloc(timers->next, m->inputs * sizeof(*grown));
+        if (grown) timers->next = grown, timers->count = m->inputs; /* else its timers past count never tick */
+    }
+    for (uint32_t i = 0; i < m->inputs && i < timers->count; ++i)
         timers->next[i] = m->input[i].binding == PURE_BIND_TIMER ? clock + m->input[i].period : 0;
 }
 
 long vega_timers_run(VegaTimers *timers, PureApp *app, double clock, bool *ticked) {
     const PureModule *m = app->module;
     double soonest = -1;
-    for (uint32_t i = 0; i < m->inputs; ++i) {
+    for (uint32_t i = 0; i < m->inputs && i < timers->count; ++i) {
         if (m->input[i].binding != PURE_BIND_TIMER) continue;
         if (timers->next[i] <= clock) {
             app->now = vega_now();
@@ -59,16 +64,16 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
         if (m->input[i].binding == PURE_BIND_FRAME) screen->frame = (int)i;
     }
     /* A <table>_focus view belongs to its table, not to the fields. */
-    bool focus_view[PURE_MODULE_VIEWS] = {false};
+    bool *focus_view = calloc(m->views + 1, sizeof(*focus_view)); /* (without room, none is) */
     for (uint32_t i = 0; i < m->views; ++i) {
         if (m->view_type[i] != PURE_VIEW_LIST || m->view_table[i]) continue;
         char name[PURE_MODULE_NAME + 8];
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         int focus = pure_module_view(m, name);
-        if (focus >= 0 && m->view_type[focus] == PURE_VIEW_NUM) focus_view[focus] = true;
+        if (focus >= 0 && m->view_type[focus] == PURE_VIEW_NUM && focus_view) focus_view[focus] = true;
     }
     for (uint32_t i = 0; i < m->views && screen->count < VEGA_PARTS; ++i) {
-        if (m->view_table[i] || (int)i == screen->title || focus_view[i]) continue;
+        if (m->view_table[i] || (int)i == screen->title || (focus_view && focus_view[i])) continue;
         VegaPart *part = &screen->parts[screen->count++];
         *part = (VegaPart){.kind = VEGA_FIELD, .view = i, .focus = -1, .pointer = -1, .label = -1, .tone = -1, .detail = -1,
                            .badge = -1};
@@ -76,7 +81,7 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
         char name[PURE_MODULE_NAME + 8];
         snprintf(name, sizeof(name), "%s_focus", m->view_names[i]);
         part->focus = pure_module_view(m, name);
-        if (part->focus >= 0 && !focus_view[part->focus]) part->focus = -1;
+        if (part->focus >= 0 && !(focus_view && focus_view[part->focus])) part->focus = -1;
         for (uint32_t k = 0; part->focus >= 0 && k < m->inputs; ++k)
             if (m->input[k].binding == PURE_BIND_POINT && m->input[k].view == i) part->pointer = (int)k;
         part->label = column(m, i, "label", PURE_VIEW_TEXT);
@@ -87,8 +92,10 @@ void vega_screen(VegaScreen *screen, const PureModule *m) {
             part->badge = column(m, i, "badge", PURE_VIEW_TEXT);
         }
         for (uint32_t k = 0; k < m->views; ++k)
-            if (m->view_table[k] == i + 1 && (int)k != part->tone) part->columns[part->column_count++] = k;
+            if (m->view_table[k] == i + 1 && (int)k != part->tone && part->column_count < VEGA_COLUMNS)
+                part->columns[part->column_count++] = k;
     }
+    free(focus_view);
 }
 
 static bool is_view(const PureModule *m, int view, uint8_t type) {

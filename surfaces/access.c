@@ -162,13 +162,16 @@ static Object parent_of(const Object *o) {
 }
 
 static size_t index_in_parent(const VegaAccess *a, const Object *o) {
-    Object parent = parent_of(o), kids[VEGA_PARTS + PURE_MODULE_INPUTS + 4];
+    Object parent = parent_of(o);
     if (o->kind == ROW) return o->row;
     if (o->kind == CELL) return o->column;
-    size_t n = children(a, &parent, kids, sizeof(kids) / sizeof(*kids));
-    for (size_t i = 0; i < n && i < sizeof(kids) / sizeof(*kids); ++i)
-        if (kids[i].kind == o->kind && kids[i].part == o->part && kids[i].key == o->key) return i;
-    return 0;
+    size_t n = children(a, &parent, NULL, 0), at = 0;
+    Object *kids = malloc((n + 1) * sizeof(*kids));
+    if (kids) n = children(a, &parent, kids, n);
+    for (size_t i = 0; kids && i < n; ++i)
+        if (kids[i].kind == o->kind && kids[i].part == o->part && kids[i].key == o->key) { at = i; break; }
+    free(kids);
+    return at;
 }
 
 static int role_of(const VegaAccess *a, const Object *o) {
