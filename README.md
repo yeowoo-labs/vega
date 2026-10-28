@@ -1,111 +1,101 @@
 # Vega
 
-Vega는 **인터페이스 구현자**이며 하나의 **aup 라이브러리**다(`use vega`). 사용자가 보는 인터페이스의
-규격과 고도화된 명세를 기반으로 TUI, CLI, GUI, NUI를 쉽게 만들 수 있게 한다.
+Surfaces for [aup](https://github.com/yeowoo-labs/aup) apps: one specification, many surfaces.
 
-상태: 첫 컴포넌트(목록·표·포커스·톤)와 표면 셋(TUI·CLI·NUI 문장)이 동작한다.
-[설계 001](docs/design/001-first-component.md).
+Vega is an aup library (`use vega`) plus a set of hosts. An app declares lists, tables, focus and
+tone once; Vega shows that declaration as a terminal UI, non-interactive CLI output, spoken
+sentences, a web page, pixels or a framebuffer — without copying the data into a per-surface model.
+
+**Status: v0, pre-1.0.** The first components (lists, tables, focus, tone) and four surfaces work:
+TUI, CLI, speech and web, plus pixel and display output. No release, no compatibility promise.
+There has been no external security audit.
+
+## Build and run
+
+`make` links `libpure.a` from a Pure checkout beside this one.
 
 ```sh
-make                                          # build/vega (옆의 ../pure 체크아웃의 libpure.a를 링크)
+git clone https://github.com/yeowoo-labs/pure.git ../pure && make -C ../pure
+git clone https://github.com/yeowoo-labs/aup.git ../aup && make -C ../aup
+make                                                      # build/vega, build/vega-symbols
+
 AUP_PATH=lib ../aup/build/aup build examples/todo.aup -o todo.pmod
-build/vega tui todo.pmod --store ~/.todo      # 터미널. 글자 입력 후 Enter, Tab으로 키 모드, Ctrl-C로 끝.
-                                              # --store가 있으면 목록이 다음 실행에도 남는다(어느 표면이든)
+build/vega tui todo.pmod --store ~/.todo                  # keyboard; Tab for key mode, Ctrl-C to quit
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega cli todo.pmod
 printf 'text 6d696c6b\nkey Space\nshow\n' | build/vega say todo.pmod
-build/vega web todo.pmod --watch              # 브라우저(GUI). --watch: 모듈이 다시 빌드되면 상태를 이어 바꾼다
-                                              # (옆에서 AUP_PATH=lib aup watch examples/todo.aup -o todo.pmod)
-build/vega pixels todo.pmod --symbols ui.vsym --grid 48x12 --out frame < script   # 픽셀: frame-N.ppm (설계 003)
-build/vega display todo.pmod --symbols ui.vsym --live      # 디스플레이(KMS)와 키보드·마우스·터치(evdev)
-                                              # (< script, --input 기록한 사건, --writeback WxH --out: 화면 없이 되돌려 받기)
-make check                                    # 참조 모델 대조, 프레임 검사, 대화형 pty 검사, 견고성
+build/vega web todo.pmod --watch                          # browser; follows rebuilt modules
+make check                                                # reference models, frames, pty, robustness
 ```
 
-사람과 프로그램이 같은 앱을 쓴다. `examples/board.aup`는 칸반 보드다. 사람은 Vega 표면으로, 프로그램은 같은 모듈과
-저장소를 서빙하는 Pure의 `pure-serve`로 쓴다(라우트 코드가 없다. 보기가 GET, 입력이 POST다).
+## The same app for a person and a program
+
+`examples/board.aup` is a kanban board. A person uses a Vega surface; a program uses the same
+module and store through Pure's `pure-serve`, with no route code — views are `GET`, inputs are
+`POST`.
 
 ```sh
 AUP_PATH=lib ../aup/build/aup build examples/board.aup -o board.pmod
-build/vega tui board.pmod --store ~/.board           # 사람: 제목을 쓰고 Enter, Tab 뒤 ←→로 칸을 옮긴다
+build/vega tui board.pmod --store ~/.board
 ../pure/build/pure-serve --module board.pmod --store ~/.board --threads 2 &
-curl -s localhost:8767/views/counts                  # 1 to do, 1 doing, 0 done
-curl -s -X POST -H 'Content-Type: application/json' -d '{"title": "ship it", "lane": 2}' localhost:8767/inputs/post
-curl -s 'localhost:8767/views/cards_list?from=0&count=20'
+curl -s localhost:8767/views/counts
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"title": "ship it", "lane": 2}' localhost:8767/inputs/post
 ```
 
-한 저장소는 한 번에 한 호스트가 연다(상태의 소유자는 하나다). 사람과 프로그램이 동시에 쓰려면 Vega를 노드 안에서
-돌린다. `pure-serve`가 `build/vega-surface.so`를 매핑해 제 스레드에서 돌린다([Pure 설계 010](/srv/git/pure.git):
-`docs/design/010-surfaces.md`). 디스플레이는 노드의 마지막 저장을 제자리에서 읽어 그리고, 사람이 치는 키와 글자는 HTTP
-요청과 같은 줄로 노드의 소유자에게 간다. 그 사이에 HTTP나 JSON이 없다.
+One store is opened by one host at a time — the owner of state is single. To write from a person
+and a program at once, run the surface inside the node: `pure-serve` maps `build/vega-surface.so`
+and runs it on its own thread, drawing from the last commit in place. Keystrokes and text travel on
+the same path as HTTP requests, with no HTTP or JSON in between.
 
 ```sh
 ../pure/build/pure-serve --module board.pmod --store ~/.board \
-    --surface build/vega-surface.so -- display --symbols ui.vsym --live   # 디스플레이와 HTTP가 한 노드를 쓴다
-```
-
-`examples/messenger.aup`는 두 노드 사이의 메신저다. 여기서 쓴 줄은 저장되고 상대 노드로 간다. 노드마다 제 키를 갖고,
-상대의 키로 봉인하며, 상대만을 이름과 키로 받는다. 그래서 사이의 중계는 읽지도 바꾸지도 못한다(Pure 086, 088). 화면은 노드
-안의 Vega다.
-
-```sh
-AUP_PATH=lib ../aup/build/aup build examples/messenger.aup -o messenger.pmod
-# 앨리스의 노드(밥의 노드는 이름과 키를 바꿔 같게). 두 공개키는 각 노드를 --key로 한 번 띄우면 시작 줄에 나온다.
-../pure/build/pure-serve --module messenger.pmod --store ~/.alice --key ~/.alice.key --name alice --port 8801 \
-    --send said=http://bob.local:8802/inputs/heard --seal said=BOB_KEY --sender bob.said=BOB_KEY \
     --surface build/vega-surface.so -- display --symbols ui.vsym --live
-curl -s -X POST -d alice localhost:8801/inputs/rename   # 이름(한 번)
 ```
 
-글자와 아이콘은 하나의 바이너리 형식(심볼 파일)으로 그린다. 폰트와 SVG는 빌드할 때 한 번만 해석한다
-([설계 002](docs/design/002-symbol-format.md)).
+`examples/messenger.aup` is a two-node messenger. A line you type is stored, then sent to the other
+node, sealed to its key and authenticated by yours, so a relay between them can neither read nor
+change it. The screen is Vega inside each node.
+
+## Symbols
+
+Text and icons are drawn from a single binary symbol format. Fonts and SVG are resolved once, at
+build time.
 
 ```sh
-build/vega-symbols build --font DejaVuSansMono.ttf --codes 0x20-0x7e,0x2190-0x21ff \
-    --font NotoSansCJK-Regular.ttc --face 6 --codes 0xac00-0xd7a3 --svg 0xE000=icon.svg -o ui.vsym   # 앞 글꼴에 없는 것만 뒤에서
-build/vega-symbols compare DejaVuSans.ttf ui.vsym --sizes 12,16,32   # FreeType과 픽셀 차이, 읽는 비용
+build/vega-symbols build --font DejaVuSansMono.ttf --codes 0x20-0x7e \
+    --font NotoSansCJK-Regular.ttc --face 6 --codes 0xac00-0xd7a3 \
+    --svg 0xE000=icon.svg -o ui.vsym
+build/vega-symbols compare DejaVuSans.ttf ui.vsym --sizes 12,16,32
 build/vega-symbols render ui.vsym 0xE000 48 icon.pgm
 ```
 
-## 부품
+## Layout
 
-| 디렉터리 | 무엇 | 만드는 것 |
+| Path | What lives there |
+|---|---|
+| `lib/` | The aup library (`use vega`): lists, tables, focus, tone |
+| `surfaces/` | TUI, CLI, speech, web, pixels, display (KMS), and the in-node surface library |
+| `symbols/` | One glyph format, drawn on CPU or GPU |
+| `docs/design/` | Surface and symbol design |
+| `tests/` | Reference models, frame checks, pty and robustness tests |
+
+## Where these fit
+
+| Layer | Role | Analogy |
 |---|---|---|
-| `lib/` | aup 라이브러리(`use vega`): 목록·표·포커스·톤 같은 인터페이스 어휘 | aup가 읽는다 |
-| `surfaces/` | 모듈을 사람에게 보이는 표면: TUI, CLI, 문장(NUI), 웹, 픽셀, 디스플레이(KMS). Pure의 `libpure.a`를 링크한다. 같은 호스트가 Pure 노드 안의 디스플레이도 된다(`pure-serve --surface`, 노드가 내보내는 앱 모델을 부른다) | `build/vega`, `build/vega-surface.so` |
-| `symbols/` | 글리프와 아이콘을 한 형식으로, CPU와 GPU로 그리기([설계 002](docs/design/002-symbol-format.md)) | `build/vega-symbols` |
+| [Pure](https://github.com/yeowoo-labs/pure) | Runtime: execution, memory and ownership, persisted state, transport | JVM |
+| [aup](https://github.com/yeowoo-labs/aup) | The app declaration: written, checked, built | Java and javac |
+| **Vega** | The surface library and hosts | JavaFX |
 
-Pure와 같은 규칙이다([Pure 009](/srv/git/pure.git): `docs/design/009-layout.md`). 최상위 디렉터리가 역할별 부품이고,
-`tests/check.py`가 저장소 전체를 끝에서 끝까지 확인한다.
+## Principles
 
-## 위치
+- **No lowest common denominator.** Each surface states what it supports; a surface never silently
+  gives a feature a different meaning.
+- **No per-surface copies of data.** Values are borrowed from the runtime's persisted state, not
+  rebuilt into a surface model.
+- **No Galápagos.** ANSI terminals, shell pipes and platform accessibility APIs stay the points of
+  contact.
 
-| 층 | 역할 | 비유 |
-|---|---|---|
-| [Pure](/srv/git/pure.git) | 런타임. 실행, 메모리와 소유권, 영속 상태, 통신 | JVM |
-| [aup](/srv/git/aup.git) | Pure가 실행하는 앱 정의를 작성·검사·빌드 | Java·javac |
-| **Vega** | aup 라이브러리. 데이터 표현과 인터페이스 명세로 TUI/CLI/GUI/NUI를 구현 | JavaFX |
+## License
 
-aup는 일반적인 투영과 모듈만 제공하고, 목록·표·커서·톤 같은 인터페이스 어휘는 Vega가 제공한다
-([aup 002](/srv/git/aup.git): `docs/design/002-dsl-direction.md`). 그래서 aup v0을 먼저 만든다.
-
-## 다루는 것
-
-- **데이터 표현.** 커서링(현재 위치·선택·이동), 컬러링(의미에 따른 색·강조), 리스트, 테이블부터 시작한다.
-- **명세에서 표면으로.** 인터페이스를 특정 표면의 위젯이 아니라 명세로 기술하고, 각 표면이 그것을 구현한다.
-- **표면.** CLI(비대화형 출력·파이프), TUI(터미널), GUI(창), NUI(음성·대화·제스처 같은 자연 인터페이스).
-
-## 원칙
-
-- **최소 공통 기능에 가두지 않는다.** 표면마다 지원하는 기능을 명시하고, 지원하지 않는 기능을
-  조용히 다른 의미로 바꾸지 않는다. 명세는 공통 의미와 표면별 고도화를 함께 담는다.
-- **데이터를 표면마다 다시 만들지 않는다.** 표시할 값은 Pure의 런타임 상태(영속 트리·draft)에서
-  복사 없이 빌려 온다. 큰 표나 문서를 표면별 모델로 복제하지 않는다.
-- **갈라파고스를 만들지 않는다.** ANSI 터미널, 셸 파이프, 플랫폼 접근성 API 같은 기존 규격과
-  호환하는 접점을 유지한다.
-- **검증 기기는 로컬 Raspberry Pi 5**(Linux AArch64)다.
-
-## 열린 질문
-
-- NUI의 다음 범위. 지금은 화면 낭독 같은 문장이다. 음성 합성·대화형 입력·제스처 중 무엇이 먼저인지.
-- 표면별 고도화(예: TUI의 셀 단위 갱신, GUI의 부드러운 스크롤)를 명세의 어디에 둘지. 가상 스크롤은 이미
-  런타임의 성질이다(보이는 칸만 계산).
+Apache-2.0. See [LICENSE](LICENSE).
