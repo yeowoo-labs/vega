@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,15 +18,26 @@
  * Pure's), committed text and clicks on rows, and an event stream tells every
  * open page when the app changed.
  *
- *   GET  /                       the page
- *   GET  /screen?rows=R&first=F,G  title, fields, each list or table with R rows
- *                                from its last first row (F, G, ... by part), keys
- *   POST /key    KEYNAME         press and release the input bound to the key
- *   POST /text   UTF-8           commit text to the screen's text input
- *   POST /point  PART ROW        focus a row of a list or table (0 first)
- *   GET  /events                 server-sent events: one per change */
+ *   GET  /T/                       the page
+ *   GET  /T/screen?rows=R&first=F,G  title, fields, each list or table with R rows
+ *                                  from its last first row (F, G, ... by part), keys
+ *   POST /T/key    KEYNAME         press and release the input bound to the key
+ *   POST /T/text   UTF-8           commit text to the screen's text input
+ *   POST /T/point  PART ROW        focus a row of a list or table (0 first)
+ *   GET  /T/events                 server-sent events: one per change
+ *
+ * T is the run's secret (128 random bits), given only in the URL the surface
+ * prints: whatever reaches the port without it, a page of another site or a
+ * host on the network, is refused (403) and changes nothing. The page names
+ * its paths relative to itself, so it carries T without knowing it. A request
+ * must also name this surface by its address (Host: an IPv4 address or
+ * localhost, with its port; another name, as DNS rebinding gives, 421) and,
+ * when it says where it comes from, come from the page (Origin http://Host). */
 
-enum { CLIENTS = 64, REQUEST = 1 << 16, ROWS_MAX = 500 };
+enum { CLIENTS = 64, REQUEST = 1 << 16, ROWS_MAX = 500, TOKEN = 16 };
+
+static char token[2 * TOKEN + 1]; /* the run's secret, in hex */
+static unsigned served_port;
 
 typedef struct { char *bytes; size_t used, capacity; } Buffer;
 
@@ -227,7 +239,7 @@ static const char *const page_parts[] = {
 "const said={accent:'accent',good:'good',warning:'warning',danger:'danger'};"
 "async function post(path,body){await fetch(path,{method:'POST',body});refresh()}"
 "async function refresh(){if(busy){again=true;return}busy=true;try{"
-"const r=await fetch('/screen?rows='+rows+'&first='+firsts.join(','));screen=await r.json();render()}"
+"const r=await fetch('screen?rows='+rows+'&first='+firsts.join(','));screen=await r.json();render()}"
 "finally{busy=false;if(again){again=false;refresh()}}}"
 "function fit(parent,count,make){while(parent.children.length>count)parent.lastChild.remove();"
 "while(parent.children.length<count)parent.append(make());return[...parent.children]}"
@@ -243,9 +255,9 @@ static const char *const page_parts[] = {
 "const box=p.kind==='list'?el('ul',{role:'listbox',tabIndex:0}):el('table',{role:'grid',tabIndex:0},el('thead',{},el('tr')),el('tbody'));"
 "box.onfocus=()=>{held=p.part};"
 "box.onwheel=e=>{e.preventDefault();const q=views.get(p.part).p;if(q.pointable)"
-"post('/point',q.part+' '+Math.max(0,Math.min(q.rows-1,(q.focus?\?-1)+Math.sign(e.deltaY))))};"
+"post('point',q.part+' '+Math.max(0,Math.min(q.rows-1,(q.focus?\?-1)+Math.sign(e.deltaY))))};"
 "v={kind:p.kind,head,box,section:el('section',{},head,box)};views.set(p.part,v);return v}"
-"function row(v,it){const p=v.p;return()=>{if(p.pointable)post('/point',p.part+' '+it.row)}}",
+"function row(v,it){const p=v.p;return()=>{if(p.pointable)post('point',p.part+' '+it.row)}}",
 "function render(){const s=screen;text($('title'),s.title?\?'');document.title=s.title?\?'Vega';"
 "const pairs=fit($('fields'),2*s.fields.length,()=>el('div'));"
 "s.fields.forEach((f,i)=>{if(pairs[2*i].tagName!=='DT'){pairs[2*i].replaceWith(el('dt'));pairs[2*i+1].replaceWith(el('dd'))}});"
@@ -276,14 +288,14 @@ static const char *const page_parts[] = {
 "Delete:'Del',Escape:'Esc',PageUp:'PgUp',PageDown:'PgDn'};"
 "fit($('keys'),s.keys.length,()=>el('button',{type:'button'},el('kbd'),el('span'))).forEach((b,i)=>{const k=s.keys[i];"
 "text(b.firstChild,symbols[k.key]?\?k.key.replace(/^(Key|Digit)/,''));text(b.lastChild,k.input);"
-"attr(b,'aria-keyshortcuts',k.key.replace(/^Key/,'').replace(/^Digit/,''));b.onclick=()=>post('/key',k.key)})}"
-"$('prompt').onsubmit=e=>{e.preventDefault();const v=$('entry').value;if(v){$('entry').value='';post('/text',v)}};"
+"attr(b,'aria-keyshortcuts',k.key.replace(/^Key/,'').replace(/^Digit/,''));b.onclick=()=>post('key',k.key)})}"
+"$('prompt').onsubmit=e=>{e.preventDefault();const v=$('entry').value;if(v){$('entry').value='';post('text',v)}};"
 "addEventListener('keydown',e=>{if(!screen||e.ctrlKey||e.metaKey||e.altKey)return;"
 "const typing=document.activeElement===$('entry');"
 "if(typing&&!['ArrowUp','ArrowDown','PageUp','PageDown','Escape'].includes(e.code))return;"
 "if(document.activeElement?.tagName==='BUTTON'&&['Enter','Space'].includes(e.code))return;"
-"if(screen.keys.some(k=>k.key===e.code)){e.preventDefault();post('/key',e.code)}});"
-"new EventSource('/events').onmessage=refresh;refresh();"
+"if(screen.keys.some(k=>k.key===e.code)){e.preventDefault();post('key',e.code)}});"
+"new EventSource('events').onmessage=refresh;refresh();"
 "</script></body></html>"};
 
 /* The page, joined once from its pieces. */
@@ -295,9 +307,49 @@ static const Buffer *page(void) {
 }
 
 static void respond(Client *c, int status, const char *reason, const char *type, const char *body, size_t length) {
-    putf(&c->out, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\n%s\r\n",
-         status, reason, type, length, c->closing ? "Connection: close\r\n" : "");
+    putf(&c->out, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\n"
+         "Referrer-Policy: no-referrer\r\n%s\r\n", status, reason, type, length, c->closing ? "Connection: close\r\n" : "");
     put(&c->out, body, length);
+}
+
+/* A header's value in a head ended by its NUL (blanks around it left out), or NULL; *length its bytes. */
+static const char *header(const char *head, const char *name, size_t *length) {
+    size_t n = strlen(name);
+    for (const char *at = strstr(head, "\r\n"); at; at = strstr(at + 2, "\r\n"))
+        if (!strncasecmp(at + 2, name, n) && at[2 + n] == ':') {
+            const char *value = at + 3 + n;
+            while (*value == ' ' || *value == '\t') ++value;
+            size_t size = strcspn(value, "\r");
+            while (size && (value[size - 1] == ' ' || value[size - 1] == '\t')) --size;
+            *length = size;
+            return value;
+        }
+    return NULL;
+}
+
+/* Whether a Host names this surface by an address: an IPv4 address or localhost, and the port it listens on. */
+static bool names_us(const char *host, size_t length) {
+    const char *colon = memchr(host, ':', length);
+    size_t name_length = colon ? (size_t)(colon - host) : length, digits = colon ? length - name_length - 1 : 0;
+    unsigned port = colon ? 0 : 80;
+    for (size_t i = 0; i < digits; ++i) {
+        if (host[name_length + 1 + i] < '0' || host[name_length + 1 + i] > '9' || port > 65535) return false;
+        port = port * 10 + (unsigned)(host[name_length + 1 + i] - '0');
+    }
+    char name[16];
+    struct in_addr address;
+    if ((colon && !digits) || port != served_port || !name_length || name_length >= sizeof(name)) return false;
+    memcpy(name, host, name_length);
+    name[name_length] = 0;
+    return !strcasecmp(name, "localhost") || inet_pton(AF_INET, name, &address) == 1;
+}
+
+/* The path under /T/ of a target that starts with the run's secret, or NULL; compared in constant time. */
+static char *under_token(char *target) {
+    if (target[0] != '/' || strlen(target) < 2 * TOKEN + 2 || target[2 * TOKEN + 1] != '/') return NULL;
+    unsigned char differ = 0;
+    for (unsigned i = 0; i < 2 * TOKEN; ++i) differ |= (unsigned char)(target[1 + i] ^ token[i]);
+    return differ ? NULL : target + 1 + 2 * TOKEN;
 }
 
 static bool query_number(const char *query, const char *name, size_t *out) {
@@ -388,10 +440,17 @@ static bool serve(Client *c, PureApp *app, const VegaScreen *screen) {
         if (body_size > sizeof(c->in) - head) { c->closing = true; return changed; }
         if (c->in_used < head + body_size) { *end = '\r'; return changed; }
         if (strcasestr(c->in, "\r\nconnection: close")) c->closing = true;
-        char method[8] = "", target[1024] = "";
-        if (sscanf(c->in, "%7s %1023s", method, target) == 2)
-            changed = handle(c, app, screen, method, target, c->in + head, body_size) || changed;
-        else c->closing = true;
+        char method[8] = "", target[1024] = "", *path;
+        size_t host_size = 0, origin_size = 0;
+        const char *host = header(c->in, "host", &host_size), *origin = header(c->in, "origin", &origin_size);
+        if (sscanf(c->in, "%7s %1023s", method, target) != 2) c->closing = true;
+        else if (!host || !names_us(host, host_size))
+            respond(c, 421, "Misdirected Request", "text/plain", "not this surface\n", 18);
+        else if (origin && (origin_size != 7 + host_size || strncasecmp(origin, "http://", 7) ||
+                            strncasecmp(origin + 7, host, host_size)))
+            respond(c, 403, "Forbidden", "text/plain", "another page\n", 13);
+        else if (!(path = under_token(target))) respond(c, 403, "Forbidden", "text/plain", "forbidden\n", 10);
+        else changed = handle(c, app, screen, method, path, c->in + head, body_size) || changed;
         memmove(c->in, c->in + head + body_size, c->in_used - head - body_size);
         c->in_used -= head + body_size;
     }
@@ -415,7 +474,14 @@ int vega_web(PureApp *app, const VegaScreen *screen, const char *listen_on, unsi
         fprintf(stderr, "vega: cannot listen on %s:%u\n", listen_on, port);
         return 2;
     }
-    printf("{\"port\":%u}\n", ntohs(address.sin_port));
+    unsigned char secret[TOKEN];
+    if (getentropy(secret, sizeof(secret))) {
+        fprintf(stderr, "vega: no randomness for the page's secret\n");
+        return 2;
+    }
+    for (unsigned i = 0; i < TOKEN; ++i) snprintf(token + 2 * i, 3, "%02x", secret[i]);
+    served_port = ntohs(address.sin_port);
+    printf("{\"port\":%u,\"url\":\"http://%s:%u/%s/\"}\n", served_port, listen_on, served_port, token);
     fflush(stdout);
     signal(SIGINT, on_stop);
     signal(SIGTERM, on_stop);

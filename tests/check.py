@@ -409,17 +409,18 @@ def web(vega, module, work, seeds, steps=150, visible=4):
         store = work / f'web-{seed}'
         process = subprocess.Popen([str(vega), 'web', str(module), '--port', '0', '--store', str(store)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        port = json.loads(process.stdout.readline())['port']
+        started = json.loads(process.stdout.readline())
+        port, base = started['port'], under(started['url'])
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
 
         def call(method, path, body=None):
-            connection.request(method, path, body.encode() if isinstance(body, str) else body)
+            connection.request(method, base + path, body.encode() if isinstance(body, str) else body)
             response = connection.getresponse()
             return response.status, response.read()
 
         heard = []
         stream = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
-        stream.request('GET', '/events')
+        stream.request('GET', base + '/events')
         events = stream.getresponse()
         assert events.getheader('Content-Type') == 'text/event-stream'
         listener = threading.Thread(target=lambda: [heard.append(line) for line in iter(events.readline, b'')
@@ -468,19 +469,28 @@ def web(vega, module, work, seeds, steps=150, visible=4):
     return compared
 
 
+def under(url):
+    """The path a web surface's URL puts every request under: /SECRET, the run's."""
+    from urllib.parse import urlsplit
+    return urlsplit(url).path.rstrip('/')
+
+
 class WebSurface:
-    """vega web on a free port; stops with SIGTERM."""
+    """vega web on a free port, its paths under the run's secret (base); stops with SIGTERM."""
 
     def __init__(self, vega, module, *args):
         self.process = subprocess.Popen([str(vega), 'web', str(module), '--port', '0', *map(str, args)],
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.port = json.loads(self.process.stdout.readline())['port']
+        started = json.loads(self.process.stdout.readline())
+        self.port, self.url, self.base = started['port'], started['url'], under(started['url'])
 
-    def call(self, method, path, body=None):
+    def call(self, method, path, body=None, headers=None, base=None):
+        """A request to base + path (the run's secret's unless another base is given)."""
         import http.client
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
         try:
-            connection.request(method, path, body.encode() if isinstance(body, str) else body)
+            connection.request(method, (self.base if base is None else base) + path,
+                               body.encode() if isinstance(body, str) else body, headers or {})
             response = connection.getresponse()
             return response.status, response.read()
         finally:
@@ -492,6 +502,95 @@ class WebSurface:
         assert self.process.wait(timeout=10) == 0, self.process.stderr.read()
 
 
+def web_guard(vega, module, work):
+    """vega web takes requests from its own page alone. Every path is under the run's secret, given only in the URL
+    it prints: without it, with a wrong one, one cut short or cased otherwise, every route is refused (403), on any
+    address it listens on. The Host must name the surface by an address or localhost and its port (another name, as
+    DNS rebinding gives, another port or none: 421), and an Origin, when one is sent, must be the page's (403). What
+    is refused changes nothing, not even the count of events; the page's own requests go on."""
+    import socket
+    surface = WebSurface(vega, module, '--store', work / 'guard-store')
+    host = f'127.0.0.1:{surface.port}'
+
+    def raw(method, path, headers, body=b''):
+        """One request with exactly these headers; its status."""
+        head = f'{method} {path} HTTP/1.1\r\n' + ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+        with socket.create_connection(('127.0.0.1', surface.port), timeout=10) as sock:
+            sock.sendall(f'{head}Content-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode() + body)
+            answer = b''
+            while chunk := sock.recv(4096):
+                answer += chunk
+        return int(answer.split(b' ', 2)[1])
+
+    def screen():
+        return json.loads(surface.call('GET', '/screen?rows=50')[1])
+
+    refused = 0
+    try:
+        assert surface.call('POST', '/text', 'kept')[0] == 200
+        before = screen()
+        secret = surface.base[1:]
+        assert len(secret) == 32 and set(secret) <= set('0123456789abcdef'), secret
+        for base in ('', '/' + format(int(secret, 16) ^ 1, '032x'), surface.base[:-1], '/' + secret.upper()):
+            for method, path, body in (('GET', '/', b''), ('GET', '/screen', b''), ('GET', '/events', b''),
+                                       ('POST', '/text', b'forged'), ('POST', '/key', b'Delete'), ('POST', '/point', b'0 0')):
+                assert raw(method, base + path, {'Host': host}, body) == 403, (base, path)
+                refused += 1
+        for named in (f'evil.example:{surface.port}', f'localhost.:{surface.port}', f'127.0.0.1:{surface.port + 1}',
+                      '127.0.0.1', None):
+            headers = {'Host': named} if named else {}
+            assert raw('GET', surface.base + '/screen', headers) == 421, named
+            assert raw('POST', surface.base + '/key', headers, b'Delete') == 421, named
+            refused += 2
+        for origin in ('https://evil.example', f'http://127.0.0.1:{surface.port + 1}', f'http://localhost:{surface.port}',
+                       f'https://{host}', 'null'):
+            for path, body in (('/text', b'forged'), ('/key', b'Delete'), ('/point', b'0 0')):
+                assert raw('POST', surface.base + path, {'Host': host, 'Origin': origin}, body) == 403, (origin, path)
+                refused += 1
+        assert screen() == before, (screen(), before)
+        assert raw('GET', surface.base + '/screen', {'Host': f'localhost:{surface.port}'}) == 200
+        assert raw('POST', surface.base + '/text', {'Host': host, 'Origin': f'http://{host}'}, b'mine') == 200
+        local = f'localhost:{surface.port}'
+        assert raw('POST', surface.base + '/text', {'Host': local, 'Origin': f'http://{local}'}, b'local') == 200
+        assert [item['label'] for item in screen()['parts'][0]['items']] == ['kept', 'mine', 'local']
+    finally:
+        surface.stop()
+    wide = WebSurface(vega, module, '--listen', '0.0.0.0')
+    try:
+        assert wide.url == f'http://0.0.0.0:{wide.port}{wide.base}/', wide.url
+        assert wide.call('GET', '/screen', base='')[0] == 403 and wide.call('GET', '/screen')[0] == 200
+    finally:
+        wide.stop()
+    return refused
+
+
+def forging_page(surface):
+    """A page of another origin (another port) that knows the surface's URL, as if it leaked, and sends text as the
+    page does, with the URL's secret and without it, then titles itself done; served until shut down. Each text
+    that landed would be a task (a key that deletes would hide it)."""
+    import http.server
+    import threading
+    tries = [(surface.url + 'text', 'forged with the secret'), (f'http://127.0.0.1:{surface.port}/text', 'forged without it')]
+    page = ('<!doctype html><title>forging</title><script>Promise.allSettled(' + json.dumps(tries) +
+            ".map(([to, body]) => fetch(to, {method: 'POST', mode: 'no-cors', body}))).then(() => { document.title = 'done' })"
+            '</script>').encode()
+
+    class Forger(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Forger)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
 def browser(vega, module, work):
     """The page in headless Chromium: keys, a click on a row, typed text, a value holding controls."""
     import shutil
@@ -500,10 +599,12 @@ def browser(vega, module, work):
     store = work / 'browser-store'
     assert run(vega, 'cli', module, '--store', store, stdin='text 61\ntext 62\ntext 63\n').returncode == 0
     surface = WebSurface(vega, module, '--store', store)
+    forger = forging_page(surface)
     try:
-        result = run('node', HERE / 'browser.mjs', f'http://127.0.0.1:{surface.port}/')
+        result = run('node', HERE / 'browser.mjs', surface.url, f'http://127.0.0.1:{forger.server_port}/')
     finally:
         surface.stop()
+        forger.shutdown()
     outcome = json.loads(result.stdout)
     assert result.returncode == 0 and outcome['ok'], outcome
     after = run(vega, 'cli', module, '--store', store, stdin='show\n').stdout.splitlines()
@@ -589,7 +690,7 @@ def hot_swap(vega, aup, work):
     import threading
     heard = []
     stream = http.client.HTTPConnection('127.0.0.1', surface.port, timeout=10)
-    stream.request('GET', '/events')
+    stream.request('GET', surface.base + '/events')
     events = stream.getresponse()
     threading.Thread(target=lambda: [heard.append(line) for line in iter(events.readline, b'') if line.startswith(b'data:')],
                      daemon=True).start()
@@ -674,7 +775,7 @@ def timing(vega, module):
     try:
         import http.client
         stream = http.client.HTTPConnection('127.0.0.1', surface.port, timeout=10)
-        stream.request('GET', '/events')
+        stream.request('GET', surface.base + '/events')
         events = stream.getresponse()
         events.readline(), events.readline()
         surface.call('POST', '/key', 'Space')
@@ -2075,6 +2176,7 @@ def main():
             painting(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30)])
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))
         report['browser_steps'] = browser(vega, modules['todo'], work)
+        report['web_refused'] = web_guard(vega, modules['todo'], work)
         report['interactive_sessions'] = interactive(vega, modules['todo']) + \
             interactive(vega, modules['todo'], work / 'interactive-store') + \
             interactive(vega, modules['todo'], cut=True)

@@ -5,14 +5,19 @@
 // tree: roles, names, the list's focus and selection, each option's place in
 // the whole list, and a focused list that survives redraws.
 //
-// node tests/browser.mjs URL   (the app: examples/todo.aup with tasks a, b, c)
+// Last, a page of another origin that knows the page's URL (as if it leaked)
+// sends what the page sends: the surface refuses it, which check.py reads in
+// the app's states afterwards.
+//
+// node tests/browser.mjs URL FORGER   (the app: examples/todo.aup with tasks a, b, c; FORGER a page of
+// another origin that posts to it and then sets its title to done)
 // Prints one JSON line: the steps that held.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const url = process.argv[2];
+const [url, forger] = process.argv.slice(2);
 const profile = mkdtempSync(join(tmpdir(), 'vega-browser-'));
 const chromium = spawn('chromium', ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
   '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=900,700', 'about:blank'],
@@ -130,9 +135,11 @@ try {
   const entry = a.nodes.find(n => role(n) === 'textbox');
   check('the text input is named for its input', entry && name(entry) === 'add', entry);
   // A value holding what would act on a screen: shown as the other surfaces show it, its bidi kept within it.
-  await evaluate(`post('/text', 'esc \\u001b[31m sep \\u2028 rlo \\u202e.')`);
+  await evaluate(`post('text', 'esc \\u001b[31m sep \\u2028 rlo \\u202e.')`);
   await until('a value is shown as the other surfaces show it', `document.querySelectorAll('li')[4]?.querySelector('.label').textContent === 'esc \\u241b[31m sep \\u2424 rlo \\u202e.'`);
   check('its bidi stays within it', await evaluate(`getComputedStyle(document.querySelectorAll('li')[4].querySelector('.label')).unicodeBidi`) === 'isolate', null);
+  await send('Page.navigate', { url: forger });
+  await until('a page of another origin sent its forgeries', `location.href === ${JSON.stringify(forger)} && document.title === 'done'`);
   await finish(true);
 } catch (error) {
   await finish(false, String(error.message || error));
