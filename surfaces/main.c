@@ -359,7 +359,7 @@ static bool raw_mode(void) {
     t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)) return false;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t)) return false; /* keys typed while it started stay (TCSAFLUSH dropped them) */
     raw_terminal = true;
     atexit(restore_terminal);
     const char *enter = "\033[?1049h\033[?25l\033[?1000h\033[?1006h"; /* mouse buttons, reported as SGR */

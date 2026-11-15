@@ -911,8 +911,15 @@ def interactive(vega, module, store=None, replace=None, cut=False):
     With cut, every key comes a byte at a time, 50 ms apart, and an arrow's
     escape sequence 150 ms after its first two bytes: the terminal's reads
     are not its keys (a UTF-8 character or a sequence cut short waits for
-    its rest)."""
-    import fcntl, pty, select, struct, termios, time
+    its rest). It waits for what the terminal shows, never for a guess of how
+    long: the first frame (a store a session opens on a slow disk can take
+    seconds before it: keys typed into a terminal not yet raw would echo, and
+    their Ctrl-C would end it by signal), the row a click lands on (keys pile
+    up while each Enter's commit syncs, and a click lands on the frame drawn
+    when it is read), the screen the keys lead to before Ctrl-C (were Ctrl-C
+    read with the last keys, their frame would not be drawn), and the end of
+    the output after it."""
+    import fcntl, pty, select, signal, struct, termios, time
     pid, fd = pty.fork()
     if pid == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 40, 0, 0))  # before it starts: no race
@@ -930,9 +937,39 @@ def interactive(vega, module, store=None, replace=None, cut=False):
                     break
         return data
 
-    screen = read_for(0.3)
-    # Then a click on line 5 (béton's row): a mouse report, press and release.
-    for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u', b'\x1b[<0;3;5M\x1b[<0;3;5m'):
+    def final_of(stream):
+        grid = [[[' ', 0, False] for _ in range(40)] for _ in range(10)]
+        replay(stream, grid)
+        return shown(grid)
+
+    def expected(final):  # the screen the keys lead to (the click on line 5 moves the focus to béton)
+        if replace:  # the new title and field, the same tasks, focus and done mark
+            return (final[:3] == ['|Things', '|left  1 of 2\tmuted', '|done_count  1\tmuted'] and
+                    final[4].startswith('|  milk') and 'done' in final[4] and final[5].startswith('>> béton'))
+        return ('milk' in '\n'.join(final) and '(2)' in final[2] and 'done' in final[3] and
+                final[4].startswith('>> béton') and final[3].startswith('|  milk'))
+
+    screen = b''
+
+    def until(seen, what, seconds=120):  # a session that never shows it is ended and fails
+        nonlocal screen
+        end = time.time() + seconds
+        while not seen(screen):
+            if time.time() > end:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                os.close(fd)
+                raise AssertionError(f'{what} not shown within {seconds} s: {screen[-200:]!r}')
+            screen += read_for(0.05)
+
+    until(lambda shown_so_far: b'\x1b[?1049h' in shown_so_far, 'the first frame')
+    # Then a click on line 5 (béton's row): a mouse report, press and release. A click lands on what the terminal
+    # shows, so it waits for béton drawn there (and milk's done mark: the keys before it drawn) as a user would.
+    click = b'\x1b[<0;3;5M\x1b[<0;3;5m'
+    for keys in (b'milk\r', 'b\u00e9ton\r'.encode(), b'\t', b'\x1b[A', b' ', b'u', click):
+        if keys == click:
+            until(lambda shown_so_far: 'done' in final_of(shown_so_far)[3] and 'béton' in final_of(shown_so_far)[4],
+                  'béton on the row the click lands on')
         if not cut:
             os.write(fd, keys)
         elif keys == b'\x1b[A':
@@ -947,9 +984,18 @@ def interactive(vega, module, store=None, replace=None, cut=False):
     if replace:
         shutil.copy(replace, module.with_suffix('.tmp'))
         os.replace(module.with_suffix('.tmp'), module)
-        screen += read_for(0.6)
+    until(lambda shown_so_far: expected(final_of(shown_so_far)), 'the screen the keys lead to')
     os.write(fd, b'\x03')
-    screen += read_for(0.3)
+    end = time.time() + 120  # leaving closes the store (a sync on a slow disk): read to the end
+    while time.time() < end:
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        try:
+            chunk = os.read(fd, 65536) if ready else b''
+        except OSError:
+            break
+        if ready and not chunk:
+            break
+        screen += chunk
     _, status = os.waitpid(pid, 0)
     os.close(fd)
     text = screen.decode(errors='replace')
@@ -2177,9 +2223,13 @@ def main():
         report['web_screens'] = web(vega, modules['todo'], work, range(args.seeds))
         report['browser_steps'] = browser(vega, modules['todo'], work)
         report['web_refused'] = web_guard(vega, modules['todo'], work)
-        report['interactive_sessions'] = interactive(vega, modules['todo']) + \
-            interactive(vega, modules['todo'], work / 'interactive-store') + \
-            interactive(vega, modules['todo'], cut=True)
+        # The session's store in memory where there is some: how long a fresh store on a slow disk keeps the first
+        # frame back (seconds on an SD card that other writes hold up) is no part of this check.
+        with tempfile.TemporaryDirectory(prefix='vega-interactive-',
+                                         dir='/dev/shm' if os.path.isdir('/dev/shm') else directory) as stores:
+            report['interactive_sessions'] = interactive(vega, modules['todo']) + \
+                interactive(vega, modules['todo'], Path(stores) / 'store') + \
+                interactive(vega, modules['todo'], cut=True)
         report['stored_surface_lines'] = stored_surfaces(vega, modules['todo'], work, range(args.seeds))
         report['hangul'] = hangul(vega, modules['todo'])
         report['convention_findings'] = conventions(vega, aup, work, modules)
