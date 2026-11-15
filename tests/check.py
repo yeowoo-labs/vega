@@ -2185,6 +2185,20 @@ def lists_and_bytes(vega, aup, work):
     return len(out) + len(dump) + len(said)
 
 
+def versions(vega, module):
+    """vega --version says its name with the VERSION file's line, then the module format it shows: the eighth byte
+    of a module aup built. --help says how it is called, on standard output; called another way it says so on
+    standard error with status 2."""
+    said = run(vega, '--version')
+    version = (ROOT / 'VERSION').read_text().strip()
+    assert said.returncode == 0 and said.stdout.splitlines() == [f'vega {version}', f'module format {chr(module.read_bytes()[7])}'], said
+    helped = run(vega, '--help')
+    assert helped.returncode == 0 and helped.stdout.startswith('vega tui|cli|say') and not helped.stderr, helped
+    refused = run(vega)
+    assert refused.returncode == 2 and refused.stderr.startswith('vega tui|cli|say') and not refused.stdout, refused
+    return 2
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--vega', type=Path, required=True)
@@ -2205,6 +2219,7 @@ def main():
             modules[name] = work / f'{name}.pmod'
             built = run(aup, 'build', ROOT / 'examples' / f'{name}.aup', '-o', modules[name], env=env)
             assert built.returncode == 0, built.stderr
+        report['versions'] = versions(vega, modules['todo'])
         report['cli_and_say_lines'], report['failed_events_spoken'] = \
             cli_and_say(vega, modules['todo'], range(args.seeds))
         report['tui_frames'] = tui(vega, modules['todo'], range(args.seeds), [(40, 12), (24, 9), (80, 30), (16, 6)])

@@ -1023,7 +1023,25 @@ __attribute__((visibility("default"))) int pure_surface_run(const PureSurface *s
     return status;
 }
 #else
+/* How vega is called: on standard error with status 2 when it was called another way, on standard output when asked. */
+static int called(FILE *to) {
+    fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
+          "vega tui MODULE.pmod [--store PATH] [--watch] | --dump|--paint WIDTHxHEIGHT < script\n"
+          "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
+          "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
+          "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] [--card PATH]\n"
+          "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [--access] [< script]\n"
+          "vega check MODULE.pmod\n"
+          "vega --version | --help\n", to);
+    return to == stdout ? 0 : 2;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--version")) { /* the version (the VERSION file's), and the module format it shows */
+        puts("vega " VEGA_VERSION "\nmodule format 7");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--help")) return called(stdout);
     unsigned width = 0, height = 0, port = 8080;
     const char *card = "/dev/dri/card1";
     float size = 16;
@@ -1069,14 +1087,7 @@ int main(int argc, char **argv) {
     bool pixels = argc > 1 && !strcmp(argv[1], "pixels"), on_display = argc > 1 && !strcmp(argv[1], "display");
     if (usage || (dumped && strcmp(argv[1], "tui") && !pixels) || (!strcmp(argv[1], "check") && argc != 3) ||
         (pixels && (!dumped || !symbols_count || !frames_prefix)) || (on_display && (!symbols_count || (writeback && !frames_prefix)))) {
-        fputs("vega tui|cli|say MODULE.pmod [--store PATH]\n"
-              "vega tui MODULE.pmod [--store PATH] [--watch] | --dump|--paint WIDTHxHEIGHT < script\n"
-              "vega web MODULE.pmod [--store PATH] [--listen ADDRESS] [--port N] [--watch]\n"
-              "vega pixels MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] --grid WIDTHxHEIGHT --out PREFIX < script\n"
-              "vega display MODULE.pmod [--store PATH] --symbols FONT.vsym... [--size PX] [--card PATH]\n"
-              "             [--writeback WIDTHxHEIGHT --out PREFIX] [--live | --input EVENTS] [--access] [< script]\n"
-              "vega check MODULE.pmod\n", stderr);
-        return 2;
+        return called(stderr);
     }
     if ((pixels || on_display) && !open_face(size)) return 2;
     if (on_display) {
