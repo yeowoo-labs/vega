@@ -1,8 +1,12 @@
 # A board two nodes share. A change to a card goes whole to the other node
 # (send changed { ..at }), and a card the other node sends is taken whole
 # (cards[k] = Card { ..remote }) when it is the later change: by its time,
-# then by the node's name. So both boards end the same, whatever order the
-# changes come in, and after the nodes were cut apart and joined again.
+# then by the node's name. A change's time is the clock's, or one past the
+# time the card had when that is not earlier: so a change is later than
+# what it changes, also the second of two within a millisecond, and one
+# made after a change from a node whose clock runs ahead. So both boards
+# end the same, whatever order the changes come in, and after the nodes
+# were cut apart and joined again.
 #
 # Each node runs it with a key of its own and links to the other, sealed:
 #   pure-serve --module shared-board.pmod --store a --key a.key --name a \
@@ -56,13 +60,13 @@ on add {
 }
 on forward.down {
   at.lane = min(at.lane + 1, 2)
-  at.since = now
+  at.since = max(now, at.since + 1)
   at.node = me
   send changed { ..at }
 }
 on back.down {
   at.lane = max(at.lane - 1, 0)
-  at.since = now
+  at.since = max(now, at.since + 1)
   at.node = me
   send changed { ..at }
 }
@@ -72,7 +76,7 @@ on name { me = name.name }
 on assign {
   require cards.has(assign.title)
   cards[assign.title].who = assign.who
-  cards[assign.title].since = now
+  cards[assign.title].since = max(now, cards[assign.title].since + 1)
   cards[assign.title].node = me
   send changed { ..cards[assign.title] }
 }

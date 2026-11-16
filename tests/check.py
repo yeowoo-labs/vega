@@ -1857,7 +1857,10 @@ def shared_board(serve, module, work):
     other, and both boards end the same. Then Bob's node is cut off (it
     listens and sends where no one is) while both give one card to someone,
     Bob first and Alice after, and Bob adds a card; joined again, both
-    boards take Alice's, the later change, and Bob's card."""
+    boards take Alice's, the later change, and Bob's card. And cards added
+    and moved at once (the two requests in one write, so within a
+    millisecond of each other) are moved on both: a node's second change
+    of a card is the later one whatever its clock says."""
     import http.client
     import select
     import signal
@@ -1950,10 +1953,22 @@ def shared_board(serve, module, work):
         start('bob')
         joined = agree([('fix the build', 'alice, to do'), ('made while cut off', 'to do'), ('plan the week', 'bob, to do'),
                         ('write the tests', 'doing')])
+        quick = [f'quick {k}' for k in range(12)]
+        for title in quick:  # added and moved in one write: two changes of one card as close as a node makes them
+            both = (f'POST /inputs/add HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: {len(title)}\r\n\r\n{title}'
+                    'POST /inputs/forward HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            with socket.create_connection(('127.0.0.1', nodes['alice'][1]), timeout=10) as pipe:
+                pipe.sendall(both.encode())
+                answers = b''
+                while chunk := pipe.recv(65536):
+                    answers += chunk
+            assert answers.count(b'HTTP/1.1 200') == 2, answers
+        moved = agree(seconds=20)
+        assert all((title, 'doing') in moved for title in quick), moved
     finally:
         for name in list(nodes):
             stop(name)
-    return {'cards': len(together), 'after_joining': len(joined)}
+    return {'cards': len(together), 'after_joining': len(joined), 'moved_at_once': len(quick)}
 
 SCREEN_APP = """use vega
 record Line {
