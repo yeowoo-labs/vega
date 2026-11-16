@@ -2,6 +2,7 @@
 """Bring in Vega's text upstreams, and hold Vega to them:
 
     python3 text/upstream.py [--harfbuzz VERSION] [--unicode VERSION] [--corpus] [--offline]
+    python3 text/upstream.py --fetch [--harfbuzz VERSION] [--unicode VERSION]
 
 Vega's shaping is HarfBuzz's, case for case, and its Unicode tables are
 generated from the Unicode Character Database. When either moves on, this
@@ -29,6 +30,11 @@ the input (the suite's case, the random run) to port its fix from. The
 generated files are left changed for review (git diff). One JSON line at
 the end: the versions, what changed, how each check went; exit 1 when one
 failed. --offline uses only what build/upstream already holds.
+
+--fetch is step 1 alone, without building that HarfBuzz: the two sources
+in build/upstream, where make check finds them. Without them (a fresh
+checkout) make check leaves out, and says so, Unicode's conformance tests
+and HarfBuzz's test suite.
 """
 import argparse
 import json
@@ -57,8 +63,8 @@ def fetch(url, into, offline):
     part.rename(into)
 
 
-def harfbuzz(version, offline):
-    """The release's source, and a static library built from it."""
+def harfbuzz_source(version, offline):
+    """The release's source."""
     source = UPSTREAM / f'harfbuzz-{version}'
     if not (source / 'src' / 'harfbuzz.cc').exists():
         archive = UPSTREAM / f'harfbuzz-{version}.tar.xz'
@@ -66,6 +72,12 @@ def harfbuzz(version, offline):
               offline)
         with tarfile.open(archive) as tar:
             tar.extractall(UPSTREAM, filter='data')
+    return source
+
+
+def harfbuzz(version, offline):
+    """The release's source, and a static library built from it."""
+    source = harfbuzz_source(version, offline)
     library = source / 'libharfbuzz.a'
     if not library.exists():
         print(f'building HarfBuzz {version}', file=sys.stderr)
@@ -103,14 +115,20 @@ def main():
     parser.add_argument('--unicode')
     parser.add_argument('--corpus', action='store_true')
     parser.add_argument('--offline', action='store_true')
+    parser.add_argument('--fetch', action='store_true')
     args = parser.parse_args()
     UPSTREAM.mkdir(parents=True, exist_ok=True)
     version = args.harfbuzz or subprocess.run(['pkg-config', '--modversion', 'harfbuzz'], capture_output=True,
                                               text=True, check=True).stdout.strip()
-    source, library = harfbuzz(version, args.offline)
+    source = harfbuzz_source(version, args.offline)
     named = re.search(r'Unicode (\d+\.\d+\.\d+)', (source / 'src' / 'hb-ucd-table.hh').read_text())
     unicode = args.unicode or named.group(1)
     database = ucd(unicode, args.offline)
+    if args.fetch:
+        print(json.dumps({'harfbuzz': version, 'unicode': unicode,
+                          'in': [str(path.relative_to(ROOT)) for path in (source, database)]}))
+        return 0
+    source, library = harfbuzz(version, args.offline)
 
     results = {}
     generated = ['text/unicode-data.c', 'text/syllabic-data.c']
