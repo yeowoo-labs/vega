@@ -38,7 +38,7 @@ typedef struct { Segment *items; size_t count, capacity; Point at, start; bool o
  * symbols that share it to share its points */
 typedef struct { uint32_t code; size_t first, count; int16_t advance; int font; long glyph; } Built;
 
-static void fail(const char *why) {
+static _Noreturn void fail(const char *why) {
     fprintf(stderr, "vega-symbols: %s\n", why);
     exit(1);
 }
