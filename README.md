@@ -7,8 +7,8 @@ tone once; Vega shows that declaration as a terminal UI, non-interactive CLI out
 sentences, a web page, pixels or a framebuffer — without copying the data into a per-surface model.
 
 **Status: v0, pre-1.0.** The first components (lists, tables, focus, tone) and four surfaces work:
-TUI, CLI, speech and web, plus pixel and display output. No release, no compatibility promise.
-There has been no external security audit.
+TUI, CLI, speech and web, plus pixel and display output. Preview release 0.9: no compatibility
+promise. There has been no external security audit.
 
 ## Build and run
 
