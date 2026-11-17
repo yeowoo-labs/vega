@@ -12,7 +12,11 @@ There has been no external security audit.
 
 ## Build and run
 
-`make` links `libpure.a` from a Pure checkout beside this one.
+`make` links `libpure.a` from a Pure checkout beside this one. Besides a C17 toolchain it needs
+the headers of FreeType, HarfBuzz, EGL and OpenGL ES (Debian or Ubuntu:
+`apt install pkg-config libfreetype-dev libharfbuzz-dev libegl-dev libgles-dev`). `make check`
+needs Python 3; `python3 text/upstream.py --fetch` first brings the Unicode data and the HarfBuzz
+release its text tests read (without them it leaves those two out, and says so).
 
 ```sh
 git clone https://github.com/yeowoo-labs/pure.git ../pure && make -C ../pure
